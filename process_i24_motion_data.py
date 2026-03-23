@@ -4,6 +4,7 @@ import json
 import os
 import pyarrow as pa
 import pyarrow.parquet as pq
+import gc
 
 with open("./11-30-2022/6386d89efb3ff533c12df167__post10.json", "r") as f:
     full_data = json.load(f)
@@ -133,11 +134,25 @@ for road in roads:
         idx = rtree.index.Index(filename=f"road{road}lane{abs(lane)}", stream=generator_function(road_lane_trajectory_data[road][lane]), properties=p)
         road_data_indices[road][lane] = idx
 
+del mapping_data
 for road in roads:
     for lane in lanes:
         road_lane_trajectory = road_lane_trajectory_data[road][lane]
+        print("Dataframe being made!")
         pandas_df = pandas.DataFrame(road_lane_trajectory)
-        pandas_df_sorted = pandas_df.sort_values(["time", "s"], kind="mergesort")
+        print("Dataframe created!")
+        del road_lane_trajectory_data[road][lane]
+        print("Sorting dataframe...")
+        pandas_df_sorted = pandas_df.sort_values(["time", "s"], kind="mergesort", ascending=True)
+        print("Dataframe sorted...")
         table = pa.Table.from_pandas(pandas_df_sorted, preserve_index=False)
-        pq.write_table(table, f"road{road}lane{lane}.parquet", compression="zstd", row_group_size=1000)
+        print("Parquet table made!")
+        del pandas_df_sorted
+        del pandas_df
+        gc.collect()
+        sorting_columns = [
+            pq.SortingColumn(column_index=0, descending=False, nulls_first=True),
+            pq.SortingColumn(column_index=8, descending=False, nulls_first=True)
+        ]
+        pq.write_table(table, f"road{road}lane{lane}.parquet", compression="zstd", row_group_size=1000, sorting_columns=sorting_columns)
         print("Written ", road, " and lane ", lane)

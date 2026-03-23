@@ -58,19 +58,29 @@ class I24MotionData:
         """
         return self.conn.execute(q, [timestamp_min, timestamp_max, s_min, s_max])
     
-    def getVehicleTrajectoryDF(self, source_ref, id):
-        q = f"""
-        SELECT time, x, y, length, width, height, class, id, s, t
-        FROM {source_ref}
-        WHERE id = ?
-        ORDER BY time ASC
-        """
-        return self.conn.execute(q, [id]).fetch_df()
+    def getVehicleTrajectoryDF(self, source_ref, id, start_time=None):
+        if start_time is None:
+            q = f"""
+            SELECT time, x, y, length, width, height, class, id, s, t
+            FROM {source_ref}
+            WHERE id = ?
+            ORDER BY time ASC
+            """
+            return self.conn.execute(q, [id]).fetch_df()
+        else:
+            q = f"""
+            SELECT time, x, y, length, width, height, class, id, s, t
+            FROM {source_ref}
+            WHERE id = ?
+            AND time >= ?
+            ORDER BY time ASC
+            """
+            return self.conn.execute(q, [id, start_time]).fetch_df() 
     
-    def getVehicleTrajectory(self, lane, id):
+    def getVehicleTrajectory(self, lane, id, start_time=None):
         lane_str = str(lane) if lane >= 0 else "neg"+str(abs(lane))
         source_ref = f"{self.trajectories_subset_db_prefix}_{self.road_id}_{lane_str}"
-        return self.getVehicleTrajectoryDF(source_ref, id)
+        return self.getVehicleTrajectoryDF(source_ref, id, start_time=start_time)
     
     def queryEdieBoxSubset(self, timestamp_min, timestamp_max, s_min, s_max, ignore_ids = None):
         result = {}
@@ -103,7 +113,7 @@ class I24MotionData:
         for query in query_ids:
             result[query] = {}
         for lane in self.road_lane_lookup[self.road_id]:
-            print(lane)
+            #print(lane)
             lane_str = str(lane) if lane >= 0 else "neg"+str(abs(lane))
             source_ref = f"{self.trajectories_subset_db_prefix}_{self.road_id}_{lane_str}"
             q = f"""
@@ -125,7 +135,7 @@ class I24MotionData:
             GROUP BY w.query_id
             """
             intermediate_result = self.conn.execute(q).fetch_df()
-            print(len(intermediate_result))
+            #print(len(intermediate_result))
             for i in range(len(intermediate_result)):
                 row = intermediate_result.iloc[i]
                 query_id = int(row["query_id"])

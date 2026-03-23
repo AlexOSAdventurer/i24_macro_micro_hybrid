@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict
-from typing import Dict, List, Tuple, Optional, Any
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple, Optional, Any, Set
 import copy
 import json
+import math
 
 import plotly.graph_objects as go
 import jax.numpy as jnp
@@ -33,6 +35,10 @@ class Cell:
     def length(self) -> float:
         return float(self.end_s - self.start_s)
 
+    @property
+    def mass(self) -> float:
+        return float(self.density * self.length)
+
     def validate(self) -> None:
         if self.end_s <= self.start_s:
             raise ValueError(
@@ -48,48 +54,46 @@ class Cell:
 @dataclass
 class Road:
     road_id: str
-
     left_polyline: List[Tuple[float, float]]
     right_polyline: List[Tuple[float, float]]
-
     lane_data: Dict[int, Dict[str, float]] = field(default_factory=dict)
-
     cells: Dict[str, Cell] = field(default_factory=dict)
 
     def validate(self) -> None:
         if len(self.left_polyline) < 2 or len(self.right_polyline) < 2:
-            raise ValueError(f"Road {self.road_id} must have valid left/right polylines.")
-
+            raise ValueError(
+                f"Road {self.road_id} must have valid left/right polylines."
+            )
         if len(self.left_polyline) != len(self.right_polyline):
             raise ValueError(
                 f"Road {self.road_id} left/right polylines must have same length."
             )
 
-        # Validate lane_data
         for lane_id, lane_info in self.lane_data.items():
             if "lateral_position" not in lane_info or "width" not in lane_info:
                 raise ValueError(
                     f"Lane {lane_id} in road {self.road_id} missing required fields."
                 )
-
-            if lane_info["width"] <= 0:
+            if float(lane_info["width"]) <= 0.0:
                 raise ValueError(
                     f"Lane {lane_id} in road {self.road_id} has non-positive width."
                 )
 
-        # Validate cells
         for cell in self.cells.values():
             if cell.road_id != self.road_id:
                 raise ValueError(
                     f"Cell {cell.cell_id} road_id mismatch: {cell.road_id} != {self.road_id}"
                 )
-
             if cell.lane not in self.lane_data:
                 raise ValueError(
                     f"Cell {cell.cell_id} references lane {cell.lane} not in lane_data."
                 )
-
             cell.validate()
+
+    def cells_for_lane(self, lane: int) -> List[Cell]:
+        out = [c for c in self.cells.values() if c.lane == lane]
+        out.sort(key=lambda c: (c.start_s, c.end_s, c.cell_id))
+        return out
 
 
 @dataclass
@@ -103,7 +107,6 @@ class Network:
                 raise ValueError(f"Road dict key mismatch: {road_id} != {road.road_id}")
             road.validate()
 
-        # Check all connections exist
         for road in self.roads.values():
             for cell in road.cells.values():
                 for nbr_road_id, nbr_cell_id in cell.inflow_connections:
@@ -134,18 +137,15 @@ class Network:
             "roads": {
                 road_id: {
                     "road_id": road.road_id,
-
                     "left_polyline": [[float(x), float(y)] for x, y in road.left_polyline],
                     "right_polyline": [[float(x), float(y)] for x, y in road.right_polyline],
-
                     "lane_data": {
-                        lane_id: {
+                        str(lane_id): {
                             "lateral_position": float(lane_info["lateral_position"]),
                             "width": float(lane_info["width"]),
                         }
                         for lane_id, lane_info in road.lane_data.items()
                     },
-
                     "cells": {
                         cell_id: {
                             "road_id": cell.road_id,
@@ -154,18 +154,14 @@ class Network:
                             "start_s": float(cell.start_s),
                             "end_s": float(cell.end_s),
                             "density": float(cell.density),
-                            "inflow_connections": [
-                                [r, c] for (r, c) in cell.inflow_connections
-                            ],
-                            "outflow_connections": [
-                                [r, c] for (r, c) in cell.outflow_connections
-                            ],
+                            "inflow_connections": [[r, c] for (r, c) in cell.inflow_connections],
+                            "outflow_connections": [[r, c] for (r, c) in cell.outflow_connections],
                         }
                         for cell_id, cell in road.cells.items()
                     },
                 }
                 for road_id, road in self.roads.items()
-            }
+            },
         }
 
     @staticmethod
@@ -176,8 +172,8 @@ class Network:
             cells: Dict[str, Cell] = {}
             for cell_id, cell_data in road_data["cells"].items():
                 cells[cell_id] = Cell(
-                    road_id=cell_data["road_id"],
-                    cell_id=cell_data["cell_id"],
+                    road_id=str(cell_data["road_id"]),
+                    cell_id=str(cell_data["cell_id"]),
                     lane=int(cell_data["lane"]),
                     start_s=float(cell_data["start_s"]),
                     end_s=float(cell_data["end_s"]),
@@ -193,15 +189,9 @@ class Network:
                 )
 
             roads[road_id] = Road(
-                road_id=road_data["road_id"],
-
-                left_polyline=[
-                    (float(x), float(y)) for x, y in road_data["left_polyline"]
-                ],
-                right_polyline=[
-                    (float(x), float(y)) for x, y in road_data["right_polyline"]
-                ],
-
+                road_id=str(road_data["road_id"]),
+                left_polyline=[(float(x), float(y)) for x, y in road_data["left_polyline"]],
+                right_polyline=[(float(x), float(y)) for x, y in road_data["right_polyline"]],
                 lane_data={
                     int(lane_id): {
                         "lateral_position": float(lane_info["lateral_position"]),
@@ -212,7 +202,7 @@ class Network:
                 cells=cells,
             )
 
-        network = Network(network_id=data["network_id"], roads=roads)
+        network = Network(network_id=str(data["network_id"]), roads=roads)
         network.validate()
         return network
 
@@ -226,164 +216,103 @@ class Network:
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(self.to_dict(), f, indent=2)
 
-    def plot_network(self):
-        """
-        Plot the road network geometry:
-        - left/right road boundaries
-        - lane boundaries
-        - cell boundaries
-
-        No traffic state (density/flow) is shown.
-        """
-
+    def plot_network(self) -> None:
         fig = go.Figure()
 
         for road in self.roads.values():
+            left_poly = np.array(road.left_polyline, dtype=float)
+            right_poly = np.array(road.right_polyline, dtype=float)
 
-            left_poly = np.array(road.left_polyline)
-            right_poly = np.array(road.right_polyline)
-
-            # =========================
-            # Plot road boundaries
-            # =========================
-
-            fig.add_trace(go.Scatter(
-                x=left_poly[:, 0],
-                y=left_poly[:, 1],
-                mode="lines",
-                line=dict(width=3, color="black"),
-                name=f"{road.road_id} left boundary",
-                showlegend=False
-            ))
-
-            fig.add_trace(go.Scatter(
-                x=right_poly[:, 0],
-                y=right_poly[:, 1],
-                mode="lines",
-                line=dict(width=3, color="black"),
-                name=f"{road.road_id} right boundary",
-                showlegend=False
-            ))
-
-            # =========================
-            # Precompute interpolation distances
-            # =========================
+            fig.add_trace(
+                go.Scatter(
+                    x=left_poly[:, 0],
+                    y=left_poly[:, 1],
+                    mode="lines",
+                    line=dict(width=3, color="black"),
+                    showlegend=False,
+                )
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=right_poly[:, 0],
+                    y=right_poly[:, 1],
+                    mode="lines",
+                    line=dict(width=3, color="black"),
+                    showlegend=False,
+                )
+            )
 
             seg_lengths = np.linalg.norm(np.diff(left_poly, axis=0), axis=1)
             cumulative = np.concatenate([[0.0], np.cumsum(seg_lengths)])
 
-            total_length = cumulative[-1]
+            def interpolate_lane_edges(s: float, lane: int) -> Tuple[np.ndarray, np.ndarray]:
+                lane_info = road.lane_data[lane]
+                lat = float(lane_info["lateral_position"])
+                width = float(lane_info["width"])
 
-            def interpolate_pair(s: float, t_left: float, t_right: float):
-                # t_left and t_right decrease in the rightward direction, so we gotta flip it
-                """Interpolate corresponding point on left and right polylines."""
-                print(s)
-                if s < 0:
-                    return None
-
-                idx = np.searchsorted(cumulative, s) - 1
-                idx = np.clip(idx, 0, len(seg_lengths) - 1)
-
+                idx = int(np.clip(np.searchsorted(cumulative, s) - 1, 0, len(seg_lengths) - 1))
                 ds = s - cumulative[idx]
-                seg_len = seg_lengths[idx]
-                interp_constant = ds / max(seg_len, 1e-8)
-                direction_raw = (right_poly[idx] - left_poly[idx])
-                total_width = np.sqrt(np.square(direction_raw).sum())
-                direction = direction_raw / total_width
+                t = ds / max(seg_lengths[idx], 1e-8)
 
-                left_pt = left_poly[idx] + interp_constant * (left_poly[idx + 1] - left_poly[idx])
-                
-                left_pt_final = left_pt + (-t_left * direction)
-                right_pt_final = left_pt + (-t_right * direction)
+                l = left_poly[idx] + t * (left_poly[idx + 1] - left_poly[idx])
+                r = right_poly[idx] + t * (right_poly[idx + 1] - right_poly[idx])
+                lr = r - l
+                w = np.linalg.norm(lr)
+                d = lr / max(w, 1e-8)
 
-                return left_pt_final, right_pt_final
+                lane_left = l + (-lat) * d
+                lane_right = l + (-(lat - width)) * d
+                return lane_left, lane_right
 
-            # =========================
-            # Plot lane boundaries
-            # =========================
-
-            for lane_id, lane_info in road.lane_data.items():
-                lat = lane_info["lateral_position"]
-                width = lane_info["width"]
-                print(lat, width)
-
-                lane_left_pts = []
-                lane_right_pts = []
-
+            for lane_id in sorted(road.lane_data):
+                pts_left = []
+                pts_right = []
                 for i in range(len(left_poly)):
                     l = left_poly[i]
                     r = right_poly[i]
-                    road_left_to_right = (r - l)
-                    road_width = (road_left_to_right ** 2).sum() ** 0.5
-                    lane_lateral_direction = (r - l) / road_width
+                    d = r - l
+                    w = np.linalg.norm(d)
+                    d = d / max(w, 1e-8)
+                    lat = float(road.lane_data[lane_id]["lateral_position"])
+                    width = float(road.lane_data[lane_id]["width"])
+                    pts_left.append(l + (-lat) * d)
+                    pts_right.append(l + (-(lat - width)) * d)
 
-
-                    lane_left = l + (lane_lateral_direction * -lat)
-                    lane_right = l + (lane_lateral_direction * -(lat - width))
-
-                    lane_left_pts.append(lane_left)
-                    lane_right_pts.append(lane_right)
-
-                lane_left_pts = np.array(lane_left_pts)
-                lane_right_pts = np.array(lane_right_pts)
-
-                fig.add_trace(go.Scatter(
-                    x=lane_left_pts[:, 0],
-                    y=lane_left_pts[:, 1],
-                    mode="lines",
-                    line=dict(width=1, dash="dot"),
-                    showlegend=False
-                ))
-
-                fig.add_trace(go.Scatter(
-                    x=lane_right_pts[:, 0],
-                    y=lane_right_pts[:, 1],
-                    mode="lines",
-                    line=dict(width=1, dash="dot"),
-                    showlegend=False
-                ))
-
-            # =========================
-            # Plot cell boundaries
-            # =========================
+                pts_left = np.array(pts_left)
+                pts_right = np.array(pts_right)
+                fig.add_trace(go.Scatter(x=pts_left[:, 0], y=pts_left[:, 1], mode="lines",
+                                         line=dict(width=1, dash="dot"), showlegend=False))
+                fig.add_trace(go.Scatter(x=pts_right[:, 0], y=pts_right[:, 1], mode="lines",
+                                         line=dict(width=1, dash="dot"), showlegend=False))
 
             for cell in road.cells.values():
-                lane_data = road.lane_data[cell.lane]
-                left_pt_back, right_pt_back = interpolate_pair(cell.start_s, lane_data["lateral_position"], lane_data["lateral_position"] - lane_data["width"])
-                left_pt_front, right_pt_front = interpolate_pair(cell.end_s, lane_data["lateral_position"], lane_data["lateral_position"] - lane_data["width"])
-                '''
-                fig.add_trace(go.Scatter(
-                    x=[left_pt[0], right_pt[0]],
-                    y=[left_pt[1], right_pt[1]],
-                    mode="lines",
-                    line=dict(width=1, color="gray"),
-                    showlegend=False
-                ))
-                '''
-                x = [left_pt_back[0], right_pt_back[0], right_pt_front[0], left_pt_front[0]]
-                y = [left_pt_back[1], right_pt_back[1], right_pt_front[1], left_pt_front[1]]
-                fig.add_trace(go.Scatter(
-                    x=x,
-                    y=y,
-                    fill="toself",
-                    mode="lines",
-                    line=dict(color="blue"),
-                    fillcolor="lightblue",
-                    name="Rectangle",
-                    showlegend=False
-                ))
+                p1, p2 = interpolate_lane_edges(cell.start_s, cell.lane)
+                p3, p4 = interpolate_lane_edges(cell.end_s, cell.lane)
+                x = [p1[0], p2[0], p4[0], p3[0], p1[0]]
+                y = [p1[1], p2[1], p4[1], p3[1], p1[1]]
+                fig.add_trace(
+                    go.Scatter(
+                        x=x,
+                        y=y,
+                        fill="toself",
+                        mode="lines",
+                        line=dict(color="blue"),
+                        fillcolor="rgba(173,216,230,0.3)",
+                        showlegend=False,
+                    )
+                )
 
         fig.update_layout(
             title="Road Network Geometry",
             xaxis=dict(scaleanchor="y"),
             yaxis=dict(),
-            template="plotly_white"
+            template="plotly_white",
         )
-
         fig.show()
 
+
 # =========================
-# Ground-truth data model
+# Ground-truth data
 # =========================
 
 REQUIRED_GT_COLUMNS = {
@@ -399,10 +328,6 @@ REQUIRED_GT_COLUMNS = {
 
 
 class GroundTruthStore:
-    """
-    Thin wrapper over a parquet table of time-indexed cell statistics.
-    """
-
     def __init__(self, df: pd.DataFrame):
         missing = REQUIRED_GT_COLUMNS - set(df.columns)
         if missing:
@@ -417,29 +342,21 @@ class GroundTruthStore:
         self.df["velocity"] = self.df["velocity"].astype(float)
         self.df["inflow"] = self.df["inflow"].astype(float)
         self.df["outflow"] = self.df["outflow"].astype(float)
-
         self.df.sort_values(["time", "road_id", "cell_id"], inplace=True)
         self.df.reset_index(drop=True, inplace=True)
 
     @staticmethod
     def from_parquet(parquet_path: str) -> "GroundTruthStore":
-        df = pd.read_parquet(parquet_path)
-        return GroundTruthStore(df)
+        return GroundTruthStore(pd.read_parquet(parquet_path))
 
-    def snapshot_at_time(
-        self, time_value: float, tolerance: float = 1e-6
-    ) -> pd.DataFrame:
-        """
-        Return rows for the nearest matching timestamp within tolerance.
-        """
+    def snapshot_at_time(self, time_value: float, tolerance: float = 1e-6) -> pd.DataFrame:
         unique_times = self.df["time"].unique()
-        idx = np.argmin(np.abs(unique_times - time_value))
+        idx = int(np.argmin(np.abs(unique_times - time_value)))
         chosen_time = float(unique_times[idx])
 
         if abs(chosen_time - time_value) > tolerance:
             raise KeyError(
-                f"No ground-truth snapshot near time={time_value}. "
-                f"Closest available is {chosen_time}."
+                f"No ground-truth snapshot near time={time_value}. Closest available is {chosen_time}."
             )
 
         out = self.df[self.df["time"] == chosen_time].copy()
@@ -451,14 +368,309 @@ class GroundTruthStore:
     ) -> None:
         snapshot = self.snapshot_at_time(time_value, tolerance=tolerance)
         for _, row in snapshot.iterrows():
-            road_id = str(row["road_id"])
-            cell_id = str(row["cell_id"])
-            density = float(row["density"])
-            network.get_cell(road_id, cell_id).density = density
+            network.get_cell(str(row["road_id"]), str(row["cell_id"])).density = float(row["density"])
 
 
 # =========================
-# CTM / LWR Simulation
+# Mask overlays / active mesh
+# =========================
+
+@dataclass
+class MaskedSegmentRef:
+    road_id: str
+    lane: int
+    start_s: float
+    end_s: float
+
+    def validate(self) -> None:
+        if self.end_s <= self.start_s:
+            raise ValueError(
+                f"Invalid masked segment on {self.road_id}, lane {self.lane}: "
+                f"[{self.start_s}, {self.end_s}]"
+            )
+
+
+class ArbitraryMaskingCell(ABC):
+    """
+    Dynamic overlay that replaces native CTM logic over one or more
+    connected road/lane intervals.
+    """
+
+    def __init__(self, mask_id: str, network: Network, segments: List[MaskedSegmentRef]):
+        self.mask_id = str(mask_id)
+        self.network = network
+        self.segments = segments
+        self.validate()
+
+    def validate(self) -> None:
+        if len(self.segments) == 0:
+            raise ValueError(f"Mask {self.mask_id} must have at least one segment.")
+        for seg in self.segments:
+            seg.validate()
+            if seg.road_id not in self.network.roads:
+                raise KeyError(f"Mask {self.mask_id}: road '{seg.road_id}' not found.")
+            if seg.lane not in self.network.roads[seg.road_id].lane_data:
+                raise KeyError(
+                    f"Mask {self.mask_id}: lane {seg.lane} not in road {seg.road_id}."
+                )
+
+    @abstractmethod
+    def demand(self, sim_time: float) -> float:
+        raise NotImplementedError
+
+    @abstractmethod
+    def supply(self, sim_time: float) -> float:
+        raise NotImplementedError
+
+    def update(self, sim_time: float, dt: float) -> None:
+        """
+        Optional hook for moving masks.
+        Override in subclasses.
+        """
+        return
+
+
+@dataclass
+class ActiveCell:
+    active_cell_id: str
+    road_id: str
+    lane: int
+    start_s: float
+    end_s: float
+    kind: str  # "normal" or "mask"
+    density: float
+    base_segments: List[Tuple[Connection, float, float]] = field(default_factory=list)
+    mask_id: Optional[str] = None
+    inflow_neighbors: List[str] = field(default_factory=list)
+    outflow_neighbors: List[str] = field(default_factory=list)
+
+    @property
+    def length(self) -> float:
+        return float(self.end_s - self.start_s)
+
+    @property
+    def mass(self) -> float:
+        return float(self.density * self.length)
+
+
+@dataclass
+class ActiveNetwork:
+    active_cells: Dict[str, ActiveCell] = field(default_factory=dict)
+
+    def ordered_ids(self) -> List[str]:
+        keys = list(self.active_cells.keys())
+        keys.sort(key=lambda k: (
+            self.active_cells[k].road_id,
+            self.active_cells[k].lane,
+            self.active_cells[k].start_s,
+            self.active_cells[k].end_s,
+            self.active_cells[k].active_cell_id,
+        ))
+        return keys
+
+
+class ActiveMeshBuilder:
+    """
+    Builds a timestep-specific active CTM mesh from:
+    - static base network
+    - dynamic mask overlays
+    """
+
+    def __init__(self, network: Network, masks: Dict[str, ArbitraryMaskingCell], min_cell_length: float):
+        self.network = network
+        self.masks = masks
+        self.min_cell_length = float(min_cell_length)
+
+    def build(self) -> ActiveNetwork:
+        active = ActiveNetwork()
+
+        for road_id, road in self.network.roads.items():
+            for lane in sorted(road.lane_data):
+                lane_cells = road.cells_for_lane(lane)
+                if not lane_cells:
+                    continue
+
+                cut_points: Set[float] = set()
+                for c in lane_cells:
+                    cut_points.add(float(c.start_s))
+                    cut_points.add(float(c.end_s))
+
+                lane_masks: List[Tuple[str, float, float]] = []
+                for mask_id, mask in self.masks.items():
+                    for seg in mask.segments:
+                        if seg.road_id == road_id and seg.lane == lane:
+                            cut_points.add(float(seg.start_s))
+                            cut_points.add(float(seg.end_s))
+                            lane_masks.append((mask_id, float(seg.start_s), float(seg.end_s)))
+
+                points = sorted(cut_points)
+                raw_intervals: List[Dict[str, Any]] = []
+
+                for i in range(len(points) - 1):
+                    a = points[i]
+                    b = points[i + 1]
+                    if b <= a:
+                        continue
+
+                    owners = []
+                    for mask_id, ms, me in lane_masks:
+                        if a >= ms - 1e-9 and b <= me + 1e-9:
+                            owners.append(mask_id)
+
+                    if len(owners) > 1:
+                        raise ValueError(
+                            f"Overlapping masks detected on {road_id}, lane {lane}, interval [{a}, {b}]"
+                        )
+
+                    mask_id = owners[0] if owners else None
+
+                    overlaps: List[Tuple[Connection, float, float]] = []
+                    for c in lane_cells:
+                        s0 = max(a, c.start_s)
+                        s1 = min(b, c.end_s)
+                        if s1 > s0:
+                            overlaps.append(((c.road_id, c.cell_id), float(s0), float(s1)))
+
+                    if len(overlaps) == 0:
+                        continue
+
+                    raw_intervals.append(
+                        {
+                            "road_id": road_id,
+                            "lane": lane,
+                            "start_s": a,
+                            "end_s": b,
+                            "kind": "mask" if mask_id is not None else "normal",
+                            "mask_id": mask_id,
+                            "base_segments": overlaps,
+                        }
+                    )
+
+                merged = self._merge_small_intervals(raw_intervals)
+
+                for idx, item in enumerate(merged):
+                    active_cell_id = f"{road_id}|lane{lane}|{idx}"
+                    active.active_cells[active_cell_id] = ActiveCell(
+                        active_cell_id=active_cell_id,
+                        road_id=road_id,
+                        lane=lane,
+                        start_s=float(item["start_s"]),
+                        end_s=float(item["end_s"]),
+                        kind=str(item["kind"]),
+                        density=0.0,
+                        base_segments=list(item["base_segments"]),
+                        mask_id=item["mask_id"],
+                    )
+
+        self._build_neighbors(active)
+        return active
+
+    def _merge_small_intervals(self, intervals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not intervals:
+            return []
+
+        intervals = sorted(intervals, key=lambda x: (x["start_s"], x["end_s"]))
+        changed = True
+
+        while changed:
+            changed = False
+            out: List[Dict[str, Any]] = []
+            i = 0
+            while i < len(intervals):
+                cur = copy.deepcopy(intervals[i])
+                cur_len = float(cur["end_s"] - cur["start_s"])
+
+                if cur_len >= self.min_cell_length or len(intervals) == 1:
+                    out.append(cur)
+                    i += 1
+                    continue
+
+                left_ok = len(out) > 0
+                right_ok = (i + 1) < len(intervals)
+
+                chosen = None
+                if left_ok:
+                    left = out[-1]
+                    if left["kind"] == cur["kind"] and left.get("mask_id") == cur.get("mask_id"):
+                        chosen = "left"
+                if chosen is None and right_ok:
+                    right = intervals[i + 1]
+                    if right["kind"] == cur["kind"] and right.get("mask_id") == cur.get("mask_id"):
+                        chosen = "right"
+                if chosen is None and left_ok:
+                    chosen = "left"
+                if chosen is None and right_ok:
+                    chosen = "right"
+
+                if chosen == "left":
+                    out[-1]["end_s"] = cur["end_s"]
+                    out[-1]["base_segments"].extend(cur["base_segments"])
+                    changed = True
+                    i += 1
+                elif chosen == "right":
+                    right = copy.deepcopy(intervals[i + 1])
+                    right["start_s"] = cur["start_s"]
+                    right["base_segments"] = list(cur["base_segments"]) + list(right["base_segments"])
+                    out.append(right)
+                    changed = True
+                    i += 2
+                else:
+                    out.append(cur)
+                    i += 1
+
+            intervals = out
+
+        return intervals
+
+    def _build_neighbors(self, active: ActiveNetwork) -> None:
+        by_lane: Dict[Tuple[str, int], List[ActiveCell]] = {}
+        for ac in active.active_cells.values():
+            by_lane.setdefault((ac.road_id, ac.lane), []).append(ac)
+
+        for _, lane_cells in by_lane.items():
+            lane_cells.sort(key=lambda c: (c.start_s, c.end_s))
+            for i, cell in enumerate(lane_cells):
+                if i > 0:
+                    cell.inflow_neighbors.append(lane_cells[i - 1].active_cell_id)
+                if i + 1 < len(lane_cells):
+                    cell.outflow_neighbors.append(lane_cells[i + 1].active_cell_id)
+
+
+class ConservativeRemapper:
+    @staticmethod
+    def base_to_active(network: Network, active: ActiveNetwork) -> None:
+        for ac in active.active_cells.values():
+            total_mass = 0.0
+            for (base_key, s0, s1) in ac.base_segments:
+                base_cell = network.get_cell(*base_key)
+                overlap_len = s1 - s0
+                total_mass += float(base_cell.density * overlap_len)
+
+            ac.density = 0.0 if ac.length <= 1e-12 else total_mass / ac.length
+
+    @staticmethod
+    def active_to_base(network: Network, active: ActiveNetwork) -> None:
+        base_mass_updates: Dict[Connection, float] = {}
+        base_lengths: Dict[Connection, float] = {}
+
+        for road in network.roads.values():
+            for cell in road.cells.values():
+                base_mass_updates[(cell.road_id, cell.cell_id)] = 0.0
+                base_lengths[(cell.road_id, cell.cell_id)] = float(cell.length)
+
+        for ac in active.active_cells.values():
+            for (base_key, s0, s1) in ac.base_segments:
+                overlap_len = s1 - s0
+                base_mass_updates[base_key] += float(ac.density * overlap_len)
+
+        for base_key, mass in base_mass_updates.items():
+            cell = network.get_cell(*base_key)
+            L = base_lengths[base_key]
+            cell.density = 0.0 if L <= 1e-12 else mass / L
+
+
+# =========================
+# CTM / simulation
 # =========================
 
 @dataclass
@@ -469,13 +681,13 @@ class RolloutStep:
 
 class Simulation:
     """
-    Simplified LWR-CTM simulator.
-
-    Notes:
-    - Uses a triangular fundamental diagram.
-    - Uses equal split at diverges.
-    - Uses equal-priority supply allocation at merges.
-    - Keeps densities in Cell objects, but uses jax.numpy internally each step.
+    Base state lives on the static Network.
+    Each timestep:
+    - update masks
+    - build active mesh
+    - remap base -> active
+    - run CTM on active mesh
+    - remap active -> base
     """
 
     def __init__(
@@ -488,22 +700,8 @@ class Simulation:
         jam_density: float,
         inflow_boundary_map: Optional[Dict[Connection, float]] = None,
         outflow_boundary_map: Optional[Dict[Connection, float]] = None,
+        min_cell_length: Optional[float] = None,
     ):
-        """
-        Args:
-            network: Network object.
-            time_resolution: dt in seconds.
-            origin_time: UNIX start time.
-            free_flow_speed: v_f in m/s.
-            congestion_wave_speed: w in m/s (positive scalar).
-            jam_density: rho_j in veh/m.
-            inflow_boundary_map:
-                Optional map for source cells with no predecessors:
-                max inflow into that cell in veh/s.
-            outflow_boundary_map:
-                Optional map for sink cells with no successors:
-                max outflow from that cell in veh/s.
-        """
         self.network = network
         self.time_resolution = float(time_resolution)
         self.origin_time = float(origin_time)
@@ -521,7 +719,6 @@ class Simulation:
         if self.jam_density <= 0.0:
             raise ValueError("jam_density must be > 0.")
 
-        # Capacity for triangular FD
         self.capacity = (
             self.free_flow_speed
             * self.congestion_wave_speed
@@ -532,11 +729,15 @@ class Simulation:
         self.inflow_boundary_map = inflow_boundary_map or {}
         self.outflow_boundary_map = outflow_boundary_map or {}
 
-        self.network.validate()
+        self.min_cell_length = (
+            float(min_cell_length)
+            if min_cell_length is not None
+            else float(self.free_flow_speed * self.time_resolution)
+        )
 
-    # -------------------------
-    # Network loaders
-    # -------------------------
+        self.masking_cells: Dict[str, ArbitraryMaskingCell] = {}
+
+        self.network.validate()
 
     @staticmethod
     def from_json(
@@ -548,6 +749,7 @@ class Simulation:
         jam_density: float,
         inflow_boundary_map: Optional[Dict[Connection, float]] = None,
         outflow_boundary_map: Optional[Dict[Connection, float]] = None,
+        min_cell_length: Optional[float] = None,
     ) -> "Simulation":
         network = Network.from_json(json_path)
         return Simulation(
@@ -559,126 +761,108 @@ class Simulation:
             jam_density=jam_density,
             inflow_boundary_map=inflow_boundary_map,
             outflow_boundary_map=outflow_boundary_map,
+            min_cell_length=min_cell_length,
         )
 
-    # -------------------------
-    # Fundamental diagram
-    # -------------------------
+    def add_masking_cell(self, mask: ArbitraryMaskingCell) -> None:
+        if mask.mask_id in self.masking_cells:
+            raise KeyError(f"Mask '{mask.mask_id}' already exists.")
+        self.masking_cells[mask.mask_id] = mask
 
-    def demand(self, rho: jnp.ndarray) -> jnp.ndarray:
-        """
-        Sending flow S(rho) in veh/s.
-        """
-        return jnp.minimum(self.free_flow_speed * rho, self.capacity)
-
-    def supply(self, rho: jnp.ndarray) -> jnp.ndarray:
-        """
-        Receiving flow R(rho) in veh/s.
-        """
-        return jnp.minimum(
-            self.capacity,
-            self.congestion_wave_speed * jnp.maximum(self.jam_density - rho, 0.0),
-        )
-
-    def velocity_from_density(self, rho: jnp.ndarray) -> jnp.ndarray:
-        """
-        Simple velocity estimate consistent with q = rho * v:
-        v = min(v_f, q(rho)/rho), with v=0 if rho=0.
-        """
-        q = jnp.minimum(
-            self.free_flow_speed * rho,
-            self.congestion_wave_speed * jnp.maximum(self.jam_density - rho, 0.0),
-        )
-        return jnp.where(rho > 1e-12, q / rho, self.free_flow_speed)
-
-    # -------------------------
-    # State helpers
-    # -------------------------
-
-    def _cell_key_order(self) -> List[Connection]:
-        return self.network.all_cell_keys()
-
-    def _densities_to_jax(self, cell_order: List[Connection]) -> jnp.ndarray:
-        return jnp.array(
-            [self.network.get_cell(r, c).density for (r, c) in cell_order],
-            dtype=jnp.float32,
-        )
-
-    def _lengths_to_jax(self, cell_order: List[Connection]) -> jnp.ndarray:
-        return jnp.array(
-            [self.network.get_cell(r, c).length for (r, c) in cell_order],
-            dtype=jnp.float32,
-        )
-
-    def _write_densities_back(
-        self, cell_order: List[Connection], densities: jnp.ndarray
-    ) -> None:
-        densities_np = np.asarray(densities, dtype=np.float64)
-        for i, (r, c) in enumerate(cell_order):
-            self.network.get_cell(r, c).density = float(densities_np[i])
+    def remove_masking_cell(self, mask_id: str) -> None:
+        if mask_id in self.masking_cells:
+            del self.masking_cells[mask_id]
 
     def _snapshot(self) -> None:
         self.rollout_results.append(
             RolloutStep(sim_time=self.current_time, network=self.network.clone())
         )
 
-    # -------------------------
-    # Flow allocation
-    # -------------------------
+    def demand(self, rho: jnp.ndarray) -> jnp.ndarray:
+        return jnp.minimum(self.free_flow_speed * rho, self.capacity)
 
-    def _compute_edge_flows(
+    def supply(self, rho: jnp.ndarray) -> jnp.ndarray:
+        return jnp.minimum(
+            self.capacity,
+            self.congestion_wave_speed * jnp.maximum(self.jam_density - rho, 0.0),
+        )
+
+    def velocity_from_density(self, rho: jnp.ndarray) -> jnp.ndarray:
+        q = jnp.minimum(
+            self.free_flow_speed * rho,
+            self.congestion_wave_speed * jnp.maximum(self.jam_density - rho, 0.0),
+        )
+        return jnp.where(rho > 1e-12, q / rho, self.free_flow_speed)
+
+    def initialize_from_ground_truth(
         self,
-        rho_map: Dict[Connection, float],
-    ) -> Dict[Tuple[Connection, Connection], float]:
-        """
-        Compute flow on each directed edge predecessor -> successor.
+        gt_store: GroundTruthStore,
+        time_value: Optional[float] = None,
+        tolerance: float = 1e-6,
+    ) -> None:
+        t = self.current_time if time_value is None else float(time_value)
+        gt_store.apply_density_snapshot_to_network(self.network, t, tolerance=tolerance)
 
-        Simplification:
-        - Diverge: predecessor demand split equally among successors.
-        - Merge: successor supply apportioned equally among predecessors.
-        - Edge flow = min(allocated predecessor demand, allocated successor supply)
-        - Then per-successor rescaling enforces total incoming flow <= successor supply
-        - Then per-predecessor rescaling enforces total outgoing flow <= predecessor demand
+    def _update_masks(self) -> None:
+        for mask in self.masking_cells.values():
+            mask.update(self.current_time, self.time_resolution)
+            mask.validate()
 
-        This is a reasonable simple baseline for a one-way highway.
-        """
-        cell_keys = list(rho_map.keys())
+    def _build_active_network(self) -> ActiveNetwork:
+        builder = ActiveMeshBuilder(
+            network=self.network,
+            masks=self.masking_cells,
+            min_cell_length=self.min_cell_length,
+        )
+        active = builder.build()
+        ConservativeRemapper.base_to_active(self.network, active)
+        return active
 
-        demand_map: Dict[Connection, float] = {}
-        supply_map: Dict[Connection, float] = {}
+    def _compute_active_demand_supply(
+        self, active: ActiveNetwork
+    ) -> Tuple[Dict[str, float], Dict[str, float]]:
+        demand_map: Dict[str, float] = {}
+        supply_map: Dict[str, float] = {}
 
-        for key in cell_keys:
-            rho = float(rho_map[key])
-            d = min(self.free_flow_speed * rho, self.capacity)
-            s = min(self.capacity, self.congestion_wave_speed * max(self.jam_density - rho, 0.0))
-            demand_map[key] = d
-            supply_map[key] = s
+        for aid, ac in active.active_cells.items():
+            if ac.kind == "normal":
+                rho = float(ac.density)
+                demand_map[aid] = min(self.free_flow_speed * rho, self.capacity)
+                supply_map[aid] = min(
+                    self.capacity,
+                    self.congestion_wave_speed * max(self.jam_density - rho, 0.0),
+                )
+            elif ac.kind == "mask":
+                mask = self.masking_cells[ac.mask_id]
+                demand_map[aid] = float(mask.demand(self.current_time))
+                supply_map[aid] = float(mask.supply(self.current_time))
+            else:
+                raise ValueError(f"Unknown active cell kind: {ac.kind}")
 
-        # Raw per-edge proposals
-        edge_flow: Dict[Tuple[Connection, Connection], float] = {}
+        return demand_map, supply_map
 
-        # First pass: equal split across outgoing and incoming degree
-        for u in cell_keys:
-            u_cell = self.network.get_cell(*u)
-            successors = u_cell.outflow_connections
+    def _compute_active_edge_flows(
+        self, active: ActiveNetwork
+    ) -> Tuple[Dict[Tuple[str, str], float], Dict[str, float], Dict[str, float]]:
+        demand_map, supply_map = self._compute_active_demand_supply(active)
 
-            if len(successors) == 0:
+        edge_flow: Dict[Tuple[str, str], float] = {}
+
+        active_ids = active.ordered_ids()
+        for u in active_ids:
+            u_cell = active.active_cells[u]
+            succ = list(u_cell.outflow_neighbors)
+            if len(succ) == 0:
                 continue
 
-            per_out_demand = demand_map[u] / float(len(successors))
-
-            for v in successors:
-                v_cell = self.network.get_cell(*v)
-                predecessors_of_v = v_cell.inflow_connections
-                if len(predecessors_of_v) == 0:
-                    per_in_supply = supply_map[v]
-                else:
-                    per_in_supply = supply_map[v] / float(len(predecessors_of_v))
-
+            per_out_demand = demand_map[u] / float(len(succ))
+            for v in succ:
+                v_cell = active.active_cells[v]
+                preds = list(v_cell.inflow_neighbors)
+                per_in_supply = supply_map[v] if len(preds) == 0 else supply_map[v] / float(len(preds))
                 edge_flow[(u, v)] = min(per_out_demand, per_in_supply)
 
-        # Enforce successor supply
-        for v in cell_keys:
+        for v in active_ids:
             incoming_edges = [e for e in edge_flow if e[1] == v]
             if not incoming_edges:
                 continue
@@ -689,8 +873,7 @@ class Simulation:
                 for e in incoming_edges:
                     edge_flow[e] *= scale
 
-        # Enforce predecessor demand
-        for u in cell_keys:
+        for u in active_ids:
             outgoing_edges = [e for e in edge_flow if e[0] == u]
             if not outgoing_edges:
                 continue
@@ -701,123 +884,68 @@ class Simulation:
                 for e in outgoing_edges:
                     edge_flow[e] *= scale
 
-        return edge_flow
+        external_inflow: Dict[str, float] = {}
+        external_outflow: Dict[str, float] = {}
+        for aid in active_ids:
+            ac = active.active_cells[aid]
+            if len(ac.inflow_neighbors) == 0:
+                base_key = ac.base_segments[0][0]
+                external_inflow[aid] = min(
+                    float(self.inflow_boundary_map.get(base_key, self.capacity)),
+                    supply_map[aid],
+                )
+            if len(ac.outflow_neighbors) == 0:
+                base_key = ac.base_segments[-1][0]
+                external_outflow[aid] = min(
+                    demand_map[aid],
+                    float(self.outflow_boundary_map.get(base_key, self.capacity)),
+                )
 
-    def _compute_boundary_flows(
-        self,
-        rho_map: Dict[Connection, float],
-    ) -> Tuple[Dict[Connection, float], Dict[Connection, float]]:
-        """
-        Boundary source/sink flows for cells with no predecessors / no successors.
+        return edge_flow, external_inflow, external_outflow
 
-        Returns:
-            external_inflow[cell]  in veh/s
-            external_outflow[cell] in veh/s
-        """
-        external_inflow: Dict[Connection, float] = {}
-        external_outflow: Dict[Connection, float] = {}
+    def _step_active_network(self, active: ActiveNetwork) -> None:
+        active_ids = active.ordered_ids()
+        index_of = {aid: i for i, aid in enumerate(active_ids)}
 
-        for key, rho in rho_map.items():
-            cell = self.network.get_cell(*key)
-            rho_val = float(rho)
-            demand_val = min(self.free_flow_speed * rho_val, self.capacity)
-            supply_val = min(
-                self.capacity,
-                self.congestion_wave_speed * max(self.jam_density - rho_val, 0.0),
-            )
+        densities = np.array([active.active_cells[aid].density for aid in active_ids], dtype=np.float64)
+        lengths = np.array([active.active_cells[aid].length for aid in active_ids], dtype=np.float64)
 
-            if len(cell.inflow_connections) == 0:
-                upstream_max = float(self.inflow_boundary_map.get(key, self.capacity))
-                external_inflow[key] = min(upstream_max, supply_val)
+        edge_flow, external_inflow, external_outflow = self._compute_active_edge_flows(active)
+        net_flow = np.zeros(len(active_ids), dtype=np.float64)
 
-            if len(cell.outflow_connections) == 0:
-                downstream_max = float(self.outflow_boundary_map.get(key, self.capacity))
-                external_outflow[key] = min(demand_val, downstream_max)
-
-        return external_inflow, external_outflow
-
-    # -------------------------
-    # Simulation step
-    # -------------------------
-
-    def step(self) -> None:
-        """
-        Advance by one timestep using CTM:
-            rho^{n+1} = rho^n + dt/L * (sum inflows - sum outflows)
-        """
-        self._snapshot()
-
-        cell_order = self._cell_key_order()
-        rho = self._densities_to_jax(cell_order)
-        lengths = self._lengths_to_jax(cell_order)
-
-        rho_np = np.asarray(rho, dtype=np.float64)
-        lengths_np = np.asarray(lengths, dtype=np.float64)
-
-        rho_map: Dict[Connection, float] = {
-            key: float(rho_np[i]) for i, key in enumerate(cell_order)
-        }
-
-        edge_flow = self._compute_edge_flows(rho_map)
-        external_inflow, external_outflow = self._compute_boundary_flows(rho_map)
-
-        net_flow = np.zeros(len(cell_order), dtype=np.float64)
-
-        index_of = {key: i for i, key in enumerate(cell_order)}
-
-        # Internal edge flows
         for (u, v), q in edge_flow.items():
-            ui = index_of[u]
-            vi = index_of[v]
-            net_flow[ui] -= q
-            net_flow[vi] += q
+            net_flow[index_of[u]] -= q
+            net_flow[index_of[v]] += q
 
-        # Boundary flows
-        for cell_key, q in external_inflow.items():
-            idx = index_of[cell_key]
-            net_flow[idx] += q
+        for aid, q in external_inflow.items():
+            net_flow[index_of[aid]] += q
 
-        for cell_key, q in external_outflow.items():
-            idx = index_of[cell_key]
-            net_flow[idx] -= q
+        for aid, q in external_outflow.items():
+            net_flow[index_of[aid]] -= q
 
         dt = self.time_resolution
-        new_rho = rho_np + dt * net_flow / lengths_np
-        new_rho = np.clip(new_rho, 0.0, self.jam_density)
+        new_densities = densities + dt * net_flow / np.maximum(lengths, 1e-12)
+        new_densities = np.clip(new_densities, 0.0, self.jam_density)
 
-        self._write_densities_back(cell_order, jnp.array(new_rho, dtype=jnp.float32))
+        for i, aid in enumerate(active_ids):
+            active.active_cells[aid].density = float(new_densities[i])
+
+    def step(self) -> None:
+        self._snapshot()
+        self._update_masks()
+        active = self._build_active_network()
+        self._step_active_network(active)
+        ConservativeRemapper.active_to_base(self.network, active)
         self.current_time += self.time_resolution
 
     def run(self, duration: float) -> None:
-        """
-        Roll out the simulation for a desired duration in seconds.
-        """
         if duration < 0.0:
             raise ValueError("duration must be non-negative.")
         num_steps = int(np.round(duration / self.time_resolution))
         for _ in range(num_steps):
             self.step()
 
-    # -------------------------
-    # Optional utilities
-    # -------------------------
-
-    def initialize_from_ground_truth(
-        self,
-        gt_store: GroundTruthStore,
-        time_value: Optional[float] = None,
-        tolerance: float = 1e-6,
-    ) -> None:
-        """
-        Set cell densities from a ground-truth snapshot.
-        """
-        t = self.current_time if time_value is None else float(time_value)
-        gt_store.apply_density_snapshot_to_network(self.network, t, tolerance=tolerance)
-
     def current_state_dataframe(self) -> pd.DataFrame:
-        """
-        Return current cell states as a DataFrame.
-        """
         rows = []
         for road_id, road in self.network.roads.items():
             for cell_id, cell in road.cells.items():
@@ -841,9 +969,6 @@ class Simulation:
         return pd.DataFrame(rows)
 
     def rollout_dataframe(self) -> pd.DataFrame:
-        """
-        Flatten all stored rollout snapshots into a DataFrame.
-        """
         rows = []
         for step in self.rollout_results:
             net = step.network
@@ -873,25 +998,59 @@ class Simulation:
 
 
 # =========================
+# Example mask subclass
+# =========================
+
+class FixedScalarMask(ArbitraryMaskingCell):
+    """
+    Simple example masking cell with fixed scalar demand/supply.
+    """
+
+    def __init__(
+        self,
+        mask_id: str,
+        network: Network,
+        segments: List[MaskedSegmentRef],
+        demand_value: float,
+        supply_value: float,
+    ):
+        super().__init__(mask_id=mask_id, network=network, segments=segments)
+        self.demand_value = float(demand_value)
+        self.supply_value = float(supply_value)
+
+    def demand(self, sim_time: float) -> float:
+        return self.demand_value
+
+    def supply(self, sim_time: float) -> float:
+        return self.supply_value
+
+
+# =========================
 # Example usage
 # =========================
 
 if __name__ == "__main__":
-    # Example:
-    #
     # sim = Simulation.from_json(
     #     json_path="network.json",
     #     time_resolution=1.0,
     #     origin_time=1669819550.0,
-    #     free_flow_speed=30.0,         # m/s
-    #     congestion_wave_speed=5.0,    # m/s
-    #     jam_density=0.16,             # veh/m
+    #     free_flow_speed=30.0,
+    #     congestion_wave_speed=5.0,
+    #     jam_density=0.16,
     # )
     #
     # gt = GroundTruthStore.from_parquet("ground_truth.parquet")
     # sim.initialize_from_ground_truth(gt, time_value=1669819550.0)
-    # sim.run(duration=300.0)
-    # sim.save_rollout_parquet("ctm_rollout.parquet")
     #
+    # mask = FixedScalarMask(
+    #     mask_id="mask_1",
+    #     network=sim.network,
+    #     segments=[MaskedSegmentRef("road_a", -1, 100.0, 160.0)],
+    #     demand_value=0.4,
+    #     supply_value=0.2,
+    # )
+    # sim.add_masking_cell(mask)
+    #
+    # sim.run(duration=60.0)
     # print(sim.current_state_dataframe().head())
     pass
