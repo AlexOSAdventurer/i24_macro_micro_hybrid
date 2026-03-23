@@ -5,6 +5,7 @@ from typing import Dict, List, Tuple, Optional, Any
 import copy
 import json
 
+import plotly.graph_objects as go
 import jax.numpy as jnp
 import numpy as np
 import pandas as pd
@@ -47,17 +48,47 @@ class Cell:
 @dataclass
 class Road:
     road_id: str
-    polyline: List[Tuple[float, float]]
+
+    left_polyline: List[Tuple[float, float]]
+    right_polyline: List[Tuple[float, float]]
+
+    lane_data: Dict[int, Dict[str, float]] = field(default_factory=dict)
+
     cells: Dict[str, Cell] = field(default_factory=dict)
 
     def validate(self) -> None:
-        if len(self.polyline) < 2:
-            raise ValueError(f"Road {self.road_id} must have at least 2 polyline points.")
+        if len(self.left_polyline) < 2 or len(self.right_polyline) < 2:
+            raise ValueError(f"Road {self.road_id} must have valid left/right polylines.")
+
+        if len(self.left_polyline) != len(self.right_polyline):
+            raise ValueError(
+                f"Road {self.road_id} left/right polylines must have same length."
+            )
+
+        # Validate lane_data
+        for lane_id, lane_info in self.lane_data.items():
+            if "lateral_position" not in lane_info or "width" not in lane_info:
+                raise ValueError(
+                    f"Lane {lane_id} in road {self.road_id} missing required fields."
+                )
+
+            if lane_info["width"] <= 0:
+                raise ValueError(
+                    f"Lane {lane_id} in road {self.road_id} has non-positive width."
+                )
+
+        # Validate cells
         for cell in self.cells.values():
             if cell.road_id != self.road_id:
                 raise ValueError(
                     f"Cell {cell.cell_id} road_id mismatch: {cell.road_id} != {self.road_id}"
                 )
+
+            if cell.lane not in self.lane_data:
+                raise ValueError(
+                    f"Cell {cell.cell_id} references lane {cell.lane} not in lane_data."
+                )
+
             cell.validate()
 
 
@@ -103,7 +134,18 @@ class Network:
             "roads": {
                 road_id: {
                     "road_id": road.road_id,
-                    "polyline": [[float(x), float(y)] for x, y in road.polyline],
+
+                    "left_polyline": [[float(x), float(y)] for x, y in road.left_polyline],
+                    "right_polyline": [[float(x), float(y)] for x, y in road.right_polyline],
+
+                    "lane_data": {
+                        lane_id: {
+                            "lateral_position": float(lane_info["lateral_position"]),
+                            "width": float(lane_info["width"]),
+                        }
+                        for lane_id, lane_info in road.lane_data.items()
+                    },
+
                     "cells": {
                         cell_id: {
                             "road_id": cell.road_id,
@@ -123,7 +165,7 @@ class Network:
                     },
                 }
                 for road_id, road in self.roads.items()
-            },
+            }
         }
 
     @staticmethod
@@ -152,7 +194,21 @@ class Network:
 
             roads[road_id] = Road(
                 road_id=road_data["road_id"],
-                polyline=[(float(x), float(y)) for x, y in road_data["polyline"]],
+
+                left_polyline=[
+                    (float(x), float(y)) for x, y in road_data["left_polyline"]
+                ],
+                right_polyline=[
+                    (float(x), float(y)) for x, y in road_data["right_polyline"]
+                ],
+
+                lane_data={
+                    int(lane_id): {
+                        "lateral_position": float(lane_info["lateral_position"]),
+                        "width": float(lane_info["width"]),
+                    }
+                    for lane_id, lane_info in road_data["lane_data"].items()
+                },
                 cells=cells,
             )
 
@@ -170,6 +226,161 @@ class Network:
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(self.to_dict(), f, indent=2)
 
+    def plot_network(self):
+        """
+        Plot the road network geometry:
+        - left/right road boundaries
+        - lane boundaries
+        - cell boundaries
+
+        No traffic state (density/flow) is shown.
+        """
+
+        fig = go.Figure()
+
+        for road in self.roads.values():
+
+            left_poly = np.array(road.left_polyline)
+            right_poly = np.array(road.right_polyline)
+
+            # =========================
+            # Plot road boundaries
+            # =========================
+
+            fig.add_trace(go.Scatter(
+                x=left_poly[:, 0],
+                y=left_poly[:, 1],
+                mode="lines",
+                line=dict(width=3, color="black"),
+                name=f"{road.road_id} left boundary",
+                showlegend=False
+            ))
+
+            fig.add_trace(go.Scatter(
+                x=right_poly[:, 0],
+                y=right_poly[:, 1],
+                mode="lines",
+                line=dict(width=3, color="black"),
+                name=f"{road.road_id} right boundary",
+                showlegend=False
+            ))
+
+            # =========================
+            # Precompute interpolation distances
+            # =========================
+
+            seg_lengths = np.linalg.norm(np.diff(left_poly, axis=0), axis=1)
+            cumulative = np.concatenate([[0.0], np.cumsum(seg_lengths)])
+
+            total_length = cumulative[-1]
+
+            def interpolate_pair(s: float, t_left: float, t_right: float):
+                # t_left and t_right decrease in the rightward direction, so we gotta flip it
+                """Interpolate corresponding point on left and right polylines."""
+                print(s)
+                if s < 0:
+                    return None
+
+                idx = np.searchsorted(cumulative, s) - 1
+                idx = np.clip(idx, 0, len(seg_lengths) - 1)
+
+                ds = s - cumulative[idx]
+                seg_len = seg_lengths[idx]
+                interp_constant = ds / max(seg_len, 1e-8)
+                direction_raw = (right_poly[idx] - left_poly[idx])
+                total_width = np.sqrt(np.square(direction_raw).sum())
+                direction = direction_raw / total_width
+
+                left_pt = left_poly[idx] + interp_constant * (left_poly[idx + 1] - left_poly[idx])
+                
+                left_pt_final = left_pt + (-t_left * direction)
+                right_pt_final = left_pt + (-t_right * direction)
+
+                return left_pt_final, right_pt_final
+
+            # =========================
+            # Plot lane boundaries
+            # =========================
+
+            for lane_id, lane_info in road.lane_data.items():
+                lat = lane_info["lateral_position"]
+                width = lane_info["width"]
+                print(lat, width)
+
+                lane_left_pts = []
+                lane_right_pts = []
+
+                for i in range(len(left_poly)):
+                    l = left_poly[i]
+                    r = right_poly[i]
+                    road_left_to_right = (r - l)
+                    road_width = (road_left_to_right ** 2).sum() ** 0.5
+                    lane_lateral_direction = (r - l) / road_width
+
+
+                    lane_left = l + (lane_lateral_direction * -lat)
+                    lane_right = l + (lane_lateral_direction * -(lat - width))
+
+                    lane_left_pts.append(lane_left)
+                    lane_right_pts.append(lane_right)
+
+                lane_left_pts = np.array(lane_left_pts)
+                lane_right_pts = np.array(lane_right_pts)
+
+                fig.add_trace(go.Scatter(
+                    x=lane_left_pts[:, 0],
+                    y=lane_left_pts[:, 1],
+                    mode="lines",
+                    line=dict(width=1, dash="dot"),
+                    showlegend=False
+                ))
+
+                fig.add_trace(go.Scatter(
+                    x=lane_right_pts[:, 0],
+                    y=lane_right_pts[:, 1],
+                    mode="lines",
+                    line=dict(width=1, dash="dot"),
+                    showlegend=False
+                ))
+
+            # =========================
+            # Plot cell boundaries
+            # =========================
+
+            for cell in road.cells.values():
+                lane_data = road.lane_data[cell.lane]
+                left_pt_back, right_pt_back = interpolate_pair(cell.start_s, lane_data["lateral_position"], lane_data["lateral_position"] - lane_data["width"])
+                left_pt_front, right_pt_front = interpolate_pair(cell.end_s, lane_data["lateral_position"], lane_data["lateral_position"] - lane_data["width"])
+                '''
+                fig.add_trace(go.Scatter(
+                    x=[left_pt[0], right_pt[0]],
+                    y=[left_pt[1], right_pt[1]],
+                    mode="lines",
+                    line=dict(width=1, color="gray"),
+                    showlegend=False
+                ))
+                '''
+                x = [left_pt_back[0], right_pt_back[0], right_pt_front[0], left_pt_front[0]]
+                y = [left_pt_back[1], right_pt_back[1], right_pt_front[1], left_pt_front[1]]
+                fig.add_trace(go.Scatter(
+                    x=x,
+                    y=y,
+                    fill="toself",
+                    mode="lines",
+                    line=dict(color="blue"),
+                    fillcolor="lightblue",
+                    name="Rectangle",
+                    showlegend=False
+                ))
+
+        fig.update_layout(
+            title="Road Network Geometry",
+            xaxis=dict(scaleanchor="y"),
+            yaxis=dict(),
+            template="plotly_white"
+        )
+
+        fig.show()
 
 # =========================
 # Ground-truth data model
