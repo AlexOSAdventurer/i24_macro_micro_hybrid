@@ -9,15 +9,16 @@ import gc
 with open("./11-30-2022/6386d89efb3ff533c12df167__post10.json", "r") as f:
     full_data = json.load(f)
 
-database_name = "road_data"
-os.makedirs("road_data", exist_ok=True)
-os.chdir(database_name)
-
 roads = [1, 2] # Eastbound, Westbound
 lanes = [-1, -2, -3, -4] # Innermost lanes to outermost lanes
 
 with open("../i24_motion_to_carla_mapping_adjusted_origin.json", "r") as f:
-    mapping_data = json.load(f)
+    config_data = json.load(f)
+    mapping_data = config_data["road_data"]
+    storage_locations = config_data["storage_locations"]
+    database_path = os.path.join(storage_locations["preprocessing_data"], "road_data")
+    os.makedirs(database_path, exist_ok=True)
+    os.chdir(database_path)
 
 mile_to_feet = 5280
 feet_to_meters = 0.3048
@@ -156,3 +157,5 @@ for road in roads:
         ]
         pq.write_table(table, f"road{road}lane{lane}.parquet", compression="zstd", row_group_size=1000, sorting_columns=sorting_columns)
         print("Written ", road, " and lane ", lane)
+
+os.chdir(os.path.join("..", ".."))

@@ -3,6 +3,7 @@ import duckdb
 import pandas
 import os
 import sys
+import json
 
 class I24MotionData:
     trajectories_all_db_prefix = "trajectories_all"
@@ -11,8 +12,10 @@ class I24MotionData:
         1: [-1, -2, -3, -4],
         2: [-1, -2, -3, -4]
     }
-    def __init__(self, road_id, timestamp_min, timestamp_max, s_min, s_max, data_folder="road_data/"):
-        self.data_folder = data_folder
+    def __init__(self, road_id, timestamp_min, timestamp_max, s_min, s_max, data_folder="road_data/", config_path="i24_motion_to_dataset.json"):
+        with open(config_path, "r") as f:
+            self.config = json.load(f)
+        self.data_folder = os.path.join(self.config["storage_locations"]["preprocessing_data"], data_folder)
         self.road_id = road_id
         self.timestamp_min = timestamp_min
         self.timestamp_max = timestamp_max

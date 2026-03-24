@@ -4,6 +4,7 @@ import numpy
 import pickle
 import os
 
+import json
 import math
 import torch
 import torch.nn as nn
@@ -175,15 +176,17 @@ class AdaptiveSmoothing(nn.Module):
         return v.squeeze(1)
 
 class I24MotionMacro:
-    def __init__(self, data_source, road_id, data_folder, longitudinal_cell_size=50.0, time_delta=0.1, max_velocity=45.0, min_velocity=-15.0):
+    def __init__(self, data_source, road_id, data_folder, config_path="i24_motion_to_dataset.json", longitudinal_cell_size=50.0, time_delta=0.1, max_velocity=45.0, min_velocity=-15.0):
+        with open(config_path, "r") as f:
+            self.config = json.load(f)
         self.data_source = data_source
         self.road_id = road_id
         self.longitudinal_cell_size = longitudinal_cell_size
         self.time_delta = time_delta
-        self.data_folder = data_folder
+        self.data_folder = os.path.join(self.config["storage_locations"]["preprocessing_data"], data_folder)
         self.max_velocity = max_velocity
         self.min_velocity = min_velocity
-        os.makedirs(data_folder, exist_ok=True)
+        os.makedirs(self.data_folder, exist_ok=True)
         self.lanes = i24_motion_data.I24MotionData.road_lane_lookup[road_id]
 
     def computeBox(self, time_index, long_cell_index):
@@ -369,11 +372,19 @@ class I24MotionMacro:
         return processed_macro_data
         
 if __name__ == "__main__":
-    print("Loading data source...")
-    data_source = i24_motion_data.I24MotionData(2, 1669812350, 1669812350+3600, 0, 1600)
-    print("Creating macro processing object...")
-    macro = I24MotionMacro(data_source, 2, "road_2")
+    #print("Loading data source...")
+    #data_source = i24_motion_data.I24MotionData(2, 1669812350, 1669812350+3600, 0, 1600)
+    #print("Creating macro processing object...")
+    #macro = I24MotionMacro(data_source, 2, "road_2")
     #print("Creating raw macro data and saving it...")
     #macro.createRawMacroData()
+    #print("Creating processed macro and saving it...")
+    #macro.createProcessedMacroData()
+    print("Loading data source...")
+    data_source = i24_motion_data.I24MotionData(1, 1669812350, 1669812350+3600, 0, 1600)
+    print("Creating macro processing object...")
+    macro = I24MotionMacro(data_source, 1, "road_1")
+    print("Creating raw macro data and saving it...")
+    macro.createRawMacroData()
     print("Creating processed macro and saving it...")
     macro.createProcessedMacroData()
