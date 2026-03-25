@@ -12,11 +12,6 @@ import jax.numpy as jnp
 import numpy as np
 import pandas as pd
 
-
-# =========================
-# Core data model
-# =========================
-
 Connection = Tuple[str, str]  # (road_id, cell_id)
 
 
@@ -335,7 +330,7 @@ class NetworkGenerator(ABC):
         self.network.validate()
         network_dict = self.network.to_dict()
         with open(path, "w+") as f:
-            json.dump(self.network, f, indent=4)    
+            json.dump(network_dict, f, indent=4)    
 
 class I24WestBoundNetwork(NetworkGenerator):
     def __init__(self):
@@ -495,41 +490,62 @@ class I24WestAndEastNetwork(NetworkGenerator):
 # =========================
 
 REQUIRED_GT_COLUMNS = {
-    "time",
-    "time_length",
-    "road_id",
-    "cell_id",
-    "density",
-    "velocity",
-    "inflow",
-    "outflow",
+    "macro": {
+        "time",
+        "time_length",
+        "road_id",
+        "cell_id",
+        "density",
+        "velocity"
+    },
+    "micro": {
+        "id",
+        "class",
+        "time",
+        "road_id",
+        "s",
+        "t",
+        "length",
+        "width",
+        "height"
+    }
 }
 
-
 class GroundTruthStore:
-    def __init__(self, df: pd.DataFrame):
-        missing = REQUIRED_GT_COLUMNS - set(df.columns)
-        if missing:
-            raise ValueError(f"Ground-truth parquet missing columns: {sorted(missing)}")
+    def __init__(self, micro_df: pd.DataFrame, macro_df: pd.DataFrame):
+        missing_micro = REQUIRED_GT_COLUMNS["micro"] - set(micro_df.columns)
+        if missing_micro:
+            raise ValueError(f"Ground-truth micro parquet missing columns: {sorted(missing_micro)}")
 
-        self.df = df.copy()
-        self.df["road_id"] = self.df["road_id"].astype(str)
-        self.df["cell_id"] = self.df["cell_id"].astype(str)
-        self.df["time"] = self.df["time"].astype(float)
-        self.df["time_length"] = self.df["time_length"].astype(float)
-        self.df["density"] = self.df["density"].astype(float)
-        self.df["velocity"] = self.df["velocity"].astype(float)
-        self.df["inflow"] = self.df["inflow"].astype(float)
-        self.df["outflow"] = self.df["outflow"].astype(float)
-        self.df.sort_values(["time", "road_id", "cell_id"], inplace=True)
-        self.df.reset_index(drop=True, inplace=True)
+        self.micro_df = micro_df.copy()
+        self.micro_df["id"] = self.micro_df["id"].astype(int)
+        self.micro_df["class"] = self.micro_df["class"].astype(int)
+        self.micro_df["time"] = self.micro_df["time"].astype(float)
+        self.micro_df["road_id"] = self.micro_df["road_id"].astype(str)
+        self.micro_df["s"] = self.micro_df["s"].astype(float)
+        self.micro_df["t"] = self.micro_df["t"].astype(float)
+        self.micro_df["length"] = self.micro_df["length"].astype(float)
+        self.micro_df["width"] = self.micro_df["width"].astype(float)
+        self.micro_df["height"] = self.micro_df["height"].astype(float)
+
+        missing_macro = REQUIRED_GT_COLUMNS["macro"] - set(macro_df.columns)
+        if missing_macro:
+            raise ValueError(f"Ground-truth macro parquet missing columns: {sorted(missing_macro)}")
+
+        self.macro_df = macro_df.copy()
+        self.macro_df["time"] = self.macro_df["time"].astype(float)
+        self.macro_df["time_length"] = self.macro_df["time_length"].astype(float)
+        self.macro_df["road_id"] = self.macro_df["road_id"].astype(str)
+        self.macro_df["cell_id"] = self.macro_df["cell_id"].astype(str)
+        self.macro_df["density"] = self.macro_df["density"].astype(float)
+        self.macro_df["velocity"] = self.macro_df["velocity"].astype(float)
 
     @staticmethod
-    def from_parquet(parquet_path: str) -> "GroundTruthStore":
-        return GroundTruthStore(pd.read_parquet(parquet_path))
+    def from_parquet(micro_parquet_path: str, macro_parquet_path: str) -> "GroundTruthStore":
+        return GroundTruthStore(pd.read_parquet(micro_parquet_path), pd.read_parquet(macro_parquet_path))
 
-    def snapshot_at_time(self, time_value: float, tolerance: float = 1e-6) -> pd.DataFrame:
-        unique_times = self.df["time"].unique()
+    def macro_snapshot_at_time(self, time_value: float, tolerance: float = 1e-2) -> pd.DataFrame:
+        unique_times = self.macro_df["time"].unique()
         idx = int(np.argmin(np.abs(unique_times - time_value)))
         chosen_time = float(unique_times[idx])
 
@@ -538,16 +554,39 @@ class GroundTruthStore:
                 f"No ground-truth snapshot near time={time_value}. Closest available is {chosen_time}."
             )
 
-        out = self.df[self.df["time"] == chosen_time].copy()
+        out = self.macro_df[self.macro_df["time"] == chosen_time].copy()
+        out.reset_index(drop=True, inplace=True)
+        return out
+    
+    def micro_snapshot_at_time(self, time_value: float, tolerance: float = 1e-2) -> pd.DataFrame:
+        unique_times = self.micro_df["time"].unique()
+        idx = int(np.argmin(np.abs(unique_times - time_value)))
+        chosen_time = float(unique_times[idx])
+
+        if abs(chosen_time - time_value) > tolerance:
+            raise KeyError(
+                f"No ground-truth snapshot near time={time_value}. Closest available is {chosen_time}."
+            )
+
+        out = self.micro_df[self.micro_df["time"] == chosen_time].copy()
         out.reset_index(drop=True, inplace=True)
         return out
 
     def apply_density_snapshot_to_network(
-        self, network: Network, time_value: float, tolerance: float = 1e-6
+        self, network: Network, time_value: float, tolerance: float = 1e-2
     ) -> None:
-        snapshot = self.snapshot_at_time(time_value, tolerance=tolerance)
+        snapshot = self.macro_snapshot_at_time(time_value, tolerance=tolerance)
         for _, row in snapshot.iterrows():
             network.get_cell(str(row["road_id"]), str(row["cell_id"])).density = float(row["density"])
+
+    def apply_density_snapshot_to_network_boundaries(
+        self, network: Network, time_value: float, tolerance: float = 1e-2
+    ) -> None:
+        snapshot = self.macro_snapshot_at_time(time_value, tolerance=tolerance)
+        for _, row in snapshot.iterrows():
+            network_cell = network.get_cell(str(row["road_id"]), str(row["cell_id"]))
+            if (len(network_cell.inflow_connections) == 0) or (len(network_cell.outflow_connections) == 0):
+                network_cell.density = float(row["density"])
 
 
 # =========================
@@ -898,13 +937,6 @@ class Simulation:
         if self.jam_density <= 0.0:
             raise ValueError("jam_density must be > 0.")
 
-        self.capacity = (
-            self.free_flow_speed
-            * self.congestion_wave_speed
-            * self.jam_density
-            / (self.free_flow_speed + self.congestion_wave_speed)
-        )
-
         self.inflow_boundary_map = inflow_boundary_map or {}
         self.outflow_boundary_map = outflow_boundary_map or {}
 
@@ -917,6 +949,8 @@ class Simulation:
         self.masking_cells: Dict[str, ArbitraryMaskingCell] = {}
 
         self.network.validate()
+
+        self.gt_store = None
 
     @staticmethod
     def from_json(
@@ -956,6 +990,14 @@ class Simulation:
         self.rollout_results.append(
             RolloutStep(sim_time=self.current_time, network=self.network.clone())
         )
+    @property
+    def rho_c(self) -> float:
+        # critical density where v_f * rho = w * (rho_j - rho)
+        return (self.congestion_wave_speed / (self.free_flow_speed + self.congestion_wave_speed)) * self.jam_density
+
+    @property
+    def capacity(self) -> float:
+        return self.free_flow_speed * self.rho_c
 
     def demand(self, rho: jnp.ndarray) -> jnp.ndarray:
         return jnp.minimum(self.free_flow_speed * rho, self.capacity)
@@ -981,6 +1023,7 @@ class Simulation:
     ) -> None:
         t = self.current_time if time_value is None else float(time_value)
         gt_store.apply_density_snapshot_to_network(self.network, t, tolerance=tolerance)
+        self.gt_store = gt_store
 
     def _update_masks(self) -> None:
         for mask in self.masking_cells.values():
@@ -1116,6 +1159,8 @@ class Simulation:
         self._step_active_network(active)
         ConservativeRemapper.active_to_base(self.network, active)
         self.current_time += self.time_resolution
+        self.gt_store.apply_density_snapshot_to_network_boundaries(self.network, self.current_time)
+        print(self.current_time)
 
     def run(self, duration: float) -> None:
         if duration < 0.0:
@@ -1176,10 +1221,6 @@ class Simulation:
         self.rollout_dataframe().to_parquet(path, index=False)
 
 
-# =========================
-# Example mask subclass
-# =========================
-
 class FixedScalarMask(ArbitraryMaskingCell):
     """
     Simple example masking cell with fixed scalar demand/supply.
@@ -1202,7 +1243,40 @@ class FixedScalarMask(ArbitraryMaskingCell):
 
     def supply(self, sim_time: float) -> float:
         return self.supply_value
+    
+class I24MicroMask(ArbitraryMaskingCell):
 
+    def __init__(
+        self,
+        mask_id: str,
+        network: Network,
+        road_id: str,
+        middle_s: float,
+        margin_s: float
+    ):
+        super().__init__(mask_id=mask_id, network=network, 
+                         segments=[
+                             MaskedSegmentRef(road_id, -1, middle_s - margin_s, middle_s + margin_s),
+                             MaskedSegmentRef(road_id, -2, middle_s - margin_s, middle_s + margin_s),
+                             MaskedSegmentRef(road_id, -3, middle_s - margin_s, middle_s + margin_s),
+                             MaskedSegmentRef(road_id, -4, middle_s - margin_s, middle_s + margin_s)
+                         ])
+        self.road_id = road_id,
+        self.middle_s = middle_s
+        self.margin_s = margin_s
+    
+    """
+    Demand and Supply calculations here form our core contributions.
+    We don't have the equations placed here just yet.
+    """
+    def demand(self, sim_time: float) -> float:
+        return 0
+    
+    def supply(self, sim_time: float) -> float:
+        return 0
+    
+    def update(self, sim_time: float, dt: float, new_middle_s: float) -> I24MicroMask:
+        return I24MicroMask(self.mask_id, self.network, self.road_id, new_middle_s, self.margin_s)
 
 # =========================
 # Example usage
