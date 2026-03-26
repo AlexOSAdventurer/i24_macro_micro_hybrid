@@ -1,3 +1,4 @@
+-i https://download.pytorch.org/whl/cu128
 rtree
 pandas
 pyarrow
@@ -6,3 +7,9 @@ ffmpeg-python
 duckdb
 ipykernel
 jupyter
+torch
+torchvision
+torchaudio
+optuna
+jax
+plotly

@@ -1,4 +1,7 @@
 {
+    "time_origin": 1669812350.0,
+    "time_length": 3600.0,
+    "time_step": 0.1,
     "road_data": {
         "1": {
             "direction": "eastbound",
