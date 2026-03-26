@@ -1054,6 +1054,8 @@ class Simulation:
                     self.capacity,
                     self.congestion_wave_speed * max(self.jam_density - rho, 0.0),
                 )
+                print("Constants", rho, self.free_flow_speed, self.capacity, self.congestion_wave_speed)
+                print("Results", self.free_flow_speed * rho, self.capacity, self.congestion_wave_speed * max(self.jam_density - rho, 0.0))
             elif ac.kind == "mask":
                 mask = self.masking_cells[ac.mask_id]
                 demand_map[aid] = float(mask.demand(self.current_time))
@@ -1250,6 +1252,7 @@ class I24MicroMask(ArbitraryMaskingCell):
         self,
         mask_id: str,
         network: Network,
+
         road_id: str,
         middle_s: float,
         margin_s: float
@@ -1274,6 +1277,8 @@ class I24MicroMask(ArbitraryMaskingCell):
     
     def supply(self, sim_time: float) -> float:
         return 0
+    
+    #def get
     
     def update(self, sim_time: float, dt: float, new_middle_s: float) -> I24MicroMask:
         return I24MicroMask(self.mask_id, self.network, self.road_id, new_middle_s, self.margin_s)

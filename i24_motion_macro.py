@@ -86,7 +86,7 @@ class AdaptiveSmoothing(nn.Module):
                  kernel_space_window: float,
                  dx: float,
                  dt: float,
-                 init_delta: float = 20.0, # meter
+                 init_delta: float = 0.02, # mile
                  init_tau: float = 4.0, # seconds
                  init_c_cong: float = 12.0,
                  init_c_free: float = -45.0,
@@ -103,7 +103,8 @@ class AdaptiveSmoothing(nn.Module):
         # print(t_offs)
         x_offs = torch.arange(-self.size_x, self.size_x + 1) * dx
         # print(x_offs)
-        X, T = torch.meshgrid(x_offs, t_offs, indexing='ij')
+        #X, T = torch.meshgrid(x_offs, t_offs, indexing='ij')
+        T, X = torch.meshgrid(t_offs, x_offs, indexing='ij')
         self.register_buffer('T_offsets', T.float())
         self.register_buffer('X_offsets', X.float())
 
@@ -125,44 +126,42 @@ class AdaptiveSmoothing(nn.Module):
 
         mask = (~raw_data.isnan()).float()
         data = torch.nan_to_num(raw_data, nan=0.0)
-        print("Data masked!")
 
         c_cong_s = self.c_cong #/ 3600.0 Already at meters per second
         c_free_s = self.c_free #/ 3600.0 Already at meters per second
         t_cong = self.T_offsets - self.X_offsets / c_cong_s
         t_free = self.T_offsets - self.X_offsets / c_free_s
 
-        k_cong = torch.exp(-(t_cong.abs() / self.tau + self.X_offsets.abs() / self.delta)).to(raw_data.device)
+        k_cong = torch.exp(-(t_cong.abs() / self.tau + self.X_offsets.abs() / self.delta))
         # size of k_cong
-        k_free = torch.exp(-(t_free.abs() / self.tau + self.X_offsets.abs() / self.delta)).to(raw_data.device)
-        print("Offsets calculated!")
+        k_free = torch.exp(-(t_free.abs() / self.tau + self.X_offsets.abs() / self.delta))
 
         k_cong = k_cong.unsqueeze(0).unsqueeze(0)  # (1,1,Kt,Kx)
         k_free = k_free.unsqueeze(0).unsqueeze(0)
 
-        pad = (self.size_t, self.size_t, self.size_x, self.size_x) # to deal with the edge effects
+        #pad = (self.size_t, self.size_t, self.size_x, self.size_x) # to deal with the edge effects
+        pad = (self.size_x, self.size_x, self.size_t, self.size_t) # to deal with the edge effects
         Dp = F.pad(data, pad, value=0.0)
         Mp = F.pad(mask, pad, value=0.0)
-        print("Padding added!")
 
-        print("Doing convolution!")
         sum_cong = F.conv2d(Dp, k_cong)
         N_cong   = F.conv2d(Mp, k_cong)
         sum_free = F.conv2d(Dp, k_free)
         N_free   = F.conv2d(Mp, k_free)
-        print("Convolution done!")
         # use FFT to compute the convolutions
-        #print("Using FFT!")
         #sum_cong, N_cong, sum_free, N_free = fft_four_convs(Dp, Mp, k_cong, k_free)
-        #print("FFT done!")
 
         v_cong = sum_cong / N_cong
         v_free = sum_free / N_free
-        v_min = torch.min(v_cong, v_free)
-        w = 0.5 * (1 + torch.tanh((self.v_thr - v_min) / self.v_delta))
+        
         if (self.high_is_congestion):
-            w = w * -1.0
-        v = w * v_cong + (1 - w) * v_free
+            v_max = torch.max(v_cong, v_free)
+            w = 0.5 * (1 + torch.tanh((v_max - self.v_thr) / self.v_delta))
+            v = w * v_cong + (1 - w) * v_free
+        else:
+            v_min = torch.min(v_cong, v_free)
+            w = 0.5 * (1 + torch.tanh((self.v_thr - v_min) / self.v_delta))
+            v = w * v_cong + (1 - w) * v_free
 
         valid_cong = (N_cong > 0).float()
         valid_free = (N_free > 0).float()
@@ -176,7 +175,7 @@ class AdaptiveSmoothing(nn.Module):
         return v.squeeze(1)
 
 class I24MotionMacro:
-    def __init__(self, data_source, road_id, data_folder, config_path="i24_motion_to_dataset.json", longitudinal_cell_size=50.0, time_delta=0.1, max_velocity=45.0, min_velocity=-15.0):
+    def __init__(self, data_source, road_id, data_folder, config_path="i24_motion_to_dataset.json", longitudinal_cell_size=50.0, time_delta=0.5, max_velocity=45.0, min_velocity=-15.0):
         with open(config_path, "r") as f:
             self.config = json.load(f)
         self.data_source = data_source
@@ -327,8 +326,8 @@ class I24MotionMacro:
         t_size = self.data_source.timestamp_max - self.data_source.timestamp_min
         device_count = torch.cuda.device_count()
         with torch.no_grad():
-            asm_velocity = AdaptiveSmoothing(3600.0, 1600.0, dx=50.0, dt=0.1, init_delta=10.0, init_tau=0.40, init_c_cong=-5.36, init_c_free=42.0, init_v_thr=30.0, init_v_delta=10.0).to(device=f"cuda:{0 % device_count}")
-            asm_density = AdaptiveSmoothing(3600.0, 1600.0, dx=50.0, dt=0.1, init_delta=10.0, init_tau=0.40, init_c_cong=-5.36, init_c_free=42.0, init_v_thr=0.10, init_v_delta=0.02, high_is_congestion=True).to(device=f"cuda:{1 % device_count}")
+            asm_velocity = AdaptiveSmoothing(3600.0, 1600.0, dx=50.0, dt=0.5, init_delta=105.62640175480215, init_tau=0.1052379737326149, init_c_cong=-4.386450786436988, init_c_free=41.09152765794657, init_v_thr=29.99849306345678, init_v_delta=9.989311356689827).to("cuda").to(device=f"cuda:{0 % device_count}")
+            asm_density =AdaptiveSmoothing(3600.0, 1600.0, dx=50.0, dt=0.5, init_delta=105.62640175480215, init_tau=0.1052379737326149, init_c_cong=-4.386450786436988, init_c_free=41.09152765794657, init_v_thr=0.0609944197208978, init_v_delta=0.03731597995330584, high_is_congestion=True).to(device=f"cuda:{1 % device_count}")
             for lane in self.lanes:
                 print(f"Processing lane {lane}")
                 processed_macro_data = {}
@@ -372,14 +371,14 @@ class I24MotionMacro:
         return processed_macro_data
         
 if __name__ == "__main__":
-    #print("Loading data source...")
-    #data_source = i24_motion_data.I24MotionData(2, 1669812350, 1669812350+3600, 0, 1600)
-    #print("Creating macro processing object...")
-    #macro = I24MotionMacro(data_source, 2, "road_2")
-    #print("Creating raw macro data and saving it...")
-    #macro.createRawMacroData()
-    #print("Creating processed macro and saving it...")
-    #macro.createProcessedMacroData()
+    print("Loading data source...")
+    data_source = i24_motion_data.I24MotionData(2, 1669812350, 1669812350+3600, 0, 1600)
+    print("Creating macro processing object...")
+    macro = I24MotionMacro(data_source, 2, "road_2")
+    print("Creating raw macro data and saving it...")
+    macro.createRawMacroData()
+    print("Creating processed macro and saving it...")
+    macro.createProcessedMacroData()
     print("Loading data source...")
     data_source = i24_motion_data.I24MotionData(1, 1669812350, 1669812350+3600, 0, 1600)
     print("Creating macro processing object...")
