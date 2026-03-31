@@ -8,7 +8,6 @@ import json
 import math
 
 import plotly.graph_objects as go
-import jax.numpy as jnp
 import numpy as np
 import pandas as pd
 
@@ -25,6 +24,7 @@ class Cell:
     density: float
     inflow_connections: List[Connection] = field(default_factory=list)
     outflow_connections: List[Connection] = field(default_factory=list)
+    fd: Optional[FundamentalDiagram] = None
 
     @property
     def length(self) -> float:
@@ -659,6 +659,7 @@ class ActiveCell:
     density: float
     base_segments: List[Tuple[Connection, float, float]] = field(default_factory=list)
     mask_id: Optional[str] = None
+    fd: Optional[FundamentalDiagram] = None
     inflow_neighbors: List[str] = field(default_factory=list)
     outflow_neighbors: List[str] = field(default_factory=list)
 
@@ -768,6 +769,9 @@ class ActiveMeshBuilder:
 
                 for idx, item in enumerate(merged):
                     active_cell_id = f"{road_id}|lane{lane}|{idx}"
+                    cell_fd = None
+                    if item["kind"] == "normal" and item["base_segments"]:
+                        cell_fd = self.network.get_cell(*item["base_segments"][0][0]).fd
                     active.active_cells[active_cell_id] = ActiveCell(
                         active_cell_id=active_cell_id,
                         road_id=road_id,
@@ -778,6 +782,7 @@ class ActiveMeshBuilder:
                         density=0.0,
                         base_segments=list(item["base_segments"]),
                         mask_id=item["mask_id"],
+                        fd=cell_fd,
                     )
 
         self._build_neighbors(active)
@@ -888,6 +893,175 @@ class ConservativeRemapper:
 
 
 # =========================
+# Fundamental diagrams
+# =========================
+
+class FundamentalDiagram(ABC):
+    @abstractmethod
+    def demand(self, rho: float) -> float:
+        """Sending flow from an upstream cell."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def supply(self, rho: float) -> float:
+        """Receiving flow into a downstream cell."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def velocity_from_density(self, rho: float) -> float:
+        raise NotImplementedError
+
+
+@dataclass
+class TriangularFD(FundamentalDiagram):
+    """
+    Piecewise-linear (triangular) fundamental diagram.
+      Free-flow:  q = v_f * rho           (rho <= rho_c)
+      Congested:  q = w * (rho_j - rho)   (rho >  rho_c)
+    """
+    v_f: float    # free-flow speed (m/s)
+    w: float      # backward wave speed magnitude (m/s)
+    rho_j: float  # jam density (veh/m)
+
+    @property
+    def rho_c(self) -> float:
+        return (self.w / (self.v_f + self.w)) * self.rho_j
+
+    @property
+    def capacity(self) -> float:
+        return self.v_f * self.rho_c
+
+    def demand(self, rho: float) -> float:
+        return min(self.v_f * rho, self.capacity)
+
+    def supply(self, rho: float) -> float:
+        return min(self.capacity, self.w * max(self.rho_j - rho, 0.0))
+
+    def velocity_from_density(self, rho: float) -> float:
+        q = self.demand(rho)
+        return q / rho if rho > 1e-12 else self.v_f
+
+
+@dataclass
+class GreenshieldsFD(FundamentalDiagram):
+    """
+    Greenshields (quadratic) fundamental diagram.
+      q(rho) = v_f * rho * (1 - rho / rho_j)
+
+    Demand and supply are computed by evaluating the flow function at
+    the appropriate side of the critical density (rho_j / 2).
+    """
+    v_f: float    # free-flow speed (m/s)
+    rho_j: float  # jam density (veh/m)
+
+    @property
+    def rho_c(self) -> float:
+        return self.rho_j / 2.0
+
+    @property
+    def capacity(self) -> float:
+        return self._flow(self.rho_c)
+
+    def _flow(self, rho: float) -> float:
+        return self.v_f * rho * (1.0 - rho / self.rho_j)
+
+    def demand(self, rho: float) -> float:
+        rho = max(0.0, min(rho, self.rho_j))
+        rho = min(rho, self.rho_c)
+        return self._flow(rho)
+
+    def supply(self, rho: float) -> float:
+        rho = max(0.0, min(rho, self.rho_j))
+        rho = max(rho, self.rho_c)
+        return self._flow(rho)
+
+    def velocity_from_density(self, rho: float) -> float:
+        q = self._flow(max(0.0, min(rho, self.rho_j)))
+        return q / rho if rho > 1e-12 else self.v_f
+
+
+# =========================
+# Lane-change models
+# =========================
+
+class LaneChangeModel(ABC):
+    @abstractmethod
+    def lateral_delta_density(self, active: ActiveNetwork, dt: float) -> Dict[str, float]:
+        """Return per active-cell-id density deltas from lateral exchange."""
+        raise NotImplementedError
+
+
+class NoLaneChange(LaneChangeModel):
+    def lateral_delta_density(self, active: ActiveNetwork, dt: float) -> Dict[str, float]:
+        return {}
+
+
+@dataclass
+class SpeedIncentiveLaneChange(LaneChangeModel):
+    """
+    Speed-differential lane-change model ported from the notebook's CTMSolver.
+
+    For each pair of adjacent lanes, vehicles migrate toward the faster lane
+    proportional to the speed gap and gap-acceptance probability.  Mass is
+    conserved exactly: vehicles transferred = s_lat * overlap_length * dt,
+    then divided by each cell's own length to give the density delta.
+    """
+    lambda_lc: float
+
+    def lateral_delta_density(self, active: ActiveNetwork, dt: float) -> Dict[str, float]:
+        # Group non-mask cells by (road_id, lane), sorted by start_s
+        by_road_lane: Dict[Tuple[str, int], List[ActiveCell]] = {}
+        for ac in active.active_cells.values():
+            if ac.kind == "mask":
+                continue
+            by_road_lane.setdefault((ac.road_id, ac.lane), []).append(ac)
+        for key in by_road_lane:
+            by_road_lane[key].sort(key=lambda c: c.start_s)
+
+        # Sorted lane indices per road
+        lanes_per_road: Dict[str, List[int]] = {}
+        for road_id, lane in by_road_lane:
+            lanes_per_road.setdefault(road_id, []).append(lane)
+        for road_id in lanes_per_road:
+            lanes_per_road[road_id].sort()
+
+        delta: Dict[str, float] = {}
+
+        for road_id, sorted_lanes in lanes_per_road.items():
+            for idx in range(len(sorted_lanes) - 1):
+                lane_a = sorted_lanes[idx]
+                lane_b = sorted_lanes[idx + 1]
+                cells_a = by_road_lane[(road_id, lane_a)]
+                cells_b = by_road_lane[(road_id, lane_b)]
+
+                for ca in cells_a:
+                    for cb in cells_b:
+                        overlap = min(ca.end_s, cb.end_s) - max(ca.start_s, cb.start_s)
+                        if overlap <= 0.0:
+                            continue
+
+                        rho_a = ca.density
+                        rho_b = cb.density
+                        v_a = ca.fd.velocity_from_density(rho_a)
+                        v_b = cb.fd.velocity_from_density(rho_b)
+                        p_gap_a = max(0.0, 1.0 - rho_a / ca.fd.rho_j)
+                        p_gap_b = max(0.0, 1.0 - rho_b / cb.fd.rho_j)
+
+                        # Net density flux rate from lane_a -> lane_b (veh/m/s)
+                        dv_ab = max(v_b - v_a, 0.0) / max(ca.fd.v_f, 1e-9)
+                        dv_ba = max(v_a - v_b, 0.0) / max(cb.fd.v_f, 1e-9)
+                        s_lat = (self.lambda_lc * dv_ab * rho_a * p_gap_b
+                               - self.lambda_lc * dv_ba * rho_b * p_gap_a)
+
+                        # Vehicles transferred over the shared boundary in this timestep
+                        vehicles = s_lat * overlap * dt
+                        delta[ca.active_cell_id] = delta.get(ca.active_cell_id, 0.0) - vehicles / ca.length
+                        delta[cb.active_cell_id] = delta.get(cb.active_cell_id, 0.0) + vehicles / cb.length
+
+        return delta
+
+
+# =========================
 # CTM / simulation
 # =========================
 
@@ -913,12 +1087,10 @@ class Simulation:
         network: Network,
         time_resolution: float,
         origin_time: float,
-        free_flow_speed: float,
-        congestion_wave_speed: float,
-        jam_density: float,
         inflow_boundary_map: Optional[Dict[Connection, float]] = None,
         outflow_boundary_map: Optional[Dict[Connection, float]] = None,
         min_cell_length: Optional[float] = None,
+        lane_change_model: Optional[LaneChangeModel] = None,
     ):
         self.network = network
         self.time_resolution = float(time_resolution)
@@ -926,25 +1098,12 @@ class Simulation:
         self.current_time = float(origin_time)
         self.rollout_results: List[RolloutStep] = []
 
-        self.free_flow_speed = float(free_flow_speed)
-        self.congestion_wave_speed = float(congestion_wave_speed)
-        self.jam_density = float(jam_density)
-
-        if self.free_flow_speed <= 0.0:
-            raise ValueError("free_flow_speed must be > 0.")
-        if self.congestion_wave_speed <= 0.0:
-            raise ValueError("congestion_wave_speed must be > 0.")
-        if self.jam_density <= 0.0:
-            raise ValueError("jam_density must be > 0.")
-
         self.inflow_boundary_map = inflow_boundary_map or {}
         self.outflow_boundary_map = outflow_boundary_map or {}
 
-        self.min_cell_length = (
-            float(min_cell_length)
-            if min_cell_length is not None
-            else float(self.free_flow_speed * self.time_resolution)
-        )
+        self.min_cell_length = float(min_cell_length) if min_cell_length is not None else 1.0
+
+        self.lane_change_model: LaneChangeModel = lane_change_model if lane_change_model is not None else NoLaneChange()
 
         self.masking_cells: Dict[str, ArbitraryMaskingCell] = {}
 
@@ -957,9 +1116,6 @@ class Simulation:
         json_path: str,
         time_resolution: float,
         origin_time: float,
-        free_flow_speed: float,
-        congestion_wave_speed: float,
-        jam_density: float,
         inflow_boundary_map: Optional[Dict[Connection, float]] = None,
         outflow_boundary_map: Optional[Dict[Connection, float]] = None,
         min_cell_length: Optional[float] = None,
@@ -969,9 +1125,6 @@ class Simulation:
             network=network,
             time_resolution=time_resolution,
             origin_time=origin_time,
-            free_flow_speed=free_flow_speed,
-            congestion_wave_speed=congestion_wave_speed,
-            jam_density=jam_density,
             inflow_boundary_map=inflow_boundary_map,
             outflow_boundary_map=outflow_boundary_map,
             min_cell_length=min_cell_length,
@@ -990,31 +1143,6 @@ class Simulation:
         self.rollout_results.append(
             RolloutStep(sim_time=self.current_time, network=self.network.clone())
         )
-    @property
-    def rho_c(self) -> float:
-        # critical density where v_f * rho = w * (rho_j - rho)
-        return (self.congestion_wave_speed / (self.free_flow_speed + self.congestion_wave_speed)) * self.jam_density
-
-    @property
-    def capacity(self) -> float:
-        return self.free_flow_speed * self.rho_c
-
-    def demand(self, rho: jnp.ndarray) -> jnp.ndarray:
-        return jnp.minimum(self.free_flow_speed * rho, self.capacity)
-
-    def supply(self, rho: jnp.ndarray) -> jnp.ndarray:
-        return jnp.minimum(
-            self.capacity,
-            self.congestion_wave_speed * jnp.maximum(self.jam_density - rho, 0.0),
-        )
-
-    def velocity_from_density(self, rho: jnp.ndarray) -> jnp.ndarray:
-        q = jnp.minimum(
-            self.free_flow_speed * rho,
-            self.congestion_wave_speed * jnp.maximum(self.jam_density - rho, 0.0),
-        )
-        return jnp.where(rho > 1e-12, q / rho, self.free_flow_speed)
-
     def initialize_from_ground_truth(
         self,
         gt_store: GroundTruthStore,
@@ -1049,13 +1177,11 @@ class Simulation:
         for aid, ac in active.active_cells.items():
             if ac.kind == "normal":
                 rho = float(ac.density)
-                demand_map[aid] = min(self.free_flow_speed * rho, self.capacity)
-                supply_map[aid] = min(
-                    self.capacity,
-                    self.congestion_wave_speed * max(self.jam_density - rho, 0.0),
-                )
-                print("Constants", rho, self.free_flow_speed, self.capacity, self.congestion_wave_speed)
-                print("Results", self.free_flow_speed * rho, self.capacity, self.congestion_wave_speed * max(self.jam_density - rho, 0.0))
+                if ac.fd is not None:
+                    demand_map[aid] = ac.fd.demand(rho)
+                    supply_map[aid] = ac.fd.supply(rho)
+                else:
+                    raise Exception ("No FD available!")
             elif ac.kind == "mask":
                 mask = self.masking_cells[ac.mask_id]
                 demand_map[aid] = float(mask.demand(self.current_time))
@@ -1112,18 +1238,19 @@ class Simulation:
         external_outflow: Dict[str, float] = {}
         for aid in active_ids:
             ac = active.active_cells[aid]
+            cell_capacity = ac.fd.capacity if ac.fd is not None else None
             if len(ac.inflow_neighbors) == 0:
                 base_key = ac.base_segments[0][0]
                 external_inflow[aid] = min(
-                    float(self.inflow_boundary_map.get(base_key, self.capacity)),
+                    float(self.inflow_boundary_map.get(base_key, cell_capacity)),
                     supply_map[aid],
-                )
+                ) if cell_capacity is not None else 0.0
             if len(ac.outflow_neighbors) == 0:
                 base_key = ac.base_segments[-1][0]
                 external_outflow[aid] = min(
                     demand_map[aid],
-                    float(self.outflow_boundary_map.get(base_key, self.capacity)),
-                )
+                    float(self.outflow_boundary_map.get(base_key, cell_capacity)),
+                ) if cell_capacity is not None else demand_map[aid]
 
         return edge_flow, external_inflow, external_outflow
 
@@ -1134,7 +1261,11 @@ class Simulation:
         densities = np.array([active.active_cells[aid].density for aid in active_ids], dtype=np.float64)
         lengths = np.array([active.active_cells[aid].length for aid in active_ids], dtype=np.float64)
 
+        dt = self.time_resolution
+
         edge_flow, external_inflow, external_outflow = self._compute_active_edge_flows(active)
+        lateral_deltas = self.lane_change_model.lateral_delta_density(active, dt)
+
         net_flow = np.zeros(len(active_ids), dtype=np.float64)
 
         for (u, v), q in edge_flow.items():
@@ -1147,12 +1278,15 @@ class Simulation:
         for aid, q in external_outflow.items():
             net_flow[index_of[aid]] -= q
 
-        dt = self.time_resolution
         new_densities = densities + dt * net_flow / np.maximum(lengths, 1e-12)
-        new_densities = np.clip(new_densities, 0.0, self.jam_density)
 
         for i, aid in enumerate(active_ids):
-            active.active_cells[aid].density = float(new_densities[i])
+            ac = active.active_cells[aid]
+            if ac.kind != "mask":
+                if ac.fd is None:
+                    raise ValueError(f"Active cell {aid} has no FundamentalDiagram assigned.")
+                new_rho = float(new_densities[i]) + lateral_deltas.get(aid, 0.0)
+                ac.density = float(np.clip(new_rho, 0.0, ac.fd.rho_j))
 
     def step(self) -> None:
         self._snapshot()
@@ -1176,8 +1310,10 @@ class Simulation:
         for road_id, road in self.network.roads.items():
             for cell_id, cell in road.cells.items():
                 rho = float(cell.density)
-                q = min(self.free_flow_speed * rho, self.capacity)
-                v = float(q / rho) if rho > 1e-12 else self.free_flow_speed
+                if cell.fd is None:
+                    raise ValueError(f"Cell {road_id}/{cell_id} has no FundamentalDiagram assigned.")
+                q = cell.fd.demand(rho)
+                v = cell.fd.velocity_from_density(rho)
                 rows.append(
                     {
                         "time": self.current_time,
@@ -1201,8 +1337,10 @@ class Simulation:
             for road_id, road in net.roads.items():
                 for cell_id, cell in road.cells.items():
                     rho = float(cell.density)
-                    q = min(self.free_flow_speed * rho, self.capacity)
-                    v = float(q / rho) if rho > 1e-12 else self.free_flow_speed
+                    if cell.fd is None:
+                        raise ValueError(f"Cell {road_id}/{cell_id} has no FundamentalDiagram assigned.")
+                    q = cell.fd.demand(rho)
+                    v = cell.fd.velocity_from_density(rho)
                     rows.append(
                         {
                             "time": step.sim_time,
