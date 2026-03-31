@@ -25,6 +25,7 @@ class Cell:
     inflow_connections: List[Connection] = field(default_factory=list)
     outflow_connections: List[Connection] = field(default_factory=list)
     fd: Optional[FundamentalDiagram] = None
+    lane_change_model: Optional[LaneChangeModel] = None
 
     @property
     def length(self) -> float:
@@ -330,12 +331,14 @@ class NetworkGenerator(ABC):
         self.network.validate()
         network_dict = self.network.to_dict()
         with open(path, "w+") as f:
-            json.dump(network_dict, f, indent=4)    
+            json.dump(network_dict, f, indent=4)  
 
 class I24WestBoundNetwork(NetworkGenerator):
     def __init__(self):
         super().__init__()
         self.network = None
+        self.fd = GreenshieldsFD(v_f=26.9, rho_j=0.065)
+        self.lane_change_model = SpeedIncentiveLaneChange(lambda_lc=0.195)
 
     def create_network(self):
         network_id = "i24_westbound"
@@ -396,7 +399,7 @@ class I24WestBoundNetwork(NetworkGenerator):
                     inflow_connections.append((road_id, f"road_{road_id}_cell_{lane}_step_{i - 1}"))
                 if (i < (len(longitudinal_steps) - 1)):
                     outflow_connections.append((road_id, f"road_{road_id}_cell_{lane}_step_{i + 1}"))
-                cell = Cell(road_id=road_id, cell_id=cell_id, lane=lane, start_s=start_s, end_s=end_s, density=density, inflow_connections=inflow_connections, outflow_connections=outflow_connections)
+                cell = Cell(road_id=road_id, cell_id=cell_id, lane=lane, start_s=start_s, end_s=end_s, density=density, inflow_connections=inflow_connections, outflow_connections=outflow_connections, fd=self.fd, lane_change_model=self.lane_change_model)
                 cells[cell_id] = cell
 
         road = Road(road_id=road_id, left_polyline=road_left_polyline, right_polyline=road_right_polyline, lane_data=road_lane_data, cells=cells)
@@ -406,6 +409,8 @@ class I24EastBoundNetwork(NetworkGenerator):
     def __init__(self):
         super().__init__()
         self.network = None
+        self.fd = GreenshieldsFD(v_f=26.9, rho_j=0.065)
+        self.lane_change_model = SpeedIncentiveLaneChange(lambda_lc=0.195)
 
     def create_network(self):
         network_id = "i24_eastbound"
@@ -469,7 +474,7 @@ class I24EastBoundNetwork(NetworkGenerator):
                 cell = Cell(road_id=road_id, cell_id=cell_id, lane=lane, start_s=start_s, end_s=end_s, density=density, inflow_connections=inflow_connections, outflow_connections=outflow_connections)
                 cells[cell_id] = cell
 
-        road = Road(road_id=road_id, left_polyline=road_left_polyline, right_polyline=road_right_polyline, lane_data=road_lane_data, cells=cells)
+        road = Road(road_id=road_id, left_polyline=road_left_polyline, right_polyline=road_right_polyline, lane_data=road_lane_data, cells=cells, fd=self.fd, lane_change_model=self.lane_change_model)
         self.network = Network(network_id=network_id, roads={road_id: road})
 
 class I24WestAndEastNetwork(NetworkGenerator):
@@ -660,6 +665,7 @@ class ActiveCell:
     base_segments: List[Tuple[Connection, float, float]] = field(default_factory=list)
     mask_id: Optional[str] = None
     fd: Optional[FundamentalDiagram] = None
+    lane_change_model: Optional[LaneChangeModel] = None
     inflow_neighbors: List[str] = field(default_factory=list)
     outflow_neighbors: List[str] = field(default_factory=list)
 
@@ -686,6 +692,41 @@ class ActiveNetwork:
             self.active_cells[k].active_cell_id,
         ))
         return keys
+
+    def lateral_delta_density(self, dt: float) -> Dict[str, float]:
+        """Compute per-cell density deltas from lateral lane exchange.
+
+        Mask cells are excluded (treated as NoLaneChange). For each adjacent lane
+        pair in each road, the lane change model is taken from the first cell in
+        the lower-indexed lane.
+        """
+        by_road_lane: Dict[Tuple[str, int], List[ActiveCell]] = {}
+        for ac in self.active_cells.values():
+            if ac.kind == "mask":
+                continue
+            by_road_lane.setdefault((ac.road_id, ac.lane), []).append(ac)
+        for key in by_road_lane:
+            by_road_lane[key].sort(key=lambda c: c.start_s)
+
+        lanes_per_road: Dict[str, List[int]] = {}
+        for road_id, lane in by_road_lane:
+            lanes_per_road.setdefault(road_id, []).append(lane)
+        for road_id in lanes_per_road:
+            lanes_per_road[road_id].sort()
+
+        delta: Dict[str, float] = {}
+        for road_id, sorted_lanes in lanes_per_road.items():
+            for idx in range(len(sorted_lanes) - 1):
+                lane_a = sorted_lanes[idx]
+                lane_b = sorted_lanes[idx + 1]
+                cells_a = by_road_lane[(road_id, lane_a)]
+                cells_b = by_road_lane[(road_id, lane_b)]
+                model = cells_a[0].lane_change_model if cells_a else None
+                if model is None:
+                    continue
+                for aid, d in model.lateral_delta_density_for_pair(cells_a, cells_b, dt).items():
+                    delta[aid] = delta.get(aid, 0.0) + d
+        return delta
 
 
 class ActiveMeshBuilder:
@@ -770,8 +811,10 @@ class ActiveMeshBuilder:
                 for idx, item in enumerate(merged):
                     active_cell_id = f"{road_id}|lane{lane}|{idx}"
                     cell_fd = None
+                    cell_lane_change_model = None
                     if item["kind"] == "normal" and item["base_segments"]:
                         cell_fd = self.network.get_cell(*item["base_segments"][0][0]).fd
+                        cell_lane_change_model = self.network.get_cell(*item["base_segments"][0][0]).lane_change_model
                     active.active_cells[active_cell_id] = ActiveCell(
                         active_cell_id=active_cell_id,
                         road_id=road_id,
@@ -783,6 +826,7 @@ class ActiveMeshBuilder:
                         base_segments=list(item["base_segments"]),
                         mask_id=item["mask_id"],
                         fd=cell_fd,
+                        lane_change_model=cell_lane_change_model
                     )
 
         self._build_neighbors(active)
@@ -986,13 +1030,26 @@ class GreenshieldsFD(FundamentalDiagram):
 
 class LaneChangeModel(ABC):
     @abstractmethod
-    def lateral_delta_density(self, active: ActiveNetwork, dt: float) -> Dict[str, float]:
-        """Return per active-cell-id density deltas from lateral exchange."""
+    def lateral_delta_density_for_pair(
+        self,
+        cells_a: List[ActiveCell],
+        cells_b: List[ActiveCell],
+        dt: float,
+    ) -> Dict[str, float]:
+        """Return per active-cell-id density deltas from lateral exchange between two adjacent lanes.
+
+        cells_a and cells_b are sorted by start_s and represent one adjacent lane pair.
+        """
         raise NotImplementedError
 
 
 class NoLaneChange(LaneChangeModel):
-    def lateral_delta_density(self, active: ActiveNetwork, dt: float) -> Dict[str, float]:
+    def lateral_delta_density_for_pair(
+        self,
+        cells_a: List[ActiveCell],
+        cells_b: List[ActiveCell],
+        dt: float,
+    ) -> Dict[str, float]:
         return {}
 
 
@@ -1008,55 +1065,37 @@ class SpeedIncentiveLaneChange(LaneChangeModel):
     """
     lambda_lc: float
 
-    def lateral_delta_density(self, active: ActiveNetwork, dt: float) -> Dict[str, float]:
-        # Group non-mask cells by (road_id, lane), sorted by start_s
-        by_road_lane: Dict[Tuple[str, int], List[ActiveCell]] = {}
-        for ac in active.active_cells.values():
-            if ac.kind == "mask":
-                continue
-            by_road_lane.setdefault((ac.road_id, ac.lane), []).append(ac)
-        for key in by_road_lane:
-            by_road_lane[key].sort(key=lambda c: c.start_s)
-
-        # Sorted lane indices per road
-        lanes_per_road: Dict[str, List[int]] = {}
-        for road_id, lane in by_road_lane:
-            lanes_per_road.setdefault(road_id, []).append(lane)
-        for road_id in lanes_per_road:
-            lanes_per_road[road_id].sort()
-
+    def lateral_delta_density_for_pair(
+        self,
+        cells_a: List[ActiveCell],
+        cells_b: List[ActiveCell],
+        dt: float,
+    ) -> Dict[str, float]:
         delta: Dict[str, float] = {}
 
-        for road_id, sorted_lanes in lanes_per_road.items():
-            for idx in range(len(sorted_lanes) - 1):
-                lane_a = sorted_lanes[idx]
-                lane_b = sorted_lanes[idx + 1]
-                cells_a = by_road_lane[(road_id, lane_a)]
-                cells_b = by_road_lane[(road_id, lane_b)]
+        for ca in cells_a:
+            for cb in cells_b:
+                overlap = min(ca.end_s, cb.end_s) - max(ca.start_s, cb.start_s)
+                if overlap <= 0.0:
+                    continue
 
-                for ca in cells_a:
-                    for cb in cells_b:
-                        overlap = min(ca.end_s, cb.end_s) - max(ca.start_s, cb.start_s)
-                        if overlap <= 0.0:
-                            continue
+                rho_a = ca.density
+                rho_b = cb.density
+                v_a = ca.fd.velocity_from_density(rho_a)
+                v_b = cb.fd.velocity_from_density(rho_b)
+                p_gap_a = max(0.0, 1.0 - rho_a / ca.fd.rho_j)
+                p_gap_b = max(0.0, 1.0 - rho_b / cb.fd.rho_j)
 
-                        rho_a = ca.density
-                        rho_b = cb.density
-                        v_a = ca.fd.velocity_from_density(rho_a)
-                        v_b = cb.fd.velocity_from_density(rho_b)
-                        p_gap_a = max(0.0, 1.0 - rho_a / ca.fd.rho_j)
-                        p_gap_b = max(0.0, 1.0 - rho_b / cb.fd.rho_j)
+                # Net density flux rate from lane_a -> lane_b (veh/m/s)
+                dv_ab = max(v_b - v_a, 0.0) / max(ca.fd.v_f, 1e-9)
+                dv_ba = max(v_a - v_b, 0.0) / max(cb.fd.v_f, 1e-9)
+                s_lat = (self.lambda_lc * dv_ab * rho_a * p_gap_b
+                       - self.lambda_lc * dv_ba * rho_b * p_gap_a)
 
-                        # Net density flux rate from lane_a -> lane_b (veh/m/s)
-                        dv_ab = max(v_b - v_a, 0.0) / max(ca.fd.v_f, 1e-9)
-                        dv_ba = max(v_a - v_b, 0.0) / max(cb.fd.v_f, 1e-9)
-                        s_lat = (self.lambda_lc * dv_ab * rho_a * p_gap_b
-                               - self.lambda_lc * dv_ba * rho_b * p_gap_a)
-
-                        # Vehicles transferred over the shared boundary in this timestep
-                        vehicles = s_lat * overlap * dt
-                        delta[ca.active_cell_id] = delta.get(ca.active_cell_id, 0.0) - vehicles / ca.length
-                        delta[cb.active_cell_id] = delta.get(cb.active_cell_id, 0.0) + vehicles / cb.length
+                # Vehicles transferred over the shared boundary in this timestep
+                vehicles = s_lat * overlap * dt
+                delta[ca.active_cell_id] = delta.get(ca.active_cell_id, 0.0) - vehicles / ca.length
+                delta[cb.active_cell_id] = delta.get(cb.active_cell_id, 0.0) + vehicles / cb.length
 
         return delta
 
@@ -1090,7 +1129,6 @@ class Simulation:
         inflow_boundary_map: Optional[Dict[Connection, float]] = None,
         outflow_boundary_map: Optional[Dict[Connection, float]] = None,
         min_cell_length: Optional[float] = None,
-        lane_change_model: Optional[LaneChangeModel] = None,
     ):
         self.network = network
         self.time_resolution = float(time_resolution)
@@ -1102,8 +1140,6 @@ class Simulation:
         self.outflow_boundary_map = outflow_boundary_map or {}
 
         self.min_cell_length = float(min_cell_length) if min_cell_length is not None else 1.0
-
-        self.lane_change_model: LaneChangeModel = lane_change_model if lane_change_model is not None else NoLaneChange()
 
         self.masking_cells: Dict[str, ArbitraryMaskingCell] = {}
 
@@ -1264,7 +1300,7 @@ class Simulation:
         dt = self.time_resolution
 
         edge_flow, external_inflow, external_outflow = self._compute_active_edge_flows(active)
-        lateral_deltas = self.lane_change_model.lateral_delta_density(active, dt)
+        lateral_deltas = active.lateral_delta_density(dt)
 
         net_flow = np.zeros(len(active_ids), dtype=np.float64)
 
