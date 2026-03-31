@@ -24,7 +24,7 @@ def fft_four_convs(Dp, Mp, k_cong, k_free, eps=1e-12, use_ortho=True):
     Returns:
       sum_cong, N_cong, sum_free, N_free each of shape (B, F, H-Kh+1, W-Kw+1)
     """
-    # ——— sanitize inputs ———
+    #  sanitize inputs ———
     Dp = torch.nan_to_num(Dp, nan=0.0, posinf=0.0, neginf=0.0)
     Mp = torch.nan_to_num(Mp, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -175,7 +175,7 @@ class AdaptiveSmoothing(nn.Module):
         return v.squeeze(1)
 
 class I24MotionMacro:
-    def __init__(self, data_source, road_id, data_folder, config_path="i24_motion_to_dataset.json", longitudinal_cell_size=50.0, time_delta=0.5, max_velocity=45.0, min_velocity=-15.0):
+    def __init__(self, data_source, road_id, data_folder, config_path="i24_motion_to_dataset.json", longitudinal_cell_size=100.0, time_delta=1.0, max_velocity=45.0, min_velocity=-15.0):
         with open(config_path, "r") as f:
             self.config = json.load(f)
         self.data_source = data_source
@@ -325,9 +325,19 @@ class I24MotionMacro:
         s_size = self.data_source.s_max - self.data_source.s_min
         t_size = self.data_source.timestamp_max - self.data_source.timestamp_min
         device_count = torch.cuda.device_count()
+        outage_locations = self.config["road_data"][str(self.road_id)]["outage_locations"]
         with torch.no_grad():
-            asm_velocity = AdaptiveSmoothing(3600.0, 1600.0, dx=50.0, dt=0.5, init_delta=105.62640175480215, init_tau=0.1052379737326149, init_c_cong=-4.386450786436988, init_c_free=41.09152765794657, init_v_thr=29.99849306345678, init_v_delta=9.989311356689827).to("cuda").to(device=f"cuda:{0 % device_count}")
-            asm_density =AdaptiveSmoothing(3600.0, 1600.0, dx=50.0, dt=0.5, init_delta=105.62640175480215, init_tau=0.1052379737326149, init_c_cong=-4.386450786436988, init_c_free=41.09152765794657, init_v_thr=0.0609944197208978, init_v_delta=0.03731597995330584, high_is_congestion=True).to(device=f"cuda:{1 % device_count}")
+            outage_mask = []
+            queries = self.computeEdieBoxQueries()
+            for i, entry in enumerate(zip(queries['s_min'], queries['s_max'])):
+                s_min, s_max = entry[0], entry[1]
+                outage_mask.append(False)
+                for outage in outage_locations:
+                    if (s_min >= outage[0]) and (s_min <= outage[1]):
+                        outage_mask[-1] = True
+            
+            asm_velocity = AdaptiveSmoothing(t_size, s_size, dx=self.longitudinal_cell_size, dt=self.time_delta, init_delta=15.0, init_tau=1.0, init_c_cong=-7.7, init_c_free=50.0, init_v_thr=21.22, init_v_delta=0.5).to("cuda").to(device=f"cuda:{0 % device_count}")
+            asm_density = AdaptiveSmoothing(t_size, s_size, dx=self.longitudinal_cell_size, dt=self.time_delta, init_delta=15.0, init_tau=1.0, init_c_cong=-7.7, init_c_free=50.0, init_v_thr=0.10, init_v_delta=0.001, high_is_congestion=True).to(device=f"cuda:{1 % device_count}")
             for lane in self.lanes:
                 print(f"Processing lane {lane}")
                 processed_macro_data = {}
@@ -335,13 +345,14 @@ class I24MotionMacro:
                 x_shape = int(round(s_size / self.longitudinal_cell_size, 0))
                 t_shape = int(round(t_size / self.time_delta, 0))
 
-                velocity_asm_input = raw_macro_data_lane["velocity"].reshape((1, 1, t_shape, x_shape)).copy()
-                nan_mask = (velocity_asm_input == 0)
-                velocity_asm_input[nan_mask] = numpy.nan
+                velocity_asm_input = raw_macro_data_lane["velocity"].reshape(-1).copy()
+                velocity_asm_input[outage_mask] = numpy.nan
+                velocity_asm_input = velocity_asm_input.reshape((1, 1, t_shape, x_shape)).copy()
                 velocity_asm_input = torch.from_numpy(velocity_asm_input).to(torch.float32).to(device=f"cuda:{0 % device_count}")
 
-                density_asm_input = raw_macro_data_lane["density"].reshape((1, 1, t_shape, x_shape))
-                density_asm_input[nan_mask] = numpy.nan
+                density_asm_input = raw_macro_data_lane["density"].reshape(-1).copy()
+                density_asm_input[outage_mask] = numpy.nan
+                density_asm_input = density_asm_input.reshape((1, 1, t_shape, x_shape)).copy()
                 density_asm_input = torch.from_numpy(density_asm_input).to(torch.float32).to(device=f"cuda:{1 % device_count}")
                 print(f"Lane data loaded!")
 
@@ -376,7 +387,7 @@ if __name__ == "__main__":
     print("Creating macro processing object...")
     macro = I24MotionMacro(data_source, 2, "road_2")
     print("Creating raw macro data and saving it...")
-    macro.createRawMacroData()
+    #macro.createRawMacroData()
     print("Creating processed macro and saving it...")
     macro.createProcessedMacroData()
     print("Loading data source...")
