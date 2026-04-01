@@ -118,7 +118,32 @@ class Network:
         return self.roads[road_id].cells[cell_id]
 
     def clone(self) -> "Network":
-        return copy.deepcopy(self)
+        """Shallow-copy structure, deep-copy only cell densities."""
+        new_roads: Dict[str, Road] = {}
+        for road_id, road in self.roads.items():
+            new_cells: Dict[str, Cell] = {
+                cell_id: Cell(
+                    road_id=cell.road_id,
+                    cell_id=cell.cell_id,
+                    lane=cell.lane,
+                    start_s=cell.start_s,
+                    end_s=cell.end_s,
+                    density=cell.density,
+                    inflow_connections=cell.inflow_connections,
+                    outflow_connections=cell.outflow_connections,
+                    fd=cell.fd,
+                    lane_change_model=cell.lane_change_model,
+                )
+                for cell_id, cell in road.cells.items()
+            }
+            new_roads[road_id] = Road(
+                road_id=road.road_id,
+                left_polyline=road.left_polyline,
+                right_polyline=road.right_polyline,
+                lane_data=road.lane_data,
+                cells=new_cells,
+            )
+        return Network(network_id=self.network_id, roads=new_roads)
 
     def all_cell_keys(self) -> List[Connection]:
         keys: List[Connection] = []
@@ -613,6 +638,16 @@ class GroundTruthStore:
         self.macro_df["density"] = self.macro_df["density"].astype(float)
         self.macro_df["velocity"] = self.macro_df["velocity"].astype(float)
 
+        # Fast lookup: sorted time array + {time: {(road_id, cell_id): density}}
+        self._macro_density_lookup: Dict[float, Dict[Tuple[str, str], float]] = {
+            float(t): {
+                (str(r), str(c)): float(d)
+                for r, c, d in zip(grp["road_id"], grp["cell_id"], grp["density"])
+            }
+            for t, grp in self.macro_df.groupby("time")
+        }
+        self._macro_times: np.ndarray = np.sort(np.array(list(self._macro_density_lookup.keys())))
+
     @staticmethod
     def from_parquet(micro_parquet_path: str, macro_parquet_path: str) -> "GroundTruthStore":
         return GroundTruthStore(pd.read_parquet(micro_parquet_path), pd.read_parquet(macro_parquet_path))
@@ -645,21 +680,30 @@ class GroundTruthStore:
         out.reset_index(drop=True, inplace=True)
         return out
 
+    def _nearest_time(self, time_value: float, tolerance: float) -> float:
+        idx = int(np.searchsorted(self._macro_times, time_value))
+        candidates = [np.clip(idx, 0, len(self._macro_times) - 1),
+                      np.clip(idx - 1, 0, len(self._macro_times) - 1)]
+        chosen = float(self._macro_times[min(candidates, key=lambda i: abs(self._macro_times[i] - time_value))])
+        if abs(chosen - time_value) > tolerance:
+            raise KeyError(f"No ground-truth snapshot near time={time_value}. Closest: {chosen}.")
+        return chosen
+
     def apply_density_snapshot_to_network(
-        self, network: Network, time_value: float, tolerance: float = 1e-2
+        self, network: Network, time_value: float, tolerance: float = 1e-1
     ) -> None:
-        snapshot = self.macro_snapshot_at_time(time_value, tolerance=tolerance)
-        for _, row in snapshot.iterrows():
-            network.get_cell(str(row["road_id"]), str(row["cell_id"])).density = float(row["density"])
+        density_map = self._macro_density_lookup[self._nearest_time(time_value, tolerance)]
+        for (road_id, cell_id), density in density_map.items():
+            network.get_cell(road_id, cell_id).density = density
 
     def apply_density_snapshot_to_network_boundaries(
-        self, network: Network, time_value: float, tolerance: float = 1e-2
+        self, network: Network, time_value: float, tolerance: float = 1e-1
     ) -> None:
-        snapshot = self.macro_snapshot_at_time(time_value, tolerance=tolerance)
-        for _, row in snapshot.iterrows():
-            network_cell = network.get_cell(str(row["road_id"]), str(row["cell_id"]))
-            if (len(network_cell.inflow_connections) == 0) or (len(network_cell.outflow_connections) == 0):
-                network_cell.density = float(row["density"])
+        density_map = self._macro_density_lookup[self._nearest_time(time_value, tolerance)]
+        for (road_id, cell_id), density in density_map.items():
+            cell = network.get_cell(road_id, cell_id)
+            if len(cell.inflow_connections) == 0 or len(cell.outflow_connections) == 0:
+                cell.density = density
 
 
 # =========================
@@ -760,6 +804,27 @@ class ActiveNetwork:
             self.active_cells[k].active_cell_id,
         ))
         return keys
+
+    def snapshot(self) -> "ActiveNetwork":
+        """Lightweight copy — shares structure, copies only densities."""
+        snap = ActiveNetwork()
+        for aid, ac in self.active_cells.items():
+            snap.active_cells[aid] = ActiveCell(
+                active_cell_id=ac.active_cell_id,
+                road_id=ac.road_id,
+                lane=ac.lane,
+                start_s=ac.start_s,
+                end_s=ac.end_s,
+                kind=ac.kind,
+                density=ac.density,
+                base_segments=ac.base_segments,
+                mask_id=ac.mask_id,
+                fd=ac.fd,
+                lane_change_model=ac.lane_change_model,
+                inflow_neighbors=ac.inflow_neighbors,
+                outflow_neighbors=ac.outflow_neighbors,
+            )
+        return snap
 
     def lateral_delta_density(self, dt: float) -> Dict[str, float]:
         """Compute per-cell density deltas from lateral lane exchange.
@@ -1215,6 +1280,7 @@ class Simulation:
         self.network.validate()
 
         self.gt_store = None
+        self._cached_active_network: Optional[ActiveNetwork] = None
 
     @staticmethod
     def from_json(
@@ -1264,12 +1330,17 @@ class Simulation:
             mask.validate()
 
     def _build_active_network(self) -> ActiveNetwork:
-        builder = ActiveMeshBuilder(
-            network=self.network,
-            masks=self.masking_cells,
-            min_cell_length=self.min_cell_length,
-        )
-        active = builder.build()
+        if not self.masking_cells and self._cached_active_network is not None:
+            active = self._cached_active_network
+        else:
+            builder = ActiveMeshBuilder(
+                network=self.network,
+                masks=self.masking_cells,
+                min_cell_length=self.min_cell_length,
+            )
+            active = builder.build()
+            if not self.masking_cells:
+                self._cached_active_network = active
         ConservativeRemapper.base_to_active(self.network, active)
         return active
 
@@ -1397,7 +1468,7 @@ class Simulation:
         self._snapshot()
         self._update_masks()
         active = self._build_active_network()
-        self.rollout_results[-1].active_network = active
+        self.rollout_results[-1].active_network = active.snapshot()
         self._step_active_network(active)
         ConservativeRemapper.active_to_base(self.network, active)
         self.current_time += self.time_resolution
@@ -1436,9 +1507,9 @@ class Simulation:
             return rx, ry
 
         QUANTITIES = ["density", "velocity", "flow"]
-        MASK_FILL = "rgba(220,80,80,0.85)"
-        MASK_LINE = "rgb(180,40,40)"
-        NORMAL_LINE = "rgba(80,80,80,0.4)"
+        MASK_FILL = "#dc5050"   # rgba(220,80,80,0.85)
+        MASK_LINE = "#b42828"
+        NORMAL_LINE = "#505050"  # rgba(80,80,80,0.4)
         CMAP = cm.get_cmap("viridis")
 
         if not self.rollout_results:
@@ -1456,7 +1527,7 @@ class Simulation:
         def _rgba(v: float, vmin: float, vmax: float) -> str:
             t = float(np.clip((v - vmin) / max(vmax - vmin, 1e-12), 0.0, 1.0))
             r, g, b, _ = CMAP(t)
-            return f"rgba({int(r*255)},{int(g*255)},{int(b*255)},0.85)"
+            return f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}"
 
         # Per-quantity global value ranges
         ranges: Dict[str, Tuple[float, float]] = {}
@@ -1545,8 +1616,8 @@ class Simulation:
                     lcolor = MASK_LINE if ac.kind == "mask" else NORMAL_LINE
                 else:
                     px, py = [], []
-                    fill = "rgba(0,0,0,0)"
-                    lcolor = "rgba(0,0,0,0)"
+                    fill = "#000000"
+                    lcolor = "#000000"
                 traces.append(go.Scatter(
                     x=px, y=py,
                     fill="toself",
@@ -1576,35 +1647,122 @@ class Simulation:
                 visible=(q_idx == 0),
                 hoverinfo="skip",
             ))
+        print("Basic cells added!")
 
-        # Animation frames — update all 3*N_base + 3*max_active data traces
-        frames: List[go.Frame] = []
-        for rs, step_active in zip(self.rollout_results, active_per_step):
-            frame_data: List[Any] = []
-            frame_traces: List[int] = []
+        # ── Precompute all colors and active geometry ───────────────────────
+        N_frames = len(self.rollout_results)
 
-            for q_idx, q in enumerate(QUANTITIES):
+        def _color_matrix(vals: np.ndarray, vmin: float, vmax: float) -> List[List[str]]:
+            """(N_frames, N_cells) values → (N_frames, N_cells) hex color strings via vectorized colormap."""
+            t = np.clip((vals - vmin) / max(vmax - vmin, 1e-12), 0.0, 1.0)
+            rgb = (CMAP(t)[..., :3] * 255).astype(np.uint8)
+            # Pack R,G,B into a single uint32 for fast hex formatting
+            packed = (rgb[..., 0].astype(np.uint32) << 16
+                      | rgb[..., 1].astype(np.uint32) << 8
+                      | rgb[..., 2].astype(np.uint32))
+            nf, nc = vals.shape
+            return [
+                [f"#{packed[i,j]:06x}" for j in range(nc)]
+                for i in range(nf)
+            ]
+
+        # Base: density matrix (N_frames, N_base), then derive other quantities per cell
+        base_rho = np.array([
+            [rs.network.get_cell(rid, cid).density for rid, cid, _px, _py, _fd in base_cells]
+            for rs in self.rollout_results
+        ])  # (N_frames, N_base)
+
+        base_frame_colors: Dict[str, List[List[str]]] = {}
+        for q in QUANTITIES:
+            vmin, vmax = ranges[q]
+            if q == "density":
+                vals = base_rho
+            else:
+                vals = np.zeros_like(base_rho)
+                for j, (_rid, _cid, _px, _py, fd) in enumerate(base_cells):
+                    vals[:, j] = [_q_value(rho, fd, q) for rho in base_rho[:, j]]
+            base_frame_colors[q] = _color_matrix(vals, vmin, vmax)
+
+        print("Rho computed!")
+
+        # Active: precompute geometry and colors per step
+        active_geo: List[List[Tuple[List, List]]] = []
+        active_lcolor: List[List[str]] = []
+        active_frame_colors: Dict[str, List[List[str]]] = {q: [] for q in QUANTITIES}
+
+        for step_idx, step_active in enumerate(active_per_step):
+            step_geo: List[Tuple[List, List]] = []
+            step_lc: List[str] = []
+            step_density: List[float] = []
+            step_fd: List[Optional[FundamentalDiagram]] = []
+            step_is_mask: List[bool] = []
+
+            for i in range(max_active):
+                if i < len(step_active):
+                    ac = step_active[i]
+                    road = self.network.roads[ac.road_id]
+                    step_geo.append(_rotate(*Network._cell_polygon(road, ac.start_s, ac.end_s, ac.lane)))
+                    step_lc.append(MASK_LINE if ac.kind == "mask" else NORMAL_LINE)
+                    step_density.append(ac.density)
+                    step_fd.append(ac.fd)
+                    step_is_mask.append(ac.kind == "mask")
+                else:
+                    step_geo.append(([], []))
+                    step_lc.append(NORMAL_LINE)
+                    step_density.append(0.0)
+                    step_fd.append(None)
+                    step_is_mask.append(False)
+
+            active_geo.append(step_geo)
+            active_lcolor.append(step_lc)
+
+            for q in QUANTITIES:
                 vmin, vmax = ranges[q]
-                for i, (road_id, cell_id, _px, _py, fd) in enumerate(base_cells):
-                    cell = rs.network.get_cell(road_id, cell_id)
-                    frame_data.append(go.Scatter(fillcolor=_rgba(_q_value(cell.density, fd, q), vmin, vmax)))
-                    frame_traces.append(base_start(q_idx) + i)
-
-            for q_idx, q in enumerate(QUANTITIES):
-                vmin, vmax = ranges[q]
+                step_colors = []
                 for i in range(max_active):
-                    if i < len(step_active):
-                        ac = step_active[i]
-                        road = self.network.roads[ac.road_id]
-                        px, py = _rotate(*Network._cell_polygon(road, ac.start_s, ac.end_s, ac.lane))
-                        fill = MASK_FILL if ac.kind == "mask" else _rgba(_q_value(ac.density, ac.fd, q), vmin, vmax)
-                        lcolor = MASK_LINE if ac.kind == "mask" else NORMAL_LINE
-                        frame_data.append(go.Scatter(x=px, y=py, fillcolor=fill, line=dict(color=lcolor, width=0.5)))
+                    if step_is_mask[i]:
+                        step_colors.append(MASK_FILL)
+                    elif step_fd[i] is not None:
+                        t = float(np.clip((_q_value(step_density[i], step_fd[i], q) - vmin) / max(vmax - vmin, 1e-12), 0.0, 1.0))
+                        r, g, b, _ = CMAP(t)
+                        step_colors.append(f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}")
                     else:
-                        frame_data.append(go.Scatter(x=[], y=[], fillcolor="rgba(0,0,0,0)"))
-                    frame_traces.append(active_start(q_idx) + i)
+                        step_colors.append("#000000")
+                active_frame_colors[q].append(step_colors)
 
-            frames.append(go.Frame(data=frame_data, traces=frame_traces, name=str(int(rs.sim_time))))
+        print("Active done!")
+
+        # Precompute fixed frame_traces list (same for every frame)
+        frame_traces_template: List[int] = []
+        for q_idx in range(len(QUANTITIES)):
+            for i in range(N_base):
+                frame_traces_template.append(base_start(q_idx) + i)
+        for q_idx in range(len(QUANTITIES)):
+            for i in range(max_active):
+                frame_traces_template.append(active_start(q_idx) + i)
+
+        # ── Build frames using precomputed data and plain dicts ─────────────
+        frames: List[go.Frame] = []
+        for step_idx, rs in enumerate(self.rollout_results):
+            frame_data: List[Any] = []
+
+            for q in QUANTITIES:
+                colors = base_frame_colors[q][step_idx]
+                for color in colors:
+                    frame_data.append({"fillcolor": color})
+
+            for q in QUANTITIES:
+                colors = active_frame_colors[q][step_idx]
+                geo = active_geo[step_idx]
+                lcs = active_lcolor[step_idx]
+                for i in range(max_active):
+                    px, py = geo[i]
+                    frame_data.append({"x": px, "y": py, "fillcolor": colors[i],
+                                       "line": {"color": lcs[i], "width": 0.5}})
+
+            frames.append({"data": frame_data, "traces": frame_traces_template,
+                           "name": str(int(rs.sim_time))})
+            print(step_idx)
 
         # Slider
         slider_steps = [
@@ -1654,9 +1812,8 @@ class Simulation:
             ),
         ]
 
-        return go.Figure(
+        fig = go.Figure(
             data=traces,
-            frames=frames,
             layout=go.Layout(
                 title="Simulation rollout",
                 xaxis=dict(scaleanchor="y", showgrid=False),
@@ -1667,6 +1824,20 @@ class Simulation:
                 margin=dict(t=120),
             ),
         )
+        print("Final frames....")
+
+        # Bypass Plotly's frame validator (which converts every frame dict into a
+        # go.Frame object and validates each trace inside it — O(frames × traces)).
+        # The serialization protocol only requires to_plotly_json(), so a thin
+        # wrapper around the already-correct raw dicts is sufficient.
+        class _RawFrame:
+            def __init__(self, d: dict) -> None:
+                self._props = d
+            def to_plotly_json(self) -> dict:
+                return self._props
+
+        fig._frame_objs = [_RawFrame(f) for f in frames]
+        return fig
 
     def current_state_dataframe(self) -> pd.DataFrame:
         rows = []
