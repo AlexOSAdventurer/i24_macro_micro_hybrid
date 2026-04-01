@@ -13,3 +13,5 @@ torchaudio
 optuna
 jax
 plotly
+orjson
+dash

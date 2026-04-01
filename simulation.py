@@ -10,6 +10,7 @@ import math
 import plotly.graph_objects as go
 import numpy as np
 import pandas as pd
+import plotly.io as pio                                                                                                                                                                                                      
 
 Connection = Tuple[str, str]  # (road_id, cell_id)
 
@@ -1497,6 +1498,7 @@ class Simulation:
         - Six combination buttons: (Base | Active) × (Density | Velocity | Flow)
         """
         import matplotlib.cm as cm
+        pio.json.config.default_engine = 'orjson'
 
         _angle = float(rotation_deg) * np.pi / 180.0
         _cos, _sin = float(np.cos(_angle)), float(np.sin(_angle))
@@ -1839,6 +1841,14 @@ class Simulation:
         fig._frame_objs = [_RawFrame(f) for f in frames]
         return fig
 
+    def build_rollout_renderer(self, rotation_deg: float = 0.0) -> "RolloutRenderer":
+        """Precompute geometry and colours for all rollout steps.
+
+        Returns a RolloutRenderer whose get_figure() can be called cheaply per
+        frame, e.g. from a Dash slider callback.
+        """
+        return RolloutRenderer(self, rotation_deg)
+
     def current_state_dataframe(self) -> pd.DataFrame:
         rows = []
         for road_id, road in self.network.roads.items():
@@ -1893,6 +1903,208 @@ class Simulation:
 
     def save_rollout_parquet(self, path: str) -> None:
         self.rollout_dataframe().to_parquet(path, index=False)
+
+    def load_rollout_parquet(self, path: str) -> pd.DataFrame:
+        return pd.read_parquet(path)
+
+
+class RolloutRenderer:
+    """Precomputed rendering state for a Simulation rollout.
+
+    Create once via sim.build_rollout_renderer(); then call get_figure()
+    cheaply for any step (e.g. from a Dash callback).
+    """
+
+    QUANTITIES = ["density", "velocity", "flow"]
+    MASK_FILL = "#dc5050"
+    MASK_LINE = "#b42828"
+    NORMAL_LINE = "#505050"
+
+    def __init__(self, sim: "Simulation", rotation_deg: float = 0.0) -> None:
+        import matplotlib.cm as cm
+        CMAP = cm.get_cmap("viridis")
+        self._cmap = CMAP
+
+        if not sim.rollout_results:
+            raise ValueError("No rollout results. Run the simulation first.")
+
+        _angle = float(rotation_deg) * np.pi / 180.0
+        _cos, _sin = float(np.cos(_angle)), float(np.sin(_angle))
+
+        def _rotate(px: List[float], py: List[float]) -> Tuple[List[float], List[float]]:
+            return (
+                [x * _cos - y * _sin for x, y in zip(px, py)],
+                [x * _sin + y * _cos for x, y in zip(px, py)],
+            )
+
+        def _q_value(density: float, fd: Optional[FundamentalDiagram], q: str) -> float:
+            if fd is None:
+                return 0.0
+            if q == "velocity":
+                return fd.velocity_from_density(density)
+            if q == "flow":
+                return fd.demand(density)
+            return density
+
+        # Global per-quantity value ranges (used for consistent colorbar across all frames)
+        self.ranges: Dict[str, Tuple[float, float]] = {}
+        for q in self.QUANTITIES:
+            vals: List[float] = []
+            for rs in sim.rollout_results:
+                for road in rs.network.roads.values():
+                    for cell in road.cells.values():
+                        vals.append(_q_value(cell.density, cell.fd, q))
+                if rs.active_network:
+                    for ac in rs.active_network.active_cells.values():
+                        if ac.kind == "normal" and ac.fd is not None:
+                            vals.append(_q_value(ac.density, ac.fd, q))
+            self.ranges[q] = (float(min(vals)) if vals else 0.0, float(max(vals)) if vals else 1.0)
+
+        # Base cell geometry — fixed for all frames
+        ref_network = sim.rollout_results[0].network
+        self.base_cells: List[Tuple[str, str, List[float], List[float], Optional[FundamentalDiagram]]] = []
+        for road in ref_network.roads.values():
+            for cell in road.cells.values():
+                px, py = _rotate(*Network._cell_polygon(road, cell.start_s, cell.end_s, cell.lane))
+                self.base_cells.append((road.road_id, cell.cell_id, px, py, cell.fd))
+
+        active_per_step: List[List[ActiveCell]] = [
+            list(rs.active_network.active_cells.values()) if rs.active_network else []
+            for rs in sim.rollout_results
+        ]
+        self.max_active: int = max((len(a) for a in active_per_step), default=0)
+        self.N_frames: int = len(sim.rollout_results)
+        self.sim_times: List[float] = [rs.sim_time for rs in sim.rollout_results]
+
+        def _color_matrix(vals: np.ndarray, vmin: float, vmax: float) -> List[List[str]]:
+            t = np.clip((vals - vmin) / max(vmax - vmin, 1e-12), 0.0, 1.0)
+            rgb = (CMAP(t)[..., :3] * 255).astype(np.uint8)
+            packed = (rgb[..., 0].astype(np.uint32) << 16
+                      | rgb[..., 1].astype(np.uint32) << 8
+                      | rgb[..., 2].astype(np.uint32))
+            nf, nc = vals.shape
+            return [[f"#{packed[i, j]:06x}" for j in range(nc)] for i in range(nf)]
+
+        # Base colors: (N_frames, N_base) per quantity
+        base_rho = np.array([
+            [rs.network.get_cell(rid, cid).density for rid, cid, _px, _py, _fd in self.base_cells]
+            for rs in sim.rollout_results
+        ])
+        self.base_frame_colors: Dict[str, List[List[str]]] = {}
+        for q in self.QUANTITIES:
+            vmin, vmax = self.ranges[q]
+            if q == "density":
+                vals_arr = base_rho
+            else:
+                vals_arr = np.zeros_like(base_rho)
+                for j, (_rid, _cid, _px, _py, fd) in enumerate(self.base_cells):
+                    vals_arr[:, j] = [_q_value(rho, fd, q) for rho in base_rho[:, j]]
+            self.base_frame_colors[q] = _color_matrix(vals_arr, vmin, vmax)
+
+        # Active cell geometry and colors per step
+        self.active_geo: List[List[Tuple[List, List]]] = []
+        self.active_lcolor: List[List[str]] = []
+        self.active_frame_colors: Dict[str, List[List[str]]] = {q: [] for q in self.QUANTITIES}
+
+        for step_active in active_per_step:
+            step_geo: List[Tuple[List, List]] = []
+            step_lc: List[str] = []
+            step_density: List[float] = []
+            step_fd: List[Optional[FundamentalDiagram]] = []
+            step_is_mask: List[bool] = []
+
+            for i in range(self.max_active):
+                if i < len(step_active):
+                    ac = step_active[i]
+                    road = sim.network.roads[ac.road_id]
+                    step_geo.append(_rotate(*Network._cell_polygon(road, ac.start_s, ac.end_s, ac.lane)))
+                    step_lc.append(self.MASK_LINE if ac.kind == "mask" else self.NORMAL_LINE)
+                    step_density.append(ac.density)
+                    step_fd.append(ac.fd)
+                    step_is_mask.append(ac.kind == "mask")
+                else:
+                    step_geo.append(([], []))
+                    step_lc.append(self.NORMAL_LINE)
+                    step_density.append(0.0)
+                    step_fd.append(None)
+                    step_is_mask.append(False)
+
+            self.active_geo.append(step_geo)
+            self.active_lcolor.append(step_lc)
+
+            for q in self.QUANTITIES:
+                vmin, vmax = self.ranges[q]
+                step_colors: List[str] = []
+                for i in range(self.max_active):
+                    if step_is_mask[i]:
+                        step_colors.append(self.MASK_FILL)
+                    elif step_fd[i] is not None:
+                        t = float(np.clip((_q_value(step_density[i], step_fd[i], q) - vmin) / max(vmax - vmin, 1e-12), 0.0, 1.0))
+                        r, g, b, _ = CMAP(t)
+                        step_colors.append(f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}")
+                    else:
+                        step_colors.append("#000000")
+                self.active_frame_colors[q].append(step_colors)
+
+    def get_figure(self, step_idx: int, show_base: bool = True, quantity: str = "density") -> go.Figure:
+        """Return a static go.Figure for a single simulation timestep."""
+        q = quantity
+        vmin, vmax = self.ranges[q]
+        traces: List[Any] = []
+
+        if show_base:
+            colors = self.base_frame_colors[q][step_idx]
+            for (_rid, _cid, px, py, _fd), color in zip(self.base_cells, colors):
+                traces.append(go.Scatter(
+                    x=px, y=py,
+                    fill="toself",
+                    fillcolor=color,
+                    mode="lines",
+                    line=dict(color=self.NORMAL_LINE, width=0.5),
+                    showlegend=False,
+                    hoverinfo="skip",
+                ))
+        else:
+            colors = self.active_frame_colors[q][step_idx]
+            geo = self.active_geo[step_idx]
+            lcs = self.active_lcolor[step_idx]
+            for i in range(self.max_active):
+                px, py = geo[i]
+                traces.append(go.Scatter(
+                    x=px, y=py,
+                    fill="toself",
+                    fillcolor=colors[i],
+                    mode="lines",
+                    line=dict(color=lcs[i], width=0.5),
+                    showlegend=False,
+                    hoverinfo="skip",
+                ))
+
+        traces.append(go.Scatter(
+            x=[None], y=[None],
+            mode="markers",
+            marker=dict(
+                colorscale="Viridis",
+                cmin=vmin, cmax=vmax,
+                color=[vmin],
+                showscale=True,
+                colorbar=dict(title=q, x=1.02, thickness=15),
+            ),
+            showlegend=False,
+            hoverinfo="skip",
+        ))
+
+        return go.Figure(
+            data=traces,
+            layout=go.Layout(
+                title=f"t = {int(self.sim_times[step_idx])} s",
+                xaxis=dict(scaleanchor="y", showgrid=False),
+                yaxis=dict(showgrid=False),
+                template="plotly_white",
+                margin=dict(t=60),
+                uirevision="constant",
+            ),
+        )
 
 
 class FixedScalarMask(ArbitraryMaskingCell):
