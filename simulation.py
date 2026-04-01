@@ -127,6 +127,48 @@ class Network:
                 keys.append((road_id, cell_id))
         return keys
 
+    @staticmethod
+    def _fd_to_dict(fd: Optional["FundamentalDiagram"]) -> Optional[Dict[str, Any]]:
+        if fd is None:
+            return None
+        if isinstance(fd, GreenshieldsFD):
+            return {"type": "greenshields", "v_f": fd.v_f, "rho_j": fd.rho_j}
+        if isinstance(fd, TriangularFD):
+            return {"type": "triangular", "v_f": fd.v_f, "w": fd.w, "rho_j": fd.rho_j}
+        raise ValueError(f"Unknown FundamentalDiagram type: {type(fd)}")
+
+    @staticmethod
+    def _fd_from_dict(data: Optional[Dict[str, Any]]) -> Optional["FundamentalDiagram"]:
+        if data is None:
+            return None
+        t = data["type"]
+        if t == "greenshields":
+            return GreenshieldsFD(v_f=data["v_f"], rho_j=data["rho_j"])
+        if t == "triangular":
+            return TriangularFD(v_f=data["v_f"], w=data["w"], rho_j=data["rho_j"])
+        raise ValueError(f"Unknown FundamentalDiagram type in JSON: {t}")
+
+    @staticmethod
+    def _lcm_to_dict(lcm: Optional["LaneChangeModel"]) -> Optional[Dict[str, Any]]:
+        if lcm is None:
+            return None
+        if isinstance(lcm, NoLaneChange):
+            return {"type": "no_lane_change"}
+        if isinstance(lcm, SpeedIncentiveLaneChange):
+            return {"type": "speed_incentive", "lambda_lc": lcm.lambda_lc}
+        raise ValueError(f"Unknown LaneChangeModel type: {type(lcm)}")
+
+    @staticmethod
+    def _lcm_from_dict(data: Optional[Dict[str, Any]]) -> Optional["LaneChangeModel"]:
+        if data is None:
+            return None
+        t = data["type"]
+        if t == "no_lane_change":
+            return NoLaneChange()
+        if t == "speed_incentive":
+            return SpeedIncentiveLaneChange(lambda_lc=data["lambda_lc"])
+        raise ValueError(f"Unknown LaneChangeModel type in JSON: {t}")
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "network_id": self.network_id,
@@ -152,6 +194,8 @@ class Network:
                             "density": float(cell.density),
                             "inflow_connections": [[r, c] for (r, c) in cell.inflow_connections],
                             "outflow_connections": [[r, c] for (r, c) in cell.outflow_connections],
+                            "fd": Network._fd_to_dict(cell.fd),
+                            "lane_change_model": Network._lcm_to_dict(cell.lane_change_model),
                         }
                         for cell_id, cell in road.cells.items()
                     },
@@ -195,6 +239,8 @@ class Network:
                         (str(x[0]), str(x[1]))
                         for x in cell_data.get("outflow_connections", [])
                     ],
+                    fd=Network._fd_from_dict(cell_data.get("fd")),
+                    lane_change_model=Network._lcm_from_dict(cell_data.get("lane_change_model")),
                 )
 
             roads[road_id] = Road(
@@ -224,6 +270,29 @@ class Network:
     def to_json(self, json_path: str) -> None:
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(self.to_dict(), f, indent=2)
+
+    @staticmethod
+    def _cell_polygon(road: "Road", start_s: float, end_s: float, lane: int) -> Tuple[List[float], List[float]]:
+        """Return (x, y) coordinate lists for a cell polygon in road-world coordinates."""
+        left_poly = np.array(road.left_polyline, dtype=float)
+        right_poly = np.array(road.right_polyline, dtype=float)
+        seg_lengths = np.linalg.norm(np.diff(left_poly, axis=0), axis=1)
+        cumulative = np.concatenate([[0.0], np.cumsum(seg_lengths)])
+        lane_info = road.lane_data[lane]
+        lat = float(lane_info["lateral_position"])
+        width = float(lane_info["width"])
+
+        def interp(s: float) -> Tuple[np.ndarray, np.ndarray]:
+            idx = int(np.clip(np.searchsorted(cumulative, s) - 1, 0, len(seg_lengths) - 1))
+            t = (s - cumulative[idx]) / max(seg_lengths[idx], 1e-8)
+            l = left_poly[idx] + t * (left_poly[idx + 1] - left_poly[idx])
+            r = right_poly[idx] + t * (right_poly[idx + 1] - right_poly[idx])
+            d = (r - l) / max(float(np.linalg.norm(r - l)), 1e-8)
+            return l + (-lat) * d, l + (-(lat - width)) * d
+
+        p1, p2 = interp(start_s)
+        p3, p4 = interp(end_s)
+        return [p1[0], p2[0], p4[0], p3[0], p1[0]], [p1[1], p2[1], p4[1], p3[1], p1[1]]
 
     def plot_network(self) -> None:
         fig = go.Figure()
@@ -295,10 +364,7 @@ class Network:
                                          line=dict(width=1, dash="dot"), showlegend=False))
 
             for cell in road.cells.values():
-                p1, p2 = interpolate_lane_edges(cell.start_s, cell.lane)
-                p3, p4 = interpolate_lane_edges(cell.end_s, cell.lane)
-                x = [p1[0], p2[0], p4[0], p3[0], p1[0]]
-                y = [p1[1], p2[1], p4[1], p3[1], p1[1]]
+                x, y = Network._cell_polygon(road, cell.start_s, cell.end_s, cell.lane)
                 fig.add_trace(
                     go.Scatter(
                         x=x,
@@ -316,6 +382,8 @@ class Network:
             xaxis=dict(scaleanchor="y"),
             yaxis=dict(),
             template="plotly_white",
+            width=2400,
+            height=6400,
         )
         fig.show()
 
@@ -471,10 +539,10 @@ class I24EastBoundNetwork(NetworkGenerator):
                     inflow_connections.append((road_id, f"road_{road_id}_cell_{lane}_step_{i - 1}"))
                 if (i < (len(longitudinal_steps) - 1)):
                     outflow_connections.append((road_id, f"road_{road_id}_cell_{lane}_step_{i + 1}"))
-                cell = Cell(road_id=road_id, cell_id=cell_id, lane=lane, start_s=start_s, end_s=end_s, density=density, inflow_connections=inflow_connections, outflow_connections=outflow_connections)
+                cell = Cell(road_id=road_id, cell_id=cell_id, lane=lane, start_s=start_s, end_s=end_s, density=density, inflow_connections=inflow_connections, outflow_connections=outflow_connections, fd=self.fd, lane_change_model=self.lane_change_model)
                 cells[cell_id] = cell
 
-        road = Road(road_id=road_id, left_polyline=road_left_polyline, right_polyline=road_right_polyline, lane_data=road_lane_data, cells=cells, fd=self.fd, lane_change_model=self.lane_change_model)
+        road = Road(road_id=road_id, left_polyline=road_left_polyline, right_polyline=road_right_polyline, lane_data=road_lane_data, cells=cells)
         self.network = Network(network_id=network_id, roads={road_id: road})
 
 class I24WestAndEastNetwork(NetworkGenerator):
@@ -1108,6 +1176,7 @@ class SpeedIncentiveLaneChange(LaneChangeModel):
 class RolloutStep:
     sim_time: float
     network: Network
+    active_network: Optional[ActiveNetwork] = None
 
 
 class Simulation:
@@ -1328,6 +1397,7 @@ class Simulation:
         self._snapshot()
         self._update_masks()
         active = self._build_active_network()
+        self.rollout_results[-1].active_network = active
         self._step_active_network(active)
         ConservativeRemapper.active_to_base(self.network, active)
         self.current_time += self.time_resolution
@@ -1340,6 +1410,263 @@ class Simulation:
         num_steps = int(np.round(duration / self.time_resolution))
         for _ in range(num_steps):
             self.step()
+
+    def plot_rollout(self, rotation_deg: float = 0.0) -> "go.Figure":
+        """Return an animated Plotly figure stepping through simulation rollouts.
+
+        Parameters
+        ----------
+        rotation_deg : float
+            Rotate all road geometry by this many degrees counter-clockwise.
+            Use 90 to display a vertical road in landscape orientation.
+
+        Interactive controls:
+        - Slider to scrub through time steps
+        - Play / Pause buttons
+        - Six combination buttons: (Base | Active) × (Density | Velocity | Flow)
+        """
+        import matplotlib.cm as cm
+
+        _angle = float(rotation_deg) * np.pi / 180.0
+        _cos, _sin = float(np.cos(_angle)), float(np.sin(_angle))
+
+        def _rotate(px: List[float], py: List[float]) -> Tuple[List[float], List[float]]:
+            rx = [x * _cos - y * _sin for x, y in zip(px, py)]
+            ry = [x * _sin + y * _cos for x, y in zip(px, py)]
+            return rx, ry
+
+        QUANTITIES = ["density", "velocity", "flow"]
+        MASK_FILL = "rgba(220,80,80,0.85)"
+        MASK_LINE = "rgb(180,40,40)"
+        NORMAL_LINE = "rgba(80,80,80,0.4)"
+        CMAP = cm.get_cmap("viridis")
+
+        if not self.rollout_results:
+            raise ValueError("No rollout results. Run the simulation first.")
+
+        def _q_value(density: float, fd: Optional[FundamentalDiagram], q: str) -> float:
+            if fd is None:
+                return 0.0
+            if q == "velocity":
+                return fd.velocity_from_density(density)
+            if q == "flow":
+                return fd.demand(density)
+            return density
+
+        def _rgba(v: float, vmin: float, vmax: float) -> str:
+            t = float(np.clip((v - vmin) / max(vmax - vmin, 1e-12), 0.0, 1.0))
+            r, g, b, _ = CMAP(t)
+            return f"rgba({int(r*255)},{int(g*255)},{int(b*255)},0.85)"
+
+        # Per-quantity global value ranges
+        ranges: Dict[str, Tuple[float, float]] = {}
+        for q in QUANTITIES:
+            vals: List[float] = []
+            for rs in self.rollout_results:
+                for road in rs.network.roads.values():
+                    for cell in road.cells.values():
+                        vals.append(_q_value(cell.density, cell.fd, q))
+                if rs.active_network:
+                    for ac in rs.active_network.active_cells.values():
+                        if ac.kind == "normal" and ac.fd is not None:
+                            vals.append(_q_value(ac.density, ac.fd, q))
+            ranges[q] = (float(min(vals)) if vals else 0.0, float(max(vals)) if vals else 1.0)
+
+        # Base cell polygons — geometry fixed, only densities vary
+        ref_network = self.rollout_results[0].network
+        base_cells: List[Tuple[str, str, List[float], List[float], Optional[FundamentalDiagram]]] = []
+        for road in ref_network.roads.values():
+            for cell in road.cells.values():
+                px, py = _rotate(*Network._cell_polygon(road, cell.start_s, cell.end_s, cell.lane))
+                base_cells.append((road.road_id, cell.cell_id, px, py, cell.fd))
+
+        active_per_step: List[List[ActiveCell]] = [
+            list(rs.active_network.active_cells.values()) if rs.active_network else []
+            for rs in self.rollout_results
+        ]
+        max_active = max((len(a) for a in active_per_step), default=0)
+        N_base = len(base_cells)
+
+        # Trace layout (per quantity q_idx in 0,1,2):
+        #   base traces:   q_idx * N_base  ..  (q_idx+1) * N_base - 1
+        #   active traces: 3*N_base + q_idx * max_active  ..  3*N_base + (q_idx+1) * max_active - 1
+        #   colorbar:      3*N_base + 3*max_active + q_idx
+        def base_start(q_idx: int) -> int:
+            return q_idx * N_base
+        def active_start(q_idx: int) -> int:
+            return 3 * N_base + q_idx * max_active
+        def colorbar_idx(q_idx: int) -> int:
+            return 3 * N_base + 3 * max_active + q_idx
+
+        N_total = 3 * N_base + 3 * max_active + 3
+
+        def _visibility(show_base: bool, q_idx: int) -> List[bool]:
+            vis = [False] * N_total
+            group_start = base_start(q_idx) if show_base else active_start(q_idx)
+            group_size = N_base if show_base else max_active
+            for i in range(group_size):
+                vis[group_start + i] = True
+            vis[colorbar_idx(q_idx)] = True
+            return vis
+
+        # Build initial traces for all 3 quantities × 2 network views
+        first_rs = self.rollout_results[0]
+        first_active = active_per_step[0]
+        traces: List[Any] = []
+
+        for q_idx, q in enumerate(QUANTITIES):
+            vmin, vmax = ranges[q]
+            visible_initially = (q_idx == 0)  # show density / base on load
+
+            # Base traces for this quantity
+            for road_id, cell_id, px, py, fd in base_cells:
+                cell = first_rs.network.get_cell(road_id, cell_id)
+                traces.append(go.Scatter(
+                    x=px, y=py,
+                    fill="toself",
+                    fillcolor=_rgba(_q_value(cell.density, fd, q), vmin, vmax),
+                    mode="lines",
+                    line=dict(color=NORMAL_LINE, width=0.5),
+                    showlegend=False,
+                    visible=visible_initially,
+                    hoverinfo="skip",
+                ))
+
+        for q_idx, q in enumerate(QUANTITIES):
+            vmin, vmax = ranges[q]
+
+            # Active traces for this quantity (padded to max_active)
+            for i in range(max_active):
+                if i < len(first_active):
+                    ac = first_active[i]
+                    road = self.network.roads[ac.road_id]
+                    px, py = _rotate(*Network._cell_polygon(road, ac.start_s, ac.end_s, ac.lane))
+                    fill = MASK_FILL if ac.kind == "mask" else _rgba(_q_value(ac.density, ac.fd, q), vmin, vmax)
+                    lcolor = MASK_LINE if ac.kind == "mask" else NORMAL_LINE
+                else:
+                    px, py = [], []
+                    fill = "rgba(0,0,0,0)"
+                    lcolor = "rgba(0,0,0,0)"
+                traces.append(go.Scatter(
+                    x=px, y=py,
+                    fill="toself",
+                    fillcolor=fill,
+                    mode="lines",
+                    line=dict(color=lcolor, width=0.5),
+                    showlegend=False,
+                    visible=False,
+                    hoverinfo="skip",
+                ))
+
+        # Colorbar dummy traces (one per quantity)
+        colorbar_x = [1.02, 1.10, 1.18]
+        for q_idx, q in enumerate(QUANTITIES):
+            vmin, vmax = ranges[q]
+            traces.append(go.Scatter(
+                x=[None], y=[None],
+                mode="markers",
+                marker=dict(
+                    colorscale="Viridis",
+                    cmin=vmin, cmax=vmax,
+                    color=[vmin],
+                    showscale=True,
+                    colorbar=dict(title=q, x=colorbar_x[q_idx], thickness=15),
+                ),
+                showlegend=False,
+                visible=(q_idx == 0),
+                hoverinfo="skip",
+            ))
+
+        # Animation frames — update all 3*N_base + 3*max_active data traces
+        frames: List[go.Frame] = []
+        for rs, step_active in zip(self.rollout_results, active_per_step):
+            frame_data: List[Any] = []
+            frame_traces: List[int] = []
+
+            for q_idx, q in enumerate(QUANTITIES):
+                vmin, vmax = ranges[q]
+                for i, (road_id, cell_id, _px, _py, fd) in enumerate(base_cells):
+                    cell = rs.network.get_cell(road_id, cell_id)
+                    frame_data.append(go.Scatter(fillcolor=_rgba(_q_value(cell.density, fd, q), vmin, vmax)))
+                    frame_traces.append(base_start(q_idx) + i)
+
+            for q_idx, q in enumerate(QUANTITIES):
+                vmin, vmax = ranges[q]
+                for i in range(max_active):
+                    if i < len(step_active):
+                        ac = step_active[i]
+                        road = self.network.roads[ac.road_id]
+                        px, py = _rotate(*Network._cell_polygon(road, ac.start_s, ac.end_s, ac.lane))
+                        fill = MASK_FILL if ac.kind == "mask" else _rgba(_q_value(ac.density, ac.fd, q), vmin, vmax)
+                        lcolor = MASK_LINE if ac.kind == "mask" else NORMAL_LINE
+                        frame_data.append(go.Scatter(x=px, y=py, fillcolor=fill, line=dict(color=lcolor, width=0.5)))
+                    else:
+                        frame_data.append(go.Scatter(x=[], y=[], fillcolor="rgba(0,0,0,0)"))
+                    frame_traces.append(active_start(q_idx) + i)
+
+            frames.append(go.Frame(data=frame_data, traces=frame_traces, name=str(int(rs.sim_time))))
+
+        # Slider
+        slider_steps = [
+            dict(
+                args=[[str(int(rs.sim_time))], {"frame": {"duration": 0, "redraw": True}, "mode": "immediate"}],
+                label=str(int(rs.sim_time)),
+                method="animate",
+            )
+            for rs in self.rollout_results
+        ]
+        sliders = [dict(
+            active=0,
+            steps=slider_steps,
+            x=0.05, xanchor="left",
+            y=0.0, yanchor="top",
+            len=0.9,
+            pad={"t": 50},
+            currentvalue=dict(prefix="t = ", visible=True, xanchor="center"),
+            transition=dict(duration=0),
+        )]
+
+        # Playback buttons + 6 combination view buttons (Base|Active × Density|Velocity|Flow)
+        view_buttons = []
+        for show_base, net_label in [(True, "Base"), (False, "Active")]:
+            for q_idx, q in enumerate(QUANTITIES):
+                view_buttons.append(dict(
+                    label=f"{net_label} · {q.capitalize()}",
+                    method="update",
+                    args=[{"visible": _visibility(show_base, q_idx)}],
+                ))
+
+        updatemenus = [
+            dict(
+                type="buttons", direction="left",
+                x=0.05, y=2.0, xanchor="left", showactive=True,
+                buttons=[
+                    dict(label="▶ Play", method="animate",
+                         args=[None, {"frame": {"duration": 100, "redraw": True}, "fromcurrent": True, "mode": "immediate"}]),
+                    dict(label="⏸ Pause", method="animate",
+                         args=[[None], {"frame": {"duration": 0, "redraw": False}, "mode": "immediate"}]),
+                ],
+            ),
+            dict(
+                type="buttons", direction="left",
+                x=0.05, y=1.06, xanchor="left", showactive=True,
+                buttons=view_buttons,
+            ),
+        ]
+
+        return go.Figure(
+            data=traces,
+            frames=frames,
+            layout=go.Layout(
+                title="Simulation rollout",
+                xaxis=dict(scaleanchor="y", showgrid=False),
+                yaxis=dict(showgrid=False),
+                template="plotly_white",
+                sliders=sliders,
+                updatemenus=updatemenus,
+                margin=dict(t=120),
+            ),
+        )
 
     def current_state_dataframe(self) -> pd.DataFrame:
         rows = []

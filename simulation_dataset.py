@@ -110,3 +110,6 @@ class I24SimulationData:
         table = pa.Table.from_pandas(final_dataframe_sorted, preserve_index=False)
         pq.write_table(table, self.macro_final_path, compression="zstd", row_group_size=1000, sorting_columns=sorting_columns)
 
+if __name__ == "__main__":
+    sim_data = I24SimulationData()
+    sim_data.create_network_file()
