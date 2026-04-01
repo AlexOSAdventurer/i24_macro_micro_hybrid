@@ -1277,6 +1277,7 @@ class Simulation:
         self.min_cell_length = float(min_cell_length) if min_cell_length is not None else 1.0
 
         self.masking_cells: Dict[str, ArbitraryMaskingCell] = {}
+        self._step_callbacks: List[Any] = []
 
         self.network.validate()
 
@@ -1310,6 +1311,10 @@ class Simulation:
     def remove_masking_cell(self, mask_id: str) -> None:
         if mask_id in self.masking_cells:
             del self.masking_cells[mask_id]
+
+    def register_step_callback(self, fn) -> None:
+        """Register a callable invoked at the start of each step as fn(sim_time, dt)."""
+        self._step_callbacks.append(fn)
 
     def _snapshot(self) -> None:
         self.rollout_results.append(
@@ -1467,6 +1472,8 @@ class Simulation:
 
     def step(self) -> None:
         self._snapshot()
+        for cb in self._step_callbacks:
+            cb(self.current_time, self.time_resolution)
         self._update_masks()
         active = self._build_active_network()
         self.rollout_results[-1].active_network = active.snapshot()
@@ -2131,41 +2138,40 @@ class FixedScalarMask(ArbitraryMaskingCell):
         return self.supply_value
     
 class I24MicroMask(ArbitraryMaskingCell):
+    """Single-lane micro-domain mask for one lane of the I-24 moving window.
+
+    Four of these (one per lane) are managed together by MicroSimBridge,
+    which replaces them each step with updated position and boundary values.
+    """
 
     def __init__(
         self,
         mask_id: str,
         network: Network,
-
         road_id: str,
+        lane: int,
         middle_s: float,
-        margin_s: float
+        margin_s: float,
     ):
-        super().__init__(mask_id=mask_id, network=network, 
-                         segments=[
-                             MaskedSegmentRef(road_id, -1, middle_s - margin_s, middle_s + margin_s),
-                             MaskedSegmentRef(road_id, -2, middle_s - margin_s, middle_s + margin_s),
-                             MaskedSegmentRef(road_id, -3, middle_s - margin_s, middle_s + margin_s),
-                             MaskedSegmentRef(road_id, -4, middle_s - margin_s, middle_s + margin_s)
-                         ])
-        self.road_id = road_id,
+        super().__init__(
+            mask_id=mask_id,
+            network=network,
+            segments=[MaskedSegmentRef(road_id, lane, middle_s - margin_s, middle_s + margin_s)],
+        )
+        self.road_id = road_id
+        self.lane = lane
         self.middle_s = middle_s
         self.margin_s = margin_s
-    
+
     """
     Demand and Supply calculations here form our core contributions.
     We don't have the equations placed here just yet.
     """
     def demand(self, sim_time: float) -> float:
         return 0
-    
+
     def supply(self, sim_time: float) -> float:
         return 0
-    
-    #def get
-    
-    def update(self, sim_time: float, dt: float, new_middle_s: float) -> I24MicroMask:
-        return I24MicroMask(self.mask_id, self.network, self.road_id, new_middle_s, self.margin_s)
 
 # =========================
 # Example usage
