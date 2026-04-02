@@ -52,6 +52,14 @@ def run_app(
         {"label": "10x",  "value": 10},
     ]
 
+    # Build road/lane options from ts_data keys
+    road_lane_options = [
+        {"label": f"Road {rid} · Lane {lane}", "value": f"{rid}:{lane}"}
+        for rid, lane in sorted(renderer.ts_data.keys())
+    ]
+    default_road_lane = road_lane_options[0]["value"] if road_lane_options else ""
+    default_rid, default_lane = default_road_lane.split(":") if default_road_lane else ("", 0)
+
     app = Dash(__name__)
     app.layout = html.Div(
         [
@@ -98,6 +106,25 @@ def run_app(
                 tooltip={"placement": "bottom", "always_visible": True},
             ),
             dcc.Interval(id="play-interval", interval=dt_ms, disabled=True),
+            html.Hr(),
+            html.Div(
+                [
+                    html.Label("Time-space diagram:", style={"marginRight": "10px", "fontWeight": "bold"}),
+                    dcc.Dropdown(
+                        id="ts-road-lane",
+                        options=road_lane_options,
+                        value=default_road_lane,
+                        clearable=False,
+                        style={"width": "220px"},
+                    ),
+                ],
+                style={"display": "flex", "padding": "10px", "alignItems": "center"},
+            ),
+            dcc.Graph(
+                id="ts-graph",
+                figure=renderer.get_ts_figure(default_rid, int(default_lane)),
+                style={"height": "40vh"},
+            ),
         ]
     )
 
@@ -118,7 +145,16 @@ def run_app(
     def configure_interval(speed: int):
         if speed == 0:
             return True, dt_ms
-        return False, 1.0
+        return False, dt_ms
+
+    @app.callback(
+        Output("ts-graph", "figure"),
+        Input("ts-road-lane", "value"),
+        Input("quantity", "value"),
+    )
+    def update_ts(road_lane: str, quantity: str) -> go.Figure:
+        rid, lane_str = road_lane.split(":")
+        return renderer.get_ts_figure(rid, int(lane_str), quantity)
 
     @app.callback(
         Output("step-slider", "value"),
@@ -139,7 +175,8 @@ if __name__ == "__main__":
     sim = Simulation.from_json(
         json_path=os.path.join(config["storage_locations"]["simulation_dataset"], "network.json"),
         time_resolution=config["time_step"],
-        origin_time=config["time_origin"]+60.0
+        origin_time=config["time_origin"]+60.0,
+        min_cell_length=100.0
     )
 
     gt = GroundTruthStore.from_parquet(os.path.join(config["storage_locations"]["simulation_dataset"], "micro.parquet"), os.path.join(config["storage_locations"]["simulation_dataset"], "macro.parquet"))
@@ -149,9 +186,10 @@ if __name__ == "__main__":
         sim=sim,
         road_id="2",
         lanes=[-1, -2, -3, -4],
-        initial_middle_s=600.0,
+        initial_middle_s=150.0,
         margin_s=50.0,
+        max_middle_s=1450,
         update_micro_callback=replayer.step,
     )
-    sim.run(duration=60.0)
+    sim.run(duration=3599.0-60.0)
     run_app(sim, rotation_deg=90.0)

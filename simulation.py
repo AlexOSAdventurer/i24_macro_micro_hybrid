@@ -428,19 +428,15 @@ class NetworkGenerator(ABC):
             json.dump(network_dict, f, indent=4)  
 
 class I24WestBoundNetwork(NetworkGenerator):
-    def __init__(self):
+    def __init__(self, v_f, rho_j, lambda_lc):
         super().__init__()
         self.network = None
-        self.fd = GreenshieldsFD(v_f=26.9, rho_j=0.065)
-        self.lane_change_model = SpeedIncentiveLaneChange(lambda_lc=0.195)
+        self.fd = GreenshieldsFD(v_f=v_f, rho_j=rho_j)
+        self.lane_change_model = SpeedIncentiveLaneChange(lambda_lc=lambda_lc)
 
-    def create_network(self):
+    def create_network(self, road_length=1600.0, longitudinal_step=50.0, lane_count=4, lane_width=3.6576):
         network_id = "i24_westbound"
         road_id = "2"
-        road_length = 1600.0
-        longitudinal_step = 50.0
-        lane_width = 3.6576
-        lane_count = 4
         offset_from_medium = lane_width
         road_width = lane_width * lane_count
         starting_x = 200.0 + lane_width
@@ -500,19 +496,15 @@ class I24WestBoundNetwork(NetworkGenerator):
         self.network = Network(network_id=network_id, roads={road_id: road})
 
 class I24EastBoundNetwork(NetworkGenerator):
-    def __init__(self):
+    def __init__(self, v_f, rho_j, lambda_lc):
         super().__init__()
         self.network = None
-        self.fd = GreenshieldsFD(v_f=26.9, rho_j=0.065)
-        self.lane_change_model = SpeedIncentiveLaneChange(lambda_lc=0.195)
+        self.fd = GreenshieldsFD(v_f=v_f, rho_j=rho_j)
+        self.lane_change_model = SpeedIncentiveLaneChange(lambda_lc=lambda_lc)
 
-    def create_network(self):
+    def create_network(self, road_length=1600.0, longitudinal_step=50.0, lane_count=4, lane_width=3.6576):
         network_id = "i24_eastbound"
         road_id = "1"
-        road_length = 1600.0
-        longitudinal_step = 50.0
-        lane_width = 3.6576
-        lane_count = 4
         offset_from_medium = lane_width
         road_width = lane_width * lane_count
         starting_x = 0.0 - offset_from_medium
@@ -572,16 +564,19 @@ class I24EastBoundNetwork(NetworkGenerator):
         self.network = Network(network_id=network_id, roads={road_id: road})
 
 class I24WestAndEastNetwork(NetworkGenerator):
-    def __init__(self):
+    def __init__(self, v_f=45.0, rho_j=0.10, lambda_lc=0.10):
         super().__init__()
         self.network = None
+        self.v_f = v_f
+        self.rho_j = rho_j
+        self.lambda_lc = lambda_lc
 
-    def create_network(self):
+    def create_network(self, road_length=1600.0, longitudinal_step=50.0, lane_count=4, lane_width=3.6576):
         network_id = "i24_west_and_east_network"
-        westbound_network = I24WestBoundNetwork()
-        eastbound_network = I24EastBoundNetwork()
-        westbound_network.create_network()
-        eastbound_network.create_network()
+        westbound_network = I24WestBoundNetwork(self.v_f, self.rho_j, self.lambda_lc)
+        eastbound_network = I24EastBoundNetwork(self.v_f, self.rho_j, self.lambda_lc)
+        westbound_network.create_network(road_length, longitudinal_step, lane_count, lane_width)
+        eastbound_network.create_network(road_length, longitudinal_step, lane_count, lane_width)
         self.network = Network.merge_networks(westbound_network.network, eastbound_network.network, network_id)
 
 # =========================
@@ -957,7 +952,8 @@ class ActiveMeshBuilder:
                         }
                     )
 
-                merged = self._merge_small_intervals(raw_intervals)
+                merged = self._merge_same_mask_intervals(raw_intervals)
+                merged = self._merge_small_intervals(merged)
 
                 for idx, item in enumerate(merged):
                     active_cell_id = f"{road_id}|lane{lane}|{idx}"
@@ -985,6 +981,20 @@ class ActiveMeshBuilder:
 
         self._build_neighbors(active)
         return active
+
+    def _merge_same_mask_intervals(self, intervals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Collapse consecutive intervals that share the same mask_id into one cell."""
+        if not intervals:
+            return []
+        out = [dict(intervals[0])]
+        for cur in intervals[1:]:
+            prev = out[-1]
+            if cur["mask_id"] is not None and cur["mask_id"] == prev["mask_id"]:
+                prev["end_s"] = cur["end_s"]
+                prev["base_segments"].extend(cur["base_segments"])
+            else:
+                out.append(dict(cur))
+        return out
 
     def _merge_small_intervals(self, intervals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if not intervals:
@@ -1040,7 +1050,7 @@ class ActiveMeshBuilder:
                     i += 1
 
             intervals = out
-
+        #print(intervals)
         return intervals
 
     def _build_neighbors(self, active: ActiveNetwork) -> None:
@@ -1052,9 +1062,13 @@ class ActiveMeshBuilder:
             lane_cells.sort(key=lambda c: (c.start_s, c.end_s))
             for i, cell in enumerate(lane_cells):
                 if i > 0:
-                    cell.inflow_neighbors.append(lane_cells[i - 1].active_cell_id)
+                    prev = lane_cells[i - 1]
+                    if not (prev.kind == "mask" and cell.kind == "mask"):
+                        cell.inflow_neighbors.append(prev.active_cell_id)
                 if i + 1 < len(lane_cells):
-                    cell.outflow_neighbors.append(lane_cells[i + 1].active_cell_id)
+                    nxt = lane_cells[i + 1]
+                    if not (cell.kind == "mask" and nxt.kind == "mask"):
+                        cell.outflow_neighbors.append(nxt.active_cell_id)
 
 
 class ConservativeRemapper:
@@ -1419,8 +1433,6 @@ class Simulation:
 
             for v in succ:
                 v_cell = active.active_cells[v]
-                if (u_cell.kind == "mask") and (v_cell.kind=="mask"):
-                    continue
                 if v_cell.kind == "mask":
                     # Normal → mask: rear boundary flux determined by mask's Riemann solver
                     mask = self.masking_cells[v_cell.mask_id]
@@ -2153,6 +2165,92 @@ class RolloutRenderer:
                     else:
                         step_colors.append("#000000")
                 self.active_frame_colors[q].append(step_colors)
+
+        # Time-space data: (road_id, lane) → per-quantity (N_frames, N_cells) arrays
+        self.ts_data: Dict[Tuple[str, int], Dict[str, Any]] = {}
+        ref_net = sim.rollout_results[0].network
+        for road in ref_net.roads.values():
+            for lane in sorted(road.lane_data):
+                cells = road.cells_for_lane(lane)
+                if not cells:
+                    continue
+                cell_ids = [c.cell_id for c in cells]
+                s_mids = [(c.start_s + c.end_s) / 2.0 for c in cells]
+                fds = [c.fd for c in cells]
+                rho_ts = np.array([
+                    [rs.network.get_cell(road.road_id, cid).density for cid in cell_ids]
+                    for rs in sim.rollout_results
+                ])  # (N_frames, N_cells)
+                entry: Dict[str, Any] = {"s_mids": s_mids, "density": rho_ts}
+                for q in ("flow", "velocity"):
+                    vals = np.zeros_like(rho_ts)
+                    for j, fd in enumerate(fds):
+                        vals[:, j] = [_q_value(rho, fd, q) for rho in rho_ts[:, j]]
+                    entry[q] = vals
+
+                # Mask extents per timestep: (start_s, end_s) or None
+                mask_extents: List[Optional[Tuple[float, float]]] = []
+                for snapshots in self.mask_snapshots_per_step:
+                    extent: Optional[Tuple[float, float]] = None
+                    for mask in snapshots.values():
+                        for seg in mask.segments:
+                            if seg.road_id == road.road_id and seg.lane == lane:
+                                lo, hi = float(seg.start_s), float(seg.end_s)
+                                extent = (lo, hi) if extent is None else (min(extent[0], lo), max(extent[1], hi))
+                    mask_extents.append(extent)
+                entry["mask_extents"] = mask_extents
+
+                self.ts_data[(road.road_id, lane)] = entry
+
+    def get_ts_figure(self, road_id: str, lane: int, quantity: str = "density") -> go.Figure:
+        """Return a time-space heatmap (viridis pcolormesh style) for one road+lane."""
+        key = (road_id, lane)
+        if key not in self.ts_data:
+            return go.Figure()
+        entry = self.ts_data[key]
+        vmin, vmax = self.ranges[quantity]
+        z = entry[quantity].T  # (N_cells, N_frames)
+        fig = go.Figure(go.Heatmap(
+            x=self.sim_times,
+            y=entry["s_mids"],
+            z=z,
+            zmin=vmin,
+            zmax=vmax,
+            colorscale="Viridis",
+            colorbar=dict(title=quantity),
+            zsmooth=False,
+        ))
+
+        # Overlay mask trajectory as a filled band
+        pairs = [
+            (t, ext)
+            for t, ext in zip(self.sim_times, entry["mask_extents"])
+            if ext is not None
+        ]
+        if pairs:
+            t_fwd = [t for t, _ in pairs]
+            t_rev = t_fwd[::-1]
+            s_lo = [ext[0] for _, ext in pairs]
+            s_hi = [ext[1] for _, ext in pairs]
+            fig.add_trace(go.Scatter(
+                x=t_fwd + t_rev,
+                y=s_lo + s_hi[::-1],
+                fill="toself",
+                fillcolor="rgba(220,80,80,0.25)",
+                line=dict(color="rgba(220,80,80,0.8)", width=1),
+                showlegend=False,
+                hoverinfo="skip",
+            ))
+
+        fig.update_layout(
+            xaxis_title="Time (s)",
+            yaxis_title="Position (m)",
+            title=f"Road {road_id} · Lane {lane} · {quantity}",
+            template="plotly_white",
+            margin=dict(t=60),
+            uirevision="ts-constant",
+        )
+        return fig
 
     def get_figure(self, step_idx: int, show_base: bool = True, quantity: str = "density") -> go.Figure:
         """Return a static go.Figure for a single simulation timestep."""

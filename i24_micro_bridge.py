@@ -40,6 +40,7 @@ class I24MicroSimBridge:
         road_id: str,
         lanes: List[int],
         initial_middle_s: float,
+        max_middle_s: float,
         margin_s: float,
         update_micro_callback=None
     ) -> None:
@@ -47,6 +48,8 @@ class I24MicroSimBridge:
         self.road_id = road_id
         self.lanes = lanes
         self.middle_s = float(initial_middle_s)
+        self.max_middle_s = float(max_middle_s)
+        self.running = True
         self.margin_s = float(margin_s)
         self.flow_memory_rear = {
             lane: 0.0 for lane in lanes
@@ -86,6 +89,8 @@ class I24MicroSimBridge:
 
         Advances the window and rebuilds all four lane masks in-place.
         """
+        if not self.running:
+            return
         lane_cells = {
             lane: self.sim.masking_cells[self._mask_id(lane)] for lane in self.lanes
         }
@@ -94,7 +99,12 @@ class I24MicroSimBridge:
             self.flow_memory_front[lane] += lane_cells[lane].front_flow
 
         self.middle_s = self.update_micro_callback(self)
-
+        if self.middle_s >= self.max_middle_s:
+            self.running = False
+            for lane in self.lanes:
+                del self.sim.masking_cells[self._mask_id(lane)]
+            return
+            
         for lane in self.lanes:
             new_mask = I24MicroMask(
                 mask_id=self._mask_id(lane),

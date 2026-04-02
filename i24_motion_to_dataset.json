@@ -18,6 +18,7 @@
             "cell_length": 100.0,
             "time_step": 1.0,
             "lanes": 4,
+            "lane_width": 3.6575,
             "outage_locations": [
                 [500.0, 600.0],
                 [1000.0, 1200.0]
@@ -37,6 +38,7 @@
             "cell_length": 100.0,
             "time_step": 1.0,
             "lanes": 4,
+            "lane_width": 3.6575,
             "outage_locations": [
                 [400.0, 600.0],
                 [1000.0, 1100.0]
