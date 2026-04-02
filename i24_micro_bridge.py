@@ -31,6 +31,7 @@ class Vehicle:
     width: float # Meters
     s: float # Longitudinal position. Relative to the rear of the microscopic bubble.
     t: float # Lateral position. Decreases as one moves to the right.
+    lane: int = 0 # Lane index (same convention as Network lanes)
 
 class I24MicroSimBridge:
     def __init__(
@@ -93,7 +94,7 @@ class I24MicroSimBridge:
         self.middle_s = self.update_micro_callback(self)
 
         for lane in self.lanes:
-            self.sim.masking_cells[self._mask_id(lane)] = I24MicroMask(
+            new_mask = I24MicroMask(
                 mask_id=self._mask_id(lane),
                 network=self.sim.network,
                 road_id=self.road_id,
@@ -101,6 +102,8 @@ class I24MicroSimBridge:
                 middle_s=self.middle_s,
                 margin_s=self.margin_s,
             )
+            new_mask.vehicles = self.vehicles
+            self.sim.masking_cells[self._mask_id(lane)] = new_mask
 
     def update_vehicles(self, vehicles: Dict[str, Vehicle]):
         self.vehicles = vehicles

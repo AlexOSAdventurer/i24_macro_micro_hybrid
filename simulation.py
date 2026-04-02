@@ -773,6 +773,14 @@ class ArbitraryMaskingCell(ABC):
         """
         return
 
+    def render(self, rotate_fn) -> list:
+        """Return a list of plotly traces for this mask's contents.
+
+        Override in subclasses that have visual contents (e.g. vehicles).
+        Default returns an empty list.
+        """
+        return []
+
 
 @dataclass
 class ActiveCell:
@@ -1256,6 +1264,7 @@ class RolloutStep:
     sim_time: float
     network: Network
     active_network: Optional[ActiveNetwork] = None
+    mask_snapshots: Optional[Dict[str, Any]] = None
 
 
 class Simulation:
@@ -1556,6 +1565,8 @@ class Simulation:
         self._update_masks()
         active = self._build_active_network()
         self.rollout_results[-1].active_network = active.snapshot()
+        if self.masking_cells:
+            self.rollout_results[-1].mask_snapshots = dict(self.masking_cells)
         self._step_active_network(active)
         ConservativeRemapper.active_to_base(self.network, active)
         self.current_time += self.time_resolution
@@ -2023,6 +2034,8 @@ class RolloutRenderer:
                 [x * _sin + y * _cos for x, y in zip(px, py)],
             )
 
+        self._rotate = _rotate
+
         def _q_value(density: float, fd: Optional[FundamentalDiagram], q: str) -> float:
             if fd is None:
                 return 0.0
@@ -2061,6 +2074,9 @@ class RolloutRenderer:
         self.max_active: int = max((len(a) for a in active_per_step), default=0)
         self.N_frames: int = len(sim.rollout_results)
         self.sim_times: List[float] = [rs.sim_time for rs in sim.rollout_results]
+        self.mask_snapshots_per_step: List[Dict[str, Any]] = [
+            rs.mask_snapshots or {} for rs in sim.rollout_results
+        ]
 
         def _color_matrix(vals: np.ndarray, vmin: float, vmax: float) -> List[List[str]]:
             t = np.clip((vals - vmin) / max(vmax - vmin, 1e-12), 0.0, 1.0)
@@ -2165,6 +2181,8 @@ class RolloutRenderer:
                     showlegend=False,
                     hoverinfo="skip",
                 ))
+            for mask in self.mask_snapshots_per_step[step_idx].values():
+                traces.extend(mask.render(self._rotate))
 
         traces.append(go.Scatter(
             x=[None], y=[None],
@@ -2241,6 +2259,7 @@ class I24MicroMask(ArbitraryMaskingCell):
         self.lane = lane
         self.middle_s = middle_s
         self.margin_s = margin_s
+        self.vehicles: Dict[str, Any] = {}
 
     """
     Boundary flux calculations here form our core contributions — to be
@@ -2252,6 +2271,29 @@ class I24MicroMask(ArbitraryMaskingCell):
 
     def front_boundary_flux(self, rho_exterior: float, fd_exterior: "FundamentalDiagram", sim_time: float) -> float:
         return 0.0
+
+    def render(self, rotate_fn) -> list:
+        """Draw each vehicle in this lane as a filled rectangle."""
+        road = self.network.roads[self.road_id]
+        s_offset = self.middle_s - self.margin_s
+        traces = []
+        for vehicle in self.vehicles.values():
+            if vehicle.lane != self.lane:
+                continue
+            s_abs = vehicle.s + s_offset
+            s_start = s_abs - vehicle.length / 2.0
+            s_end = s_abs + vehicle.length / 2.0
+            px, py = rotate_fn(*Network._cell_polygon(road, s_start, s_end, self.lane))
+            traces.append(go.Scatter(
+                x=px, y=py,
+                fill="toself",
+                fillcolor="#1f77b4",
+                mode="lines",
+                line=dict(color="#0d4f8b", width=0.5),
+                showlegend=False,
+                hoverinfo="skip",
+            ))
+        return traces
 
 # =========================
 # Example usage
