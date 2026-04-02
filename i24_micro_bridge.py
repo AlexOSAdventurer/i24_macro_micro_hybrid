@@ -55,6 +55,7 @@ class I24MicroSimBridge:
             lane: 0.0 for lane in lanes
         }
         self.vehicles: Dict[str, Vehicle] = {}
+        self.anchor_speed = 0.0
 
         # Create one mask per lane and register with the simulation
         for lane in self.lanes:
@@ -65,6 +66,7 @@ class I24MicroSimBridge:
                 lane=lane,
                 middle_s=self.middle_s,
                 margin_s=self.margin_s,
+                anchor_speed=0.0
             )
             sim.add_masking_cell(mask)
 
@@ -101,8 +103,9 @@ class I24MicroSimBridge:
                 lane=lane,
                 middle_s=self.middle_s,
                 margin_s=self.margin_s,
+                anchor_speed=self.anchor_speed
             )
-            new_mask.vehicles = self.vehicles
+            new_mask.vehicles = {vehicle: self.vehicles[vehicle] for vehicle in self.vehicles if self.vehicles[vehicle].lane == lane}
             self.sim.masking_cells[self._mask_id(lane)] = new_mask
 
     def update_vehicles(self, vehicles: Dict[str, Vehicle]):

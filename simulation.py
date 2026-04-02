@@ -602,6 +602,7 @@ REQUIRED_GT_COLUMNS = {
         "class",
         "time",
         "road_id",
+        "lane_id",
         "s",
         "t",
         "length",
@@ -746,21 +747,21 @@ class ArbitraryMaskingCell(ABC):
         for seg in self.segments:
             seg.validate()
             if seg.road_id not in self.network.roads:
-                raise KeyError(f"Mask {self.mask_id}: road '{seg.road_id}' not found.")
+                raise KeyError(f"Mask {self.mask_id}: road '{seg.road_id}' not found in {self.network.roads.keys()}.")
             if seg.lane not in self.network.roads[seg.road_id].lane_data:
                 raise KeyError(
                     f"Mask {self.mask_id}: lane {seg.lane} not in road {seg.road_id}."
                 )
 
     @abstractmethod
-    def rear_boundary_flux(self, rho_exterior: float, fd_exterior: "FundamentalDiagram", sim_time: float) -> float:
+    def rear_boundary_flux(self, rho_exterior: float, fd_exterior: "FundamentalDiagram", sim_time: float, dt: float) -> float:
         """Net flux entering the mask through its rear (upstream) face.
         May be negative (backward flow out of rear face).
         """
         raise NotImplementedError
 
     @abstractmethod
-    def front_boundary_flux(self, rho_exterior: float, fd_exterior: "FundamentalDiagram", sim_time: float) -> float:
+    def front_boundary_flux(self, rho_exterior: float, fd_exterior: "FundamentalDiagram", sim_time: float, dt: float) -> float:
         """Net flux leaving the mask through its front (downstream) face.
         May be negative (backward flow into front face).
         """
@@ -965,6 +966,9 @@ class ActiveMeshBuilder:
                     if item["kind"] == "normal" and item["base_segments"]:
                         cell_fd = self.network.get_cell(*item["base_segments"][0][0]).fd
                         cell_lane_change_model = self.network.get_cell(*item["base_segments"][0][0]).lane_change_model
+                    elif item["kind"] == "normal":
+                        cell_fd = GreenshieldsFD(v_f=26.9, rho_j=0.065)
+                        cell_lane_change_model = SpeedIncentiveLaneChange(lambda_lc=0.195)
                     active.active_cells[active_cell_id] = ActiveCell(
                         active_cell_id=active_cell_id,
                         road_id=road_id,
@@ -1415,18 +1419,20 @@ class Simulation:
 
             for v in succ:
                 v_cell = active.active_cells[v]
-
+                if (u_cell.kind == "mask") and (v_cell.kind=="mask"):
+                    continue
                 if v_cell.kind == "mask":
                     # Normal → mask: rear boundary flux determined by mask's Riemann solver
                     mask = self.masking_cells[v_cell.mask_id]
+                    
                     edge_flow[(u, v)] = mask.rear_boundary_flux(
-                        u_cell.density, u_cell.fd, self.current_time
+                        u_cell.density, u_cell.fd, self.current_time, self.time_resolution
                     )
                 elif u_cell.kind == "mask":
                     # Mask → normal: front boundary flux determined by mask's Riemann solver
                     mask = self.masking_cells[u_cell.mask_id]
                     edge_flow[(u, v)] = mask.front_boundary_flux(
-                        v_cell.density, v_cell.fd, self.current_time
+                        v_cell.density, v_cell.fd, self.current_time, self.time_resolution
                     )
                 else:
                     # Normal → normal: standard Godunov supply/demand
@@ -2228,10 +2234,10 @@ class FixedScalarMask(ArbitraryMaskingCell):
         self.demand_value = float(demand_value)
         self.supply_value = float(supply_value)
 
-    def rear_boundary_flux(self, rho_exterior: float, fd_exterior: "FundamentalDiagram", sim_time: float) -> float:
+    def rear_boundary_flux(self, rho_exterior: float, fd_exterior: "FundamentalDiagram", sim_time: float, dt: float) -> float:
         return min(fd_exterior.demand(rho_exterior), self.supply_value)
 
-    def front_boundary_flux(self, rho_exterior: float, fd_exterior: "FundamentalDiagram", sim_time: float) -> float:
+    def front_boundary_flux(self, rho_exterior: float, fd_exterior: "FundamentalDiagram", sim_time: float, dt: float) -> float:
         return min(self.demand_value, fd_exterior.supply(rho_exterior))
     
 class I24MicroMask(ArbitraryMaskingCell):
@@ -2249,6 +2255,7 @@ class I24MicroMask(ArbitraryMaskingCell):
         lane: int,
         middle_s: float,
         margin_s: float,
+        anchor_speed: float
     ):
         super().__init__(
             mask_id=mask_id,
@@ -2260,17 +2267,38 @@ class I24MicroMask(ArbitraryMaskingCell):
         self.middle_s = middle_s
         self.margin_s = margin_s
         self.vehicles: Dict[str, Any] = {}
+        self.anchor_speed = 0.0
+
+    def get_rear_vehicle(self):
+        vehicle = None
+        for new_vehicle_key in self.vehicles:
+            if (vehicle is None) or (self.vehicles[new_vehicle_key].s < vehicle.s):
+                vehicle = self.vehicles[new_vehicle_key]
+        return vehicle
+    
+    def get_front_vehicle(self):
+        vehicle = None
+        for new_vehicle_key in self.vehicles:
+            if (vehicle is None) or (self.vehicles[new_vehicle_key].s > vehicle.s):
+                vehicle = self.vehicles[new_vehicle_key]
+        return vehicle
 
     """
     Boundary flux calculations here form our core contributions — to be
     derived from the constrained Riemann solver once the weak entropy
     solution is in hand.
     """
-    def rear_boundary_flux(self, rho_exterior: float, fd_exterior: "FundamentalDiagram", sim_time: float) -> float:
-        return 0.0
+    def rear_boundary_flux(self, rho_exterior: float, fd_exterior: "FundamentalDiagram", sim_time: float, dt: float) -> float:
+        rear_macro_flux = rho_exterior * fd_exterior.velocity_from_density(rho_exterior) * dt
+        rear_micro_geometric_flux = rho_exterior * fd_exterior.velocity_from_density(self.anchor_speed) * dt
+        total_non_clipped_flux = rear_macro_flux - rear_micro_geometric_flux
+        return total_non_clipped_flux
 
-    def front_boundary_flux(self, rho_exterior: float, fd_exterior: "FundamentalDiagram", sim_time: float) -> float:
-        return 0.0
+    def front_boundary_flux(self, rho_exterior: float, fd_exterior: "FundamentalDiagram", sim_time: float, dt: float) -> float:
+        front_macro_flux = rho_exterior * fd_exterior.velocity_from_density(rho_exterior) * dt
+        front_micro_geometric_flux = rho_exterior * fd_exterior.velocity_from_density(self.anchor_speed) * dt
+        total_non_clipped_flux = front_micro_geometric_flux - front_macro_flux
+        return total_non_clipped_flux
 
     def render(self, rotate_fn) -> list:
         """Draw each vehicle in this lane as a filled rectangle."""

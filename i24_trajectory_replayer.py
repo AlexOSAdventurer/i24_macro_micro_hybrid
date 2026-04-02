@@ -32,9 +32,9 @@ Usage
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Dict
+from typing import TYPE_CHECKING, Dict, List
 
-from i24_motion_data import I24MotionData
+from simulation import GroundTruthStore
 from i24_micro_bridge import Vehicle
 
 if TYPE_CHECKING:
@@ -42,9 +42,20 @@ if TYPE_CHECKING:
 
 
 class I24TrajectoryReplayer:
-    def __init__(self, motion_data: I24MotionData, dt: float) -> None:
+    def __init__(self, motion_data: GroundTruthStore, dt: float, lanes: List[int]) -> None:
         self.motion_data = motion_data
+        self.lanes = lanes
         self.dt = float(dt)
+
+    def get_lane_dfs(self, timestamp_min, timestamp_max, s_min, s_max):
+        df = self.motion_data.micro_df
+        window = df[
+            (df["time"] >= timestamp_min) &
+            (df["time"] <= timestamp_max) &
+            (df["s"] >= s_min) &
+            (df["s"] <= s_max)
+        ]
+        return {lane: window[window["lane_id"] == lane] for lane in self.lanes}
 
     # ------------------------------------------------------------------
     # Bridge callback — called each step with the bridge as argument
@@ -66,12 +77,13 @@ class I24TrajectoryReplayer:
         s_min = middle_s - margin_s
         s_max = middle_s + margin_s
 
-        lane_dfs = self.motion_data.queryEdieBoxSubset(
+        lane_dfs = self.get_lane_dfs(sim_time, sim_time + self.dt, s_min, s_max)
+        """lane_dfs = self.motion_data.queryEdieBoxSubset(
             timestamp_min=sim_time,
             timestamp_max=sim_time + self.dt,
             s_min=s_min,
             s_max=s_max,
-        )
+        )"""
 
         vehicles: Dict[str, Vehicle] = {}
         anchor_speed: float | None = None
@@ -104,6 +116,7 @@ class I24TrajectoryReplayer:
                         anchor_speed = ds / dt_obs
 
         bridge.update_vehicles(vehicles)
+        bridge.anchor_speed = anchor_speed
         return self._compute_next_middle_s(middle_s, anchor_speed)
 
     # ------------------------------------------------------------------

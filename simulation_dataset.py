@@ -46,6 +46,7 @@ class I24SimulationData:
                 all_vehicles_selected_columns["width"] *= feet_to_meters
                 all_vehicles_selected_columns["height"] *= feet_to_meters
                 all_vehicles_selected_columns["road_id"] = road_str
+                all_vehicles_selected_columns["lane_id"] = lane
                 final_dataframe = pd.concat([final_dataframe, all_vehicles_selected_columns])
         final_dataframe_sorted = final_dataframe.sort_values(["time", "road_id", "s", "id"], kind="mergesort", ascending=True)
         sorting_columns = [
@@ -113,3 +114,4 @@ class I24SimulationData:
 if __name__ == "__main__":
     sim_data = I24SimulationData()
     sim_data.create_network_file()
+    sim_data.generate_micro_data()

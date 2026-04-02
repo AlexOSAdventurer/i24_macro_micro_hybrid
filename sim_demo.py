@@ -22,7 +22,8 @@ Standalone (requires a pickled Simulation at demo_sim.pickle)::
 from __future__ import annotations
 
 from simulation import Simulation, RolloutRenderer, GroundTruthStore
-
+from i24_trajectory_replayer import I24TrajectoryReplayer
+from i24_micro_bridge import I24MicroSimBridge
 from dash import Dash, dcc, html, Input, Output, State, callback
 import plotly.graph_objects as go
 import json
@@ -138,10 +139,19 @@ if __name__ == "__main__":
     sim = Simulation.from_json(
         json_path=os.path.join(config["storage_locations"]["simulation_dataset"], "network.json"),
         time_resolution=config["time_step"],
-        origin_time=config["time_origin"]
+        origin_time=config["time_origin"]+60.0
     )
 
     gt = GroundTruthStore.from_parquet(os.path.join(config["storage_locations"]["simulation_dataset"], "micro.parquet"), os.path.join(config["storage_locations"]["simulation_dataset"], "macro.parquet"))
-    sim.initialize_from_ground_truth(gt, time_value=config["time_origin"])
-    sim.run(duration=3600.0)
+    sim.initialize_from_ground_truth(gt, time_value=config["time_origin"]+60.0)
+    replayer = I24TrajectoryReplayer(gt, dt=1.0, lanes=[-1, -2, -3, -4])
+    bridge = I24MicroSimBridge(
+        sim=sim,
+        road_id="2",
+        lanes=[-1, -2, -3, -4],
+        initial_middle_s=600.0,
+        margin_s=50.0,
+        update_micro_callback=replayer.step,
+    )
+    sim.run(duration=60.0)
     run_app(sim, rotation_deg=90.0)
