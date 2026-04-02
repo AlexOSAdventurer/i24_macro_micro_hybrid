@@ -19,13 +19,20 @@ The bridge registers itself as a step callback on construction.  Each step it:
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from functools import partial
-from typing import List
+from typing import Dict, List
 
 from simulation import Simulation, I24MicroMask
 
+@dataclass
+class Vehicle:
+    length: float # Meters
+    width: float # Meters
+    s: float # Longitudinal position. Relative to the rear of the microscopic bubble.
+    t: float # Lateral position. Decreases as one moves to the right.
 
-class MicroSimBridge:
+class I24MicroSimBridge:
     def __init__(
         self,
         sim: Simulation,
@@ -33,12 +40,20 @@ class MicroSimBridge:
         lanes: List[int],
         initial_middle_s: float,
         margin_s: float,
+        update_micro_callback=None
     ) -> None:
         self.sim = sim
         self.road_id = road_id
         self.lanes = lanes
         self.middle_s = float(initial_middle_s)
         self.margin_s = float(margin_s)
+        self.flow_memory_rear = {
+            lane: 0.0 for lane in lanes
+        }
+        self.flow_memory_front = {
+            lane: 0.0 for lane in lanes
+        }
+        self.vehicles: Dict[str, Vehicle] = {}
 
         # Create one mask per lane and register with the simulation
         for lane in self.lanes:
@@ -52,7 +67,9 @@ class MicroSimBridge:
             )
             sim.add_masking_cell(mask)
 
-        sim.register_step_callback(partial(MicroSimBridge._step, self))
+        sim.register_step_callback(partial(I24MicroSimBridge._step, self))
+        self.update_micro_callback = update_micro_callback
+
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -66,7 +83,14 @@ class MicroSimBridge:
 
         Advances the window and rebuilds all four lane masks in-place.
         """
-        self.middle_s = self._compute_next_middle_s(sim_time, dt)
+        lane_cells = {
+            lane: self.sim.masking_cells[self._mask_id(lane)] for lane in self.lanes
+        }
+        for lane in lane_cells:
+            self.flow_memory_rear[lane] += lane_cells[lane].rear_flow
+            self.flow_memory_front[lane] += lane_cells[lane].front_flow
+
+        self.middle_s = self.update_micro_callback(self)
 
         for lane in self.lanes:
             self.sim.masking_cells[self._mask_id(lane)] = I24MicroMask(
@@ -78,9 +102,5 @@ class MicroSimBridge:
                 margin_s=self.margin_s,
             )
 
-    def _compute_next_middle_s(self, sim_time: float, dt: float) -> float:
-        """Return the window centre position at sim_time + dt.
-
-        Placeholder — replace with empirical trajectory lookup.
-        """
-        return self.middle_s
+    def update_vehicles(self, vehicles: Dict[str, Vehicle]):
+        self.vehicles = vehicles

@@ -736,6 +736,8 @@ class ArbitraryMaskingCell(ABC):
         self.mask_id = str(mask_id)
         self.network = network
         self.segments = segments
+        self.rear_flow = 0.0
+        self.front_flow = 0.0
         self.validate()
 
     def validate(self) -> None:
@@ -751,11 +753,17 @@ class ArbitraryMaskingCell(ABC):
                 )
 
     @abstractmethod
-    def demand(self, sim_time: float) -> float:
+    def rear_boundary_flux(self, rho_exterior: float, fd_exterior: "FundamentalDiagram", sim_time: float) -> float:
+        """Net flux entering the mask through its rear (upstream) face.
+        May be negative (backward flow out of rear face).
+        """
         raise NotImplementedError
 
     @abstractmethod
-    def supply(self, sim_time: float) -> float:
+    def front_boundary_flux(self, rho_exterior: float, fd_exterior: "FundamentalDiagram", sim_time: float) -> float:
+        """Net flux leaving the mask through its front (downstream) face.
+        May be negative (backward flow into front face).
+        """
         raise NotImplementedError
 
     def update(self, sim_time: float, dt: float) -> None:
@@ -1041,6 +1049,8 @@ class ConservativeRemapper:
     @staticmethod
     def base_to_active(network: Network, active: ActiveNetwork) -> None:
         for ac in active.active_cells.values():
+            if ac.kind == "mask":
+                continue  # mask interior is owned by the micro simulation
             total_mass = 0.0
             for (base_key, s0, s1) in ac.base_segments:
                 base_cell = network.get_cell(*base_key)
@@ -1051,17 +1061,20 @@ class ConservativeRemapper:
 
     @staticmethod
     def active_to_base(network: Network, active: ActiveNetwork) -> None:
+        # Only accumulate mass from non-mask active cells.
+        # Base cells exclusively covered by a mask are left unchanged — their
+        # density is the micro simulation's responsibility (managed by the bridge).
         base_mass_updates: Dict[Connection, float] = {}
         base_lengths: Dict[Connection, float] = {}
 
-        for road in network.roads.values():
-            for cell in road.cells.values():
-                base_mass_updates[(cell.road_id, cell.cell_id)] = 0.0
-                base_lengths[(cell.road_id, cell.cell_id)] = float(cell.length)
-
         for ac in active.active_cells.values():
+            if ac.kind == "mask":
+                continue
             for (base_key, s0, s1) in ac.base_segments:
                 overlap_len = s1 - s0
+                if base_key not in base_mass_updates:
+                    base_mass_updates[base_key] = 0.0
+                    base_lengths[base_key] = float(network.get_cell(*base_key).length)
                 base_mass_updates[base_key] += float(ac.density * overlap_len)
 
         for base_key, mass in base_mass_updates.items():
@@ -1353,6 +1366,10 @@ class Simulation:
     def _compute_active_demand_supply(
         self, active: ActiveNetwork
     ) -> Tuple[Dict[str, float], Dict[str, float]]:
+        """Returns demand and supply maps for normal cells only.
+        Mask boundary fluxes are computed directly in _compute_active_edge_flows
+        via each mask's rear_boundary_flux / front_boundary_flux methods.
+        """
         demand_map: Dict[str, float] = {}
         supply_map: Dict[str, float] = {}
 
@@ -1363,12 +1380,8 @@ class Simulation:
                     demand_map[aid] = ac.fd.demand(rho)
                     supply_map[aid] = ac.fd.supply(rho)
                 else:
-                    raise Exception ("No FD available!")
-            elif ac.kind == "mask":
-                mask = self.masking_cells[ac.mask_id]
-                demand_map[aid] = float(mask.demand(self.current_time))
-                supply_map[aid] = float(mask.supply(self.current_time))
-            else:
+                    raise Exception("No FD available!")
+            elif ac.kind != "mask":
                 raise ValueError(f"Unknown active cell kind: {ac.kind}")
 
         return demand_map, supply_map
@@ -1384,42 +1397,78 @@ class Simulation:
         for u in active_ids:
             u_cell = active.active_cells[u]
             succ = list(u_cell.outflow_neighbors)
-            if len(succ) == 0:
+            if not succ:
                 continue
 
-            per_out_demand = demand_map[u] / float(len(succ))
+            # Pre-split demand for normal upstream cells
+            if u_cell.kind == "normal":
+                per_out_demand = demand_map[u] / float(len(succ))
+
             for v in succ:
                 v_cell = active.active_cells[v]
-                preds = list(v_cell.inflow_neighbors)
-                per_in_supply = supply_map[v] if len(preds) == 0 else supply_map[v] / float(len(preds))
-                edge_flow[(u, v)] = min(per_out_demand, per_in_supply)
 
+                if v_cell.kind == "mask":
+                    # Normal → mask: rear boundary flux determined by mask's Riemann solver
+                    mask = self.masking_cells[v_cell.mask_id]
+                    edge_flow[(u, v)] = mask.rear_boundary_flux(
+                        u_cell.density, u_cell.fd, self.current_time
+                    )
+                elif u_cell.kind == "mask":
+                    # Mask → normal: front boundary flux determined by mask's Riemann solver
+                    mask = self.masking_cells[u_cell.mask_id]
+                    edge_flow[(u, v)] = mask.front_boundary_flux(
+                        v_cell.density, v_cell.fd, self.current_time
+                    )
+                else:
+                    # Normal → normal: standard Godunov supply/demand
+                    preds = list(v_cell.inflow_neighbors)
+                    per_in_supply = supply_map[v] if not preds else supply_map[v] / float(len(preds))
+                    edge_flow[(u, v)] = min(per_out_demand, per_in_supply)
+
+        # Cap inflow to normal cells.
+        # Mask boundary fluxes are fixed (Riemann solver output) and are not scaled —
+        # only normal-normal edges are subject to capping. The fixed mask flux is
+        # subtracted from remaining supply before scaling normal inflow.
         for v in active_ids:
-            incoming_edges = [e for e in edge_flow if e[1] == v]
-            if not incoming_edges:
+            v_cell = active.active_cells[v]
+            if v_cell.kind == "mask":
                 continue
-            total_in = sum(edge_flow[e] for e in incoming_edges)
-            cap_in = supply_map[v]
-            if total_in > cap_in and total_in > 1e-12:
-                scale = cap_in / total_in
-                for e in incoming_edges:
+            all_incoming = [e for e in edge_flow if e[1] == v]
+            normal_incoming = [e for e in all_incoming if active.active_cells[e[0]].kind == "normal"]
+            if not normal_incoming:
+                continue
+            mask_inflow = sum(edge_flow[e] for e in all_incoming if e not in normal_incoming)
+            normal_total_in = sum(edge_flow[e] for e in normal_incoming)
+            remaining_supply = supply_map[v] - mask_inflow
+            if normal_total_in > remaining_supply and normal_total_in > 1e-12:
+                scale = remaining_supply / normal_total_in
+                for e in normal_incoming:
                     edge_flow[e] *= scale
 
+        # Cap outflow from normal cells, same logic.
         for u in active_ids:
-            outgoing_edges = [e for e in edge_flow if e[0] == u]
-            if not outgoing_edges:
+            u_cell = active.active_cells[u]
+            if u_cell.kind == "mask":
                 continue
-            total_out = sum(edge_flow[e] for e in outgoing_edges)
-            cap_out = demand_map[u]
-            if total_out > cap_out and total_out > 1e-12:
-                scale = cap_out / total_out
-                for e in outgoing_edges:
+            all_outgoing = [e for e in edge_flow if e[0] == u]
+            normal_outgoing = [e for e in all_outgoing if active.active_cells[e[1]].kind == "normal"]
+            if not normal_outgoing:
+                continue
+            mask_outflow = sum(edge_flow[e] for e in all_outgoing if e not in normal_outgoing)
+            normal_total_out = sum(edge_flow[e] for e in normal_outgoing)
+            remaining_demand = demand_map[u] - mask_outflow
+            if normal_total_out > remaining_demand and normal_total_out > 1e-12:
+                scale = remaining_demand / normal_total_out
+                for e in normal_outgoing:
                     edge_flow[e] *= scale
 
+        # External road boundaries — mask cells have no external boundaries in the macro sense
         external_inflow: Dict[str, float] = {}
         external_outflow: Dict[str, float] = {}
         for aid in active_ids:
             ac = active.active_cells[aid]
+            if ac.kind == "mask":
+                continue
             cell_capacity = ac.fd.capacity if ac.fd is not None else None
             if len(ac.inflow_neighbors) == 0:
                 base_key = ac.base_segments[0][0]
@@ -1448,8 +1497,23 @@ class Simulation:
         edge_flow, external_inflow, external_outflow = self._compute_active_edge_flows(active)
         lateral_deltas = active.lateral_delta_density(dt)
 
-        net_flow = np.zeros(len(active_ids), dtype=np.float64)
+        #net_flow = np.zeros(len(active_ids), dtype=np.float64)
+        rear_flow = np.zeros(len(active_ids), dtype=np.float64)
+        front_flow = np.zeros(len(active_ids), dtype=np.float64)
+        for (u, v), q in edge_flow.items():
+            front_flow[index_of[u]] -= q
+            rear_flow[index_of[v]] += q
 
+        for aid, q in external_inflow.items():
+            rear_flow[index_of[aid]] += q
+
+        for aid, q in external_outflow.items():
+            front_flow[index_of[aid]] -= q
+
+        net_flow = rear_flow + front_flow
+        new_densities = densities + (dt * (net_flow / np.maximum(lengths, 1e-12)))
+
+        """
         for (u, v), q in edge_flow.items():
             net_flow[index_of[u]] -= q
             net_flow[index_of[v]] += q
@@ -1469,6 +1533,21 @@ class Simulation:
                     raise ValueError(f"Active cell {aid} has no FundamentalDiagram assigned.")
                 new_rho = float(new_densities[i]) + lateral_deltas.get(aid, 0.0)
                 ac.density = float(np.clip(new_rho, 0.0, ac.fd.rho_j))
+        """
+        for i, aid in enumerate(active_ids):
+            ac = active.active_cells[aid]
+            if ac.kind != "mask":
+                if ac.fd is None:
+                    raise ValueError(f"Active cell {aid} has no FundamentalDiagram assigned.")
+                new_rho = float(new_densities[i]) + lateral_deltas.get(aid, 0.0)
+                ac.density = float(np.clip(new_rho, 0.0, ac.fd.rho_j))
+            else:
+                # We need to impart the new flow into the masked cells as needed.
+                # We separately compute the flow in the rear of the cell and the front of the cell.
+                rear_flow_ac = float(rear_flow[i]) * dt
+                front_flow_ac = float(front_flow[i]) * dt
+                self.masking_cells[ac.mask_id].rear_flow += rear_flow_ac
+                self.masking_cells[ac.mask_id].front_flow += front_flow_ac
 
     def step(self) -> None:
         self._snapshot()
@@ -2131,11 +2210,11 @@ class FixedScalarMask(ArbitraryMaskingCell):
         self.demand_value = float(demand_value)
         self.supply_value = float(supply_value)
 
-    def demand(self, sim_time: float) -> float:
-        return self.demand_value
+    def rear_boundary_flux(self, rho_exterior: float, fd_exterior: "FundamentalDiagram", sim_time: float) -> float:
+        return min(fd_exterior.demand(rho_exterior), self.supply_value)
 
-    def supply(self, sim_time: float) -> float:
-        return self.supply_value
+    def front_boundary_flux(self, rho_exterior: float, fd_exterior: "FundamentalDiagram", sim_time: float) -> float:
+        return min(self.demand_value, fd_exterior.supply(rho_exterior))
     
 class I24MicroMask(ArbitraryMaskingCell):
     """Single-lane micro-domain mask for one lane of the I-24 moving window.
@@ -2164,14 +2243,15 @@ class I24MicroMask(ArbitraryMaskingCell):
         self.margin_s = margin_s
 
     """
-    Demand and Supply calculations here form our core contributions.
-    We don't have the equations placed here just yet.
+    Boundary flux calculations here form our core contributions — to be
+    derived from the constrained Riemann solver once the weak entropy
+    solution is in hand.
     """
-    def demand(self, sim_time: float) -> float:
-        return 0
+    def rear_boundary_flux(self, rho_exterior: float, fd_exterior: "FundamentalDiagram", sim_time: float) -> float:
+        return 0.0
 
-    def supply(self, sim_time: float) -> float:
-        return 0
+    def front_boundary_flux(self, rho_exterior: float, fd_exterior: "FundamentalDiagram", sim_time: float) -> float:
+        return 0.0
 
 # =========================
 # Example usage
