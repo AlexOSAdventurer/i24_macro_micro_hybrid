@@ -1092,8 +1092,15 @@ class ConservativeRemapper:
         # Only accumulate mass from non-mask active cells.
         # Base cells exclusively covered by a mask are left unchanged — their
         # density is the micro simulation's responsibility (managed by the bridge).
+        #
+        # IMPORTANT: divide by *covered* length, not full base cell length.
+        # A mask boundary can fall within a base cell, so the normal active cell
+        # covers only a fraction of it.  Dividing by the full length would dilute
+        # the density each step by that fraction, causing runaway decay at mask
+        # boundaries.  Dividing by covered_length preserves the correct density
+        # for the normal portion and leaves the masked portion untouched.
         base_mass_updates: Dict[Connection, float] = {}
-        base_lengths: Dict[Connection, float] = {}
+        base_covered_lengths: Dict[Connection, float] = {}
 
         for ac in active.active_cells.values():
             if ac.kind == "mask":
@@ -1102,13 +1109,14 @@ class ConservativeRemapper:
                 overlap_len = s1 - s0
                 if base_key not in base_mass_updates:
                     base_mass_updates[base_key] = 0.0
-                    base_lengths[base_key] = float(network.get_cell(*base_key).length)
+                    base_covered_lengths[base_key] = 0.0
                 base_mass_updates[base_key] += float(ac.density * overlap_len)
+                base_covered_lengths[base_key] += overlap_len
 
         for base_key, mass in base_mass_updates.items():
             cell = network.get_cell(*base_key)
-            L = base_lengths[base_key]
-            cell.density = 0.0 if L <= 1e-12 else mass / L
+            covered_L = base_covered_lengths[base_key]
+            cell.density = 0.0 if covered_L <= 1e-12 else mass / covered_L
 
 
 # =========================
@@ -2228,7 +2236,7 @@ class RolloutRenderer:
                         for i, t in enumerate(macro_times):
                             for j, cid in enumerate(cell_ids):
                                 vals_density[i, j] = macro_density_lookup[t][(road.road_id, cid)][0]
-                                vals_velocity[i, j] = macro_density_lookup[t][(road.road_id, cid)][0]
+                                vals_velocity[i, j] = macro_density_lookup[t][(road.road_id, cid)][1]
                         vals_flow = vals_density * vals_velocity
                         entry["density"] = vals_density
                         entry["velocity"] = vals_velocity
@@ -2466,10 +2474,11 @@ class I24MicroMask(ArbitraryMaskingCell):
         else:
             rho_interior = 0.0
             vehicle_leaving = False
-        available_supply = fd_exterior.supply(rho_interior) * (if vehicle_leaving 0 else 1)
+        available_supply = fd_exterior.supply(rho_interior) *  (0 if vehicle_leaving else 1) * dt
         vehicle_leaving_flux = -1 if vehicle_leaving else 0
         flux_cap = available_supply + vehicle_leaving_flux
-        flux_demand_moving = fd_exterior.demand(rho_exterior) - rho_exterior*self.anchor_speed
+
+        flux_demand_moving = (fd_exterior.demand(rho_exterior) - rho_exterior*self.anchor_speed) * dt
         flux_reconciled = min(flux_cap, flux_demand_moving)
         self.rear_flux_memory += flux_reconciled
         return flux_reconciled
@@ -2484,13 +2493,13 @@ class I24MicroMask(ArbitraryMaskingCell):
             rho_interior = 0.0
             vehicle_leaving = False
 
-        available_exterior_supply = fd_exterior.supply(rho_exterior) - rho_exterior*self.anchor_speed
+        available_exterior_supply = fd_exterior.supply(rho_exterior) - rho_exterior*self.anchor_speed * dt
         vehicle_leaving_flux = 1 if vehicle_leaving else 0
         flux_capped_for_external = min(available_exterior_supply, vehicle_leaving_flux)
 
         vehicle_can_enter = (not vehicle_leaving) and (rho_interior < fd_exterior.rho_j)
         vehicle_entering_flux_allowed = 1 if vehicle_can_enter else 0
-        available_interior_supply = -fd_exterior.supply(rho_interior) * vehicle_entering_flux_allowed
+        available_interior_supply = -fd_exterior.supply(rho_interior) * vehicle_entering_flux_allowed * dt
         flux_reconciled = max(available_interior_supply, flux_capped_for_external)
 
         self.front_flux_memory += flux_reconciled
@@ -2530,7 +2539,7 @@ class I24MicroMask(ArbitraryMaskingCell):
             mode="lines",
             line=dict(color="#0d4f8b", width=0.5),
             showlegend=False,
-            text=f"Rear: {self.rear_flux_memory}"
+            text=f"Rear: {self.rear_flux_memory}, Anchor Speed: {self.anchor_speed}"
         ))
 
         # Front Flux
@@ -2542,7 +2551,7 @@ class I24MicroMask(ArbitraryMaskingCell):
             mode="lines",
             line=dict(color="#0d4f8b", width=0.5),
             showlegend=False,
-            text=f"Front: {self.front_flux_memory}"
+            text=f"Front: {self.front_flux_memory}, Anchor Speed: {self.anchor_speed}"
         ))
         return traces
 
