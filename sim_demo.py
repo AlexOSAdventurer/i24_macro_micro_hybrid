@@ -51,11 +51,15 @@ def run_app(
         {"label": "5x",   "value": 5},
         {"label": "10x",  "value": 10},
     ]
+    mask_options = [
+        {"label": "Hide Masks", "value": False},
+        {"label": "Show Masks",   "value": True}
+    ]
 
     # Build road/lane options from ts_data keys
     road_lane_options = [
         {"label": f"Road {rid} · Lane {lane}", "value": f"{rid}:{lane}"}
-        for rid, lane in sorted(renderer.ts_data.keys())
+        for rid, lane, version in sorted(renderer.ts_data.keys()) if version == "sim"
     ]
     default_road_lane = road_lane_options[0]["value"] if road_lane_options else ""
     default_rid, default_lane = default_road_lane.split(":") if default_road_lane else ("", 0)
@@ -88,6 +92,12 @@ def run_app(
                         value=0,
                         inline=True,
                     ),
+                    dcc.RadioItems(
+                        id="render_masks",
+                        options=mask_options,
+                        value=False,
+                        inline=True,
+                    )
                 ],
                 style={"display": "flex", "padding": "10px", "alignItems": "center"},
             ),
@@ -121,8 +131,13 @@ def run_app(
                 style={"display": "flex", "padding": "10px", "alignItems": "center"},
             ),
             dcc.Graph(
-                id="ts-graph",
-                figure=renderer.get_ts_figure(default_rid, int(default_lane)),
+                id="ts-graph-sim",
+                figure=renderer.get_ts_figure(default_rid, int(default_lane), version="sim"),
+                style={"height": "40vh"},
+            ),
+            dcc.Graph(
+                id="ts-graph-empirical",
+                figure=renderer.get_ts_figure(default_rid, int(default_lane), version="empirical"),
                 style={"height": "40vh"},
             ),
         ]
@@ -148,13 +163,23 @@ def run_app(
         return False, dt_ms
 
     @app.callback(
-        Output("ts-graph", "figure"),
+        Output("ts-graph-sim", "figure"),
+        Input("ts-road-lane", "value"),
+        Input("quantity", "value"),
+        Input("render_masks", "value")
+    )
+    def update_ts_sim(road_lane: str, quantity: str, render_masks: bool) -> go.Figure:
+        rid, lane_str = road_lane.split(":")
+        return renderer.get_ts_figure(rid, int(lane_str), quantity, version="sim", render_masks=render_masks)
+    
+    @app.callback(
+        Output("ts-graph-empirical", "figure"),
         Input("ts-road-lane", "value"),
         Input("quantity", "value"),
     )
-    def update_ts(road_lane: str, quantity: str) -> go.Figure:
+    def update_ts_empirical(road_lane: str, quantity: str) -> go.Figure:
         rid, lane_str = road_lane.split(":")
-        return renderer.get_ts_figure(rid, int(lane_str), quantity)
+        return renderer.get_ts_figure(rid, int(lane_str), quantity, version="empirical")
 
     @app.callback(
         Output("step-slider", "value"),
@@ -168,19 +193,19 @@ def run_app(
     app.run(host=host, port=port, debug=debug)
 
 
-if __name__ == "__main__":
+def run_demo():
     with open("i24_motion_to_dataset.json", "r") as f:
         config = json.load(f)
 
     sim = Simulation.from_json(
         json_path=os.path.join(config["storage_locations"]["simulation_dataset"], "network.json"),
         time_resolution=config["time_step"],
-        origin_time=config["time_origin"]+60.0,
+        origin_time=config["time_origin"],
         min_cell_length=100.0
     )
 
     gt = GroundTruthStore.from_parquet(os.path.join(config["storage_locations"]["simulation_dataset"], "micro.parquet"), os.path.join(config["storage_locations"]["simulation_dataset"], "macro.parquet"))
-    sim.initialize_from_ground_truth(gt, time_value=config["time_origin"]+60.0)
+    sim.initialize_from_ground_truth(gt, time_value=config["time_origin"])
     replayer = I24TrajectoryReplayer(gt, dt=1.0, lanes=[-1, -2, -3, -4])
     bridge = I24MicroSimBridge(
         sim=sim,
@@ -190,6 +215,35 @@ if __name__ == "__main__":
         margin_s=50.0,
         max_middle_s=1450,
         update_micro_callback=replayer.step,
+        bridge_callback_name="bridge_step"
     )
-    sim.run(duration=3599.0-60.0)
-    run_app(sim, rotation_deg=90.0)
+    bridge_time_window = 90.0
+    current_bridge_iteration = 1.0
+    def update_bridge_callback(current_time, resolution):
+        nonlocal bridge
+        nonlocal bridge_time_window
+        nonlocal current_bridge_iteration
+        nonlocal sim
+        if ((current_time - sim.origin_time) >= (bridge_time_window * current_bridge_iteration)):
+            print("Resetting bridge!")
+            bridge.destroy()
+            bridge = I24MicroSimBridge(
+                sim=sim,
+                road_id="2",
+                lanes=[-1, -2, -3, -4],
+                initial_middle_s=150.0,
+                margin_s=50.0,
+                max_middle_s=1450,
+                update_micro_callback=replayer.step,
+                bridge_callback_name="bridge_step"
+            )
+            bridge._step(sim.current_time, sim.time_resolution)
+            print("Bridge reset!")
+            current_bridge_iteration += 1
+    sim.register_step_callback(update_bridge_callback, "bridge_restart")
+    for i in range(3599):
+        sim.step()
+    run_app(sim, rotation_deg=82.8192)
+
+if __name__ == "__main__":
+    run_demo()

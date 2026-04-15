@@ -94,9 +94,14 @@ class I24TrajectoryReplayer:
                 continue
 
             for vid, group in df.groupby("id"):
+                if len(group) == 1:
+                    continue
                 group = group.sort_values("time")
                 row0 = group.iloc[0]
+                row1 = group.iloc[1]
                 s_abs = float(row0["s"])
+                s_next_abs = float(row1["s"])
+                velocity_estimated = (s_next_abs - s_abs) / (row1["time"] - row0["time"])
 
                 vehicles[str(vid)] = Vehicle(
                     length=float(row0["length"]),
@@ -104,6 +109,7 @@ class I24TrajectoryReplayer:
                     s=s_abs - s_min,   # relative to rear face of window
                     t=float(row0["t"]),
                     lane=lane,
+                    s_dt=velocity_estimated
                 )
 
                 # Track the vehicle closest to middle_s as the window anchor

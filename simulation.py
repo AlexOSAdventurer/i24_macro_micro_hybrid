@@ -564,7 +564,7 @@ class I24EastBoundNetwork(NetworkGenerator):
         self.network = Network(network_id=network_id, roads={road_id: road})
 
 class I24WestAndEastNetwork(NetworkGenerator):
-    def __init__(self, v_f=45.0, rho_j=0.10, lambda_lc=0.10):
+    def __init__(self, v_f=21.11708033086837, rho_j=0.0659339614507989, lambda_lc=0.3747470640406389):
         super().__init__()
         self.network = None
         self.v_f = v_f
@@ -963,6 +963,8 @@ class ActiveMeshBuilder:
                         cell_fd = self.network.get_cell(*item["base_segments"][0][0]).fd
                         cell_lane_change_model = self.network.get_cell(*item["base_segments"][0][0]).lane_change_model
                     elif item["kind"] == "normal":
+                        print(f"Substituting {item}'s behavior model!")
+                        print("---------------------------")
                         cell_fd = GreenshieldsFD(v_f=26.9, rho_j=0.065)
                         cell_lane_change_model = SpeedIncentiveLaneChange(lambda_lc=0.195)
                     active.active_cells[active_cell_id] = ActiveCell(
@@ -1317,7 +1319,7 @@ class Simulation:
         self.min_cell_length = float(min_cell_length) if min_cell_length is not None else 1.0
 
         self.masking_cells: Dict[str, ArbitraryMaskingCell] = {}
-        self._step_callbacks: List[Any] = []
+        self._step_callbacks: Dict[str, Any] = {}
 
         self.network.validate()
 
@@ -1352,9 +1354,13 @@ class Simulation:
         if mask_id in self.masking_cells:
             del self.masking_cells[mask_id]
 
-    def register_step_callback(self, fn) -> None:
+    def register_step_callback(self, fn, key) -> None:
         """Register a callable invoked at the start of each step as fn(sim_time, dt)."""
-        self._step_callbacks.append(fn)
+        self._step_callbacks[key] = fn
+
+    def unregister_step_callback(self, key) -> None:
+        if key in self._step_callbacks:
+            del self._step_callbacks[key]
 
     def _snapshot(self) -> None:
         self.rollout_results.append(
@@ -1578,8 +1584,9 @@ class Simulation:
 
     def step(self) -> None:
         self._snapshot()
-        for cb in self._step_callbacks:
-            cb(self.current_time, self.time_resolution)
+        callbacks = [cb for cb in self._step_callbacks]
+        for cb in callbacks:
+            self._step_callbacks[cb](self.current_time, self.time_resolution)
         self._update_masks()
         active = self._build_active_network()
         self.rollout_results[-1].active_network = active.snapshot()
@@ -2060,7 +2067,7 @@ class RolloutRenderer:
             if q == "velocity":
                 return fd.velocity_from_density(density)
             if q == "flow":
-                return fd.demand(density)
+                return fd.velocity_from_density(density) * density
             return density
 
         # Global per-quantity value ranges (used for consistent colorbar across all frames)
@@ -2091,7 +2098,8 @@ class RolloutRenderer:
         ]
         self.max_active: int = max((len(a) for a in active_per_step), default=0)
         self.N_frames: int = len(sim.rollout_results)
-        self.sim_times: List[float] = [rs.sim_time for rs in sim.rollout_results]
+        min_sim_time = min([rs.sim_time for rs in sim.rollout_results])
+        self.sim_times: List[float] = [rs.sim_time - min_sim_time for rs in sim.rollout_results]
         self.mask_snapshots_per_step: List[Dict[str, Any]] = [
             rs.mask_snapshots or {} for rs in sim.rollout_results
         ]
@@ -2167,8 +2175,16 @@ class RolloutRenderer:
                 self.active_frame_colors[q].append(step_colors)
 
         # Time-space data: (road_id, lane) → per-quantity (N_frames, N_cells) arrays
-        self.ts_data: Dict[Tuple[str, int], Dict[str, Any]] = {}
+        self.ts_data: Dict[Tuple[str, int, str], Dict[str, Any]] = {}
         ref_net = sim.rollout_results[0].network
+        macro_density_lookup: Dict[float, Dict[Tuple[str, str], float]] = {
+            float(t): {
+                (str(r), str(c)): (float(d), float(v))
+                for r, c, d, v in zip(grp["road_id"], grp["cell_id"], grp["density"], grp["velocity"])
+            }
+            for t, grp in sim.gt_store.macro_df.groupby("time")
+        }
+        macro_times: np.ndarray = np.sort(np.array(list(macro_density_lookup.keys())))
         for road in ref_net.roads.values():
             for lane in sorted(road.lane_data):
                 cells = road.cells_for_lane(lane)
@@ -2181,30 +2197,48 @@ class RolloutRenderer:
                     [rs.network.get_cell(road.road_id, cid).density for cid in cell_ids]
                     for rs in sim.rollout_results
                 ])  # (N_frames, N_cells)
-                entry: Dict[str, Any] = {"s_mids": s_mids, "density": rho_ts}
-                for q in ("flow", "velocity"):
-                    vals = np.zeros_like(rho_ts)
-                    for j, fd in enumerate(fds):
-                        vals[:, j] = [_q_value(rho, fd, q) for rho in rho_ts[:, j]]
-                    entry[q] = vals
+                for version in ["sim", "empirical"]:
+                    entry: Dict[str, Any] = {"s_mids": s_mids}
+                    mask_extents: List[List[Optional[Tuple[float, float]]]] = [[]]
+                    if (version == "sim"):
+                        entry["density"] = rho_ts
+                        for q in ("flow", "velocity"):
+                            vals = np.zeros_like(rho_ts)
+                            for j, fd in enumerate(fds):
+                                vals[:, j] = [_q_value(rho, fd, q) for rho in rho_ts[:, j]]
+                            entry[q] = vals
 
-                # Mask extents per timestep: (start_s, end_s) or None
-                mask_extents: List[Optional[Tuple[float, float]]] = []
-                for snapshots in self.mask_snapshots_per_step:
-                    extent: Optional[Tuple[float, float]] = None
-                    for mask in snapshots.values():
-                        for seg in mask.segments:
-                            if seg.road_id == road.road_id and seg.lane == lane:
-                                lo, hi = float(seg.start_s), float(seg.end_s)
-                                extent = (lo, hi) if extent is None else (min(extent[0], lo), max(extent[1], hi))
-                    mask_extents.append(extent)
-                entry["mask_extents"] = mask_extents
+                        # Mask extents per timestep: (start_s, end_s) or None
+                        for snapshots in self.mask_snapshots_per_step:
+                            extent: Optional[Tuple[float, float]] = None
+                            for mask in snapshots.values():
+                                for seg in mask.segments:
+                                    if seg.road_id == road.road_id and seg.lane == lane:
+                                        lo, hi = float(seg.start_s), float(seg.end_s)
+                                        extent = (lo, hi) if extent is None else (min(extent[0], lo), max(extent[1], hi))
+                            if (extent == None) and (len(mask_extents[-1]) > 0) and (mask_extents[-1][-1] is not None):
+                                mask_extents.append([])
+                            elif (extent is not None) and (len(mask_extents[-1]) > 0) and (mask_extents[-1][-1] is None):
+                                mask_extents.append([])
+                            mask_extents[-1].append(extent)
+                    elif (version == "empirical"):
+                        vals_density = np.zeros((len(macro_times), len(cell_ids)))
+                        vals_velocity = np.zeros_like(vals_density)
+                        print(vals_density.shape, len(macro_times), len(cell_ids))
+                        for i, t in enumerate(macro_times):
+                            for j, cid in enumerate(cell_ids):
+                                vals_density[i, j] = macro_density_lookup[t][(road.road_id, cid)][0]
+                                vals_velocity[i, j] = macro_density_lookup[t][(road.road_id, cid)][0]
+                        vals_flow = vals_density * vals_velocity
+                        entry["density"] = vals_density
+                        entry["velocity"] = vals_velocity
+                        entry["flow"] = vals_flow
+                    entry["mask_extents"] = mask_extents
+                    self.ts_data[(road.road_id, lane, version)] = entry
 
-                self.ts_data[(road.road_id, lane)] = entry
-
-    def get_ts_figure(self, road_id: str, lane: int, quantity: str = "density") -> go.Figure:
+    def get_ts_figure(self, road_id: str, lane: int, quantity: str = "density", version: str = "sim", render_masks: bool = True) -> go.Figure:
         """Return a time-space heatmap (viridis pcolormesh style) for one road+lane."""
-        key = (road_id, lane)
+        key = (road_id, lane, version)
         if key not in self.ts_data:
             return go.Figure()
         entry = self.ts_data[key]
@@ -2222,30 +2256,33 @@ class RolloutRenderer:
         ))
 
         # Overlay mask trajectory as a filled band
-        pairs = [
-            (t, ext)
-            for t, ext in zip(self.sim_times, entry["mask_extents"])
-            if ext is not None
-        ]
-        if pairs:
-            t_fwd = [t for t, _ in pairs]
-            t_rev = t_fwd[::-1]
-            s_lo = [ext[0] for _, ext in pairs]
-            s_hi = [ext[1] for _, ext in pairs]
-            fig.add_trace(go.Scatter(
-                x=t_fwd + t_rev,
-                y=s_lo + s_hi[::-1],
-                fill="toself",
-                fillcolor="rgba(220,80,80,0.25)",
-                line=dict(color="rgba(220,80,80,0.8)", width=1),
-                showlegend=False,
-                hoverinfo="skip",
-            ))
+        if render_masks:
+            mask_position = 0
+            for mask in entry["mask_extents"]:
+                pairs = [
+                    (t, ext)
+                    for t, ext in zip(self.sim_times[mask_position:(mask_position + len(mask))], mask)
+                    if ext is not None
+                ]
+                t_fwd = [t for t, _ in pairs]
+                t_rev = t_fwd[::-1]
+                s_lo = [ext[0] for _, ext in pairs]
+                s_hi = [ext[1] for _, ext in pairs]
+                fig.add_trace(go.Scatter(
+                    x=t_fwd + t_rev,
+                    y=s_lo + s_hi[::-1],
+                    fill="toself",
+                    fillcolor="rgba(220,80,80,0.25)",
+                    line=dict(color="rgba(220,80,80,0.8)", width=1),
+                    showlegend=False,
+                    hoverinfo="skip",
+                ))
+                mask_position += len(mask)
 
         fig.update_layout(
             xaxis_title="Time (s)",
             yaxis_title="Position (m)",
-            title=f"Road {road_id} · Lane {lane} · {quantity}",
+            title=f"Road {road_id} · Lane {lane} · {quantity} · {version}",
             template="plotly_white",
             margin=dict(t=60),
             uirevision="ts-constant",
@@ -2353,7 +2390,9 @@ class I24MicroMask(ArbitraryMaskingCell):
         lane: int,
         middle_s: float,
         margin_s: float,
-        anchor_speed: float
+        anchor_speed: float,
+        rear_flux_memory: float,
+        front_flux_memory: float
     ):
         super().__init__(
             mask_id=mask_id,
@@ -2365,7 +2404,9 @@ class I24MicroMask(ArbitraryMaskingCell):
         self.middle_s = middle_s
         self.margin_s = margin_s
         self.vehicles: Dict[str, Any] = {}
-        self.anchor_speed = 0.0
+        self.anchor_speed = anchor_speed
+        self.rear_flux_memory = rear_flux_memory
+        self.front_flux_memory = front_flux_memory
 
     def get_rear_vehicle(self):
         vehicle = None
@@ -2386,17 +2427,75 @@ class I24MicroMask(ArbitraryMaskingCell):
     derived from the constrained Riemann solver once the weak entropy
     solution is in hand.
     """
+    """
     def rear_boundary_flux(self, rho_exterior: float, fd_exterior: "FundamentalDiagram", sim_time: float, dt: float) -> float:
+        rear_vehicle = self.get_rear_vehicle()
+        if rear_vehicle is not None:
+            rho_interior = 1.0 / rear_vehicle.s
+            rear_vehicle_flux = rho_interior * (rear_vehicle.s_dt - self.anchor_speed) * dt
+            rear_vehicle_flux = min(0.0, rear_vehicle_flux)
+        else:
+            rear_vehicle_flux = 0.0
         rear_macro_flux = rho_exterior * fd_exterior.velocity_from_density(rho_exterior) * dt
         rear_micro_geometric_flux = rho_exterior * fd_exterior.velocity_from_density(self.anchor_speed) * dt
-        total_non_clipped_flux = rear_macro_flux - rear_micro_geometric_flux
+        total_non_clipped_flux = rear_macro_flux - rear_micro_geometric_flux + rear_vehicle_flux
+        self.rear_flux_memory += total_non_clipped_flux
         return total_non_clipped_flux
 
     def front_boundary_flux(self, rho_exterior: float, fd_exterior: "FundamentalDiagram", sim_time: float, dt: float) -> float:
+        front_vehicle = self.get_front_vehicle()
+        if front_vehicle is not None:
+            rho_interior = 1.0 / (self.middle_s + self.margin_s - front_vehicle.s)
+            front_vehicle_flux = rho_interior * (front_vehicle.s_dt - self.anchor_speed) * dt
+            front_vehicle_flux = max(0.0, front_vehicle_flux)
+        else:
+            front_vehicle_flux = 0.0
         front_macro_flux = rho_exterior * fd_exterior.velocity_from_density(rho_exterior) * dt
         front_micro_geometric_flux = rho_exterior * fd_exterior.velocity_from_density(self.anchor_speed) * dt
-        total_non_clipped_flux = front_micro_geometric_flux - front_macro_flux
+        total_non_clipped_flux = front_micro_geometric_flux - front_macro_flux + front_vehicle_flux
+        self.front_flux_memory += total_non_clipped_flux
         return total_non_clipped_flux
+    """
+
+    def rear_boundary_flux(self, rho_exterior: float, fd_exterior: "FundamentalDiagram", sim_time: float, dt: float) -> float:
+        rear_vehicle = self.get_rear_vehicle()
+        if rear_vehicle is not None:
+            interior_s = rear_vehicle.s
+            vehicle_leaving = (interior_s < 0)
+            rho_interior = min(1.0 / interior_s, fd_exterior.rho_j) if not vehicle_leaving else fd_exterior.rho_j
+        else:
+            rho_interior = 0.0
+            vehicle_leaving = False
+        available_supply = fd_exterior.supply(rho_interior) * (if vehicle_leaving 0 else 1)
+        vehicle_leaving_flux = -1 if vehicle_leaving else 0
+        flux_cap = available_supply + vehicle_leaving_flux
+        flux_demand_moving = fd_exterior.demand(rho_exterior) - rho_exterior*self.anchor_speed
+        flux_reconciled = min(flux_cap, flux_demand_moving)
+        self.rear_flux_memory += flux_reconciled
+        return flux_reconciled
+
+    def front_boundary_flux(self, rho_exterior: float, fd_exterior: "FundamentalDiagram", sim_time: float, dt: float) -> float:
+        front_vehicle = self.get_front_vehicle()
+        if front_vehicle is not None:
+            interior_s = front_vehicle.s
+            vehicle_leaving = ((self.middle_s + self.margin_s - interior_s) < 0)
+            rho_interior = min(1.0 / (self.middle_s + self.margin_s - interior_s), fd_exterior.rho_j) if not vehicle_leaving else fd_exterior.rho_j
+        else:
+            rho_interior = 0.0
+            vehicle_leaving = False
+
+        available_exterior_supply = fd_exterior.supply(rho_exterior) - rho_exterior*self.anchor_speed
+        vehicle_leaving_flux = 1 if vehicle_leaving else 0
+        flux_capped_for_external = min(available_exterior_supply, vehicle_leaving_flux)
+
+        vehicle_can_enter = (not vehicle_leaving) and (rho_interior < fd_exterior.rho_j)
+        vehicle_entering_flux_allowed = 1 if vehicle_can_enter else 0
+        available_interior_supply = -fd_exterior.supply(rho_interior) * vehicle_entering_flux_allowed
+        flux_reconciled = max(available_interior_supply, flux_capped_for_external)
+
+        self.front_flux_memory += flux_reconciled
+        return flux_reconciled
+
 
     def render(self, rotate_fn) -> list:
         """Draw each vehicle in this lane as a filled rectangle."""
@@ -2407,8 +2506,8 @@ class I24MicroMask(ArbitraryMaskingCell):
             if vehicle.lane != self.lane:
                 continue
             s_abs = vehicle.s + s_offset
-            s_start = s_abs - vehicle.length / 2.0
-            s_end = s_abs + vehicle.length / 2.0
+            s_start = s_abs
+            s_end = s_abs + vehicle.length
             px, py = rotate_fn(*Network._cell_polygon(road, s_start, s_end, self.lane))
             traces.append(go.Scatter(
                 x=px, y=py,
@@ -2419,6 +2518,32 @@ class I24MicroMask(ArbitraryMaskingCell):
                 showlegend=False,
                 hoverinfo="skip",
             ))
+        # Render Flux Memories
+        # Rear Flux
+        s_start = self.middle_s - self.margin_s
+        s_end = self.middle_s + self.margin_s
+        px, py = rotate_fn(*Network._cell_polygon(road, s_start - 10.0, s_start, self.lane))
+        traces.append(go.Scatter(
+            x=px, y=py,
+            fill="toself",
+            fillcolor="#ffffff",
+            mode="lines",
+            line=dict(color="#0d4f8b", width=0.5),
+            showlegend=False,
+            text=f"Rear: {self.rear_flux_memory}"
+        ))
+
+        # Front Flux
+        px, py = rotate_fn(*Network._cell_polygon(road, s_end, s_end + 10.0, self.lane))
+        traces.append(go.Scatter(
+            x=px, y=py,
+            fill="toself",
+            fillcolor="#ffffff",
+            mode="lines",
+            line=dict(color="#0d4f8b", width=0.5),
+            showlegend=False,
+            text=f"Front: {self.front_flux_memory}"
+        ))
         return traces
 
 # =========================

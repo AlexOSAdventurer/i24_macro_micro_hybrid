@@ -32,6 +32,7 @@ class Vehicle:
     s: float # Longitudinal position. Relative to the rear of the microscopic bubble.
     t: float # Lateral position. Decreases as one moves to the right.
     lane: int = 0 # Lane index (same convention as Network lanes)
+    s_dt: float = 0 # Vehicle velocity (absolute, not relative to anchor)
 
 class I24MicroSimBridge:
     def __init__(
@@ -42,7 +43,8 @@ class I24MicroSimBridge:
         initial_middle_s: float,
         max_middle_s: float,
         margin_s: float,
-        update_micro_callback=None
+        update_micro_callback=None,
+        bridge_callback_name=None
     ) -> None:
         self.sim = sim
         self.road_id = road_id
@@ -69,11 +71,13 @@ class I24MicroSimBridge:
                 lane=lane,
                 middle_s=self.middle_s,
                 margin_s=self.margin_s,
-                anchor_speed=0.0
+                anchor_speed=0.0,
+                rear_flux_memory=0.0,
+                front_flux_memory=0.0
             )
             sim.add_masking_cell(mask)
-
-        sim.register_step_callback(partial(I24MicroSimBridge._step, self))
+        self.bridge_callback_name = bridge_callback_name
+        sim.register_step_callback(partial(I24MicroSimBridge._step, self), bridge_callback_name)
         self.update_micro_callback = update_micro_callback
 
 
@@ -100,11 +104,9 @@ class I24MicroSimBridge:
 
         self.middle_s = self.update_micro_callback(self)
         if self.middle_s >= self.max_middle_s:
-            self.running = False
-            for lane in self.lanes:
-                del self.sim.masking_cells[self._mask_id(lane)]
+            self.destroy()
             return
-            
+                    
         for lane in self.lanes:
             new_mask = I24MicroMask(
                 mask_id=self._mask_id(lane),
@@ -113,10 +115,19 @@ class I24MicroSimBridge:
                 lane=lane,
                 middle_s=self.middle_s,
                 margin_s=self.margin_s,
-                anchor_speed=self.anchor_speed
+                anchor_speed=self.anchor_speed,
+                rear_flux_memory=self.flow_memory_rear[lane],
+                front_flux_memory=self.flow_memory_front[lane]
             )
             new_mask.vehicles = {vehicle: self.vehicles[vehicle] for vehicle in self.vehicles if self.vehicles[vehicle].lane == lane}
             self.sim.masking_cells[self._mask_id(lane)] = new_mask
 
     def update_vehicles(self, vehicles: Dict[str, Vehicle]):
         self.vehicles = vehicles
+
+    def destroy(self):
+        if self.running:
+            self.running = False
+            for lane in self.lanes:
+                del self.sim.masking_cells[self._mask_id(lane)]
+            self.sim.unregister_step_callback(self.bridge_callback_name)
