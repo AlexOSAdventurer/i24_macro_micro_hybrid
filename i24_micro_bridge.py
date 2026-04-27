@@ -99,8 +99,8 @@ class I24MicroSimBridge:
             lane: self.sim.masking_cells[self._mask_id(lane)] for lane in self.lanes
         }
         for lane in lane_cells:
-            self.flow_memory_rear[lane] += lane_cells[lane].rear_flow
-            self.flow_memory_front[lane] += lane_cells[lane].front_flow
+            self.flow_memory_rear[lane] = lane_cells[lane].rear_flux_memory
+            self.flow_memory_front[lane] = lane_cells[lane].front_flux_memory
 
         self.middle_s = self.update_micro_callback(self)
         if self.middle_s >= self.max_middle_s:

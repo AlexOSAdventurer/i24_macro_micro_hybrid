@@ -564,7 +564,7 @@ class I24EastBoundNetwork(NetworkGenerator):
         self.network = Network(network_id=network_id, roads={road_id: road})
 
 class I24WestAndEastNetwork(NetworkGenerator):
-    def __init__(self, v_f=21.11708033086837, rho_j=0.0659339614507989, lambda_lc=0.3747470640406389):
+    def __init__(self, v_f=40.0, rho_j=0.10, lambda_lc=0.05):
         super().__init__()
         self.network = None
         self.v_f = v_f
@@ -1118,6 +1118,17 @@ class ConservativeRemapper:
             covered_L = base_covered_lengths[base_key]
             cell.density = 0.0 if covered_L <= 1e-12 else mass / covered_L
 
+        # Zero out base cells that are exclusively covered by a mask (not touched by
+        # any normal active cell above).  Vehicles in these cells have entered the
+        # micro domain; keeping stale non-zero density would inject ghost vehicles
+        # into the upstream normal cell when the mask moves away.
+        for ac in active.active_cells.values():
+            if ac.kind != "mask":
+                continue
+            for (base_key, s0, s1) in ac.base_segments:
+                if base_key not in base_mass_updates:
+                    network.get_cell(*base_key).density = 0.0
+
 
 # =========================
 # Fundamental diagrams
@@ -1205,6 +1216,12 @@ class GreenshieldsFD(FundamentalDiagram):
     def velocity_from_density(self, rho: float) -> float:
         q = self._flow(max(0.0, min(rho, self.rho_j)))
         return q / rho if rho > 1e-12 else self.v_f
+    
+    def sonic_point(self, y: float) -> float:
+        return ((self.v_f - y) * self.rho_j) / (2 * self.v_f)
+    
+    def shock_speed(self, rho_left: float, rho_right: float) -> float:
+        return self.v_f * (1.0 - ((rho_left + rho_right) / self.rho_j))
 
 
 # =========================
@@ -1604,7 +1621,7 @@ class Simulation:
         ConservativeRemapper.active_to_base(self.network, active)
         self.current_time += self.time_resolution
         self.gt_store.apply_density_snapshot_to_network_boundaries(self.network, self.current_time)
-        print(self.current_time)
+        #print(self.current_time)
 
     def run(self, duration: float) -> None:
         if duration < 0.0:
@@ -2465,6 +2482,7 @@ class I24MicroMask(ArbitraryMaskingCell):
         return total_non_clipped_flux
     """
 
+    """
     def rear_boundary_flux(self, rho_exterior: float, fd_exterior: "FundamentalDiagram", sim_time: float, dt: float) -> float:
         rear_vehicle = self.get_rear_vehicle()
         if rear_vehicle is not None:
@@ -2479,7 +2497,9 @@ class I24MicroMask(ArbitraryMaskingCell):
         flux_cap = available_supply + vehicle_leaving_flux
 
         flux_demand_moving = (fd_exterior.demand(rho_exterior) - rho_exterior*self.anchor_speed) * dt
-        flux_reconciled = min(flux_cap, flux_demand_moving)
+        flux_reconciled = min(flux_cap, max(flux_demand_moving, 0))
+        if (flux_reconciled < 0):
+            print((fd_exterior.demand(rho_exterior) - rho_exterior*self.anchor_speed) * dt, rho_exterior, fd_exterior.demand(rho_exterior), self.anchor_speed, dt)
         self.rear_flux_memory += flux_reconciled
         return flux_reconciled
 
@@ -2504,6 +2524,80 @@ class I24MicroMask(ArbitraryMaskingCell):
 
         self.front_flux_memory += flux_reconciled
         return flux_reconciled
+    """
+    def rear_boundary_flux(self, rho_exterior: float, fd_exterior: "FundamentalDiagram", sim_time: float, dt: float) -> float:
+        rear_vehicle = self.get_rear_vehicle()
+        leaving_region = 1 / fd_exterior.rho_c
+        if rear_vehicle is not None:
+            interior_s = rear_vehicle.s
+            vehicle_leaving = (interior_s < leaving_region)
+            rho_interior = 1.0 / interior_s if not vehicle_leaving else fd_exterior.rho_c
+            rear_velocity = rear_vehicle.s_dt
+        else:
+            interior_s = 2 * self.margin_s
+            vehicle_leaving = False
+            rho_interior = 0.0
+            rear_velocity = 0
+        
+        p_star = None
+        # Rarefaction
+        if (rho_exterior > rho_interior):
+            p_s = fd_exterior.sonic_point(self.anchor_speed)
+            if (rho_exterior < p_s):
+                p_star = rho_exterior
+            elif ((rho_interior <= p_s) and (p_s <= rho_exterior)):
+                p_star = p_s
+            else:
+                p_star = rho_interior
+        # Shock
+        else:
+            s = fd_exterior.shock_speed(rho_exterior, rho_interior)
+            p_star = rho_exterior if (s > self.anchor_speed) else rho_interior
+        
+        net_flux = fd_exterior._flow(p_star) - (self.anchor_speed * p_star)
+        print(f"Rear Boundary rear_speed: {rear_velocity}, anchor_speed: {self.anchor_speed}, rho_exterior: {rho_exterior}, interior_s: {interior_s}, rho_interior: {rho_interior}, p_star: {p_star}, net_flux: {net_flux}, leaving: {vehicle_leaving}")
+        if (not vehicle_leaving):
+            net_flux = max(net_flux, 0.0)
+
+        self.rear_flux_memory += net_flux
+        return net_flux
+
+    def front_boundary_flux(self, rho_exterior: float, fd_exterior: "FundamentalDiagram", sim_time: float, dt: float) -> float:
+        front_vehicle = self.get_front_vehicle()
+        leaving_region = 1 / fd_exterior.rho_c
+        window_length = (self.margin_s * 2)
+        if front_vehicle is not None:
+            interior_s = window_length - front_vehicle.s
+            vehicle_leaving = (interior_s < leaving_region)
+            rho_interior = 1.0 / interior_s if not vehicle_leaving else fd_exterior.rho_c
+        else:
+            interior_s = window_length
+            rho_interior = 0.0
+            vehicle_leaving = False
+
+        p_star = None
+        # Rarefaction
+        if (rho_interior > rho_exterior):
+            p_s = fd_exterior.sonic_point(self.anchor_speed)
+            if (rho_interior < p_s):
+                p_star = rho_interior
+            elif ((rho_exterior <= p_s) and (p_s <= rho_interior)):
+                p_star = p_s
+            else:
+                p_star = rho_exterior
+        # Shock
+        else:
+            s = fd_exterior.shock_speed(rho_interior, rho_exterior)
+            p_star = rho_interior if (s > self.anchor_speed) else rho_exterior
+        
+        net_flux = fd_exterior._flow(p_star) - (self.anchor_speed * p_star)
+        #print(f"Front Boundary rho_exterior: {rho_exterior}, interior_s: {interior_s}, rho_interior: {rho_interior}, p_star: {p_star}, net_flux: {net_flux}, leaving: {vehicle_leaving}")
+        if (not vehicle_leaving):
+            net_flux = min(net_flux, 0.0)
+
+        self.front_flux_memory += net_flux
+        return net_flux
+
 
 
     def render(self, rotate_fn) -> list:
