@@ -25,7 +25,9 @@ class I24SimulationData:
     def create_network_file(self):
         # For now both roads have the same length, so just grab one of them for config.
         config = self.config["road_data"]["2"]
-        self.network_generator = simulation.I24WestAndEastNetwork(v_f=30.29887885552525, rho_j=0.07034713174590666, lambda_lc=0.2596950634679115)
+        fd = simulation.TriangularFD(v_f=44.46, w=5.4228, rho_j=0.1348)
+        self.network_generator = simulation.I24WestAndEastNetwork(fd=fd, lambda_lc=0.1667)
+        #self.network_generator = simulation.I24WestAndEastNetwork(v_f=30.29887885552525, rho_j=0.07034713174590666, lambda_lc=0.2596950634679115)
         self.network_generator.create_network(config["road_length"], config["cell_length"], config["lanes"], lane_width=config["lane_width"])
         self.network_generator.save_network(self.network_path)
 

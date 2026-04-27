@@ -428,10 +428,11 @@ class NetworkGenerator(ABC):
             json.dump(network_dict, f, indent=4)  
 
 class I24WestBoundNetwork(NetworkGenerator):
-    def __init__(self, v_f, rho_j, lambda_lc):
+    def __init__(self, fd, lambda_lc):# , v_f, rho_j, lambda_lc):
         super().__init__()
         self.network = None
-        self.fd = GreenshieldsFD(v_f=v_f, rho_j=rho_j)
+        #self.fd = GreenshieldsFD(v_f=v_f, rho_j=rho_j)
+        self.fd = fd
         self.lane_change_model = SpeedIncentiveLaneChange(lambda_lc=lambda_lc)
 
     def create_network(self, road_length=1600.0, longitudinal_step=50.0, lane_count=4, lane_width=3.6576):
@@ -496,10 +497,11 @@ class I24WestBoundNetwork(NetworkGenerator):
         self.network = Network(network_id=network_id, roads={road_id: road})
 
 class I24EastBoundNetwork(NetworkGenerator):
-    def __init__(self, v_f, rho_j, lambda_lc):
+    def __init__(self, fd, lambda_lc):# , v_f, rho_j, lambda_lc):
         super().__init__()
         self.network = None
-        self.fd = GreenshieldsFD(v_f=v_f, rho_j=rho_j)
+        #self.fd = GreenshieldsFD(v_f=v_f, rho_j=rho_j)
+        self.fd = fd
         self.lane_change_model = SpeedIncentiveLaneChange(lambda_lc=lambda_lc)
 
     def create_network(self, road_length=1600.0, longitudinal_step=50.0, lane_count=4, lane_width=3.6576):
@@ -564,17 +566,16 @@ class I24EastBoundNetwork(NetworkGenerator):
         self.network = Network(network_id=network_id, roads={road_id: road})
 
 class I24WestAndEastNetwork(NetworkGenerator):
-    def __init__(self, v_f=40.0, rho_j=0.10, lambda_lc=0.05):
+    def __init__(self, fd, lambda_lc=0.05):
         super().__init__()
         self.network = None
-        self.v_f = v_f
-        self.rho_j = rho_j
+        self.fd = fd
         self.lambda_lc = lambda_lc
 
     def create_network(self, road_length=1600.0, longitudinal_step=50.0, lane_count=4, lane_width=3.6576):
         network_id = "i24_west_and_east_network"
-        westbound_network = I24WestBoundNetwork(self.v_f, self.rho_j, self.lambda_lc)
-        eastbound_network = I24EastBoundNetwork(self.v_f, self.rho_j, self.lambda_lc)
+        westbound_network = I24WestBoundNetwork(self.fd, self.lambda_lc)
+        eastbound_network = I24EastBoundNetwork(self.fd, self.lambda_lc)
         westbound_network.create_network(road_length, longitudinal_step, lane_count, lane_width)
         eastbound_network.create_network(road_length, longitudinal_step, lane_count, lane_width)
         self.network = Network.merge_networks(westbound_network.network, eastbound_network.network, network_id)
@@ -1168,6 +1169,12 @@ class TriangularFD(FundamentalDiagram):
     @property
     def capacity(self) -> float:
         return self.v_f * self.rho_c
+    
+    def _flow(self, rho: float) -> float:
+        if (rho > self.rho_c):
+            return self.w * (self.rho_j - rho)
+        else:
+            return self.v_f * rho
 
     def demand(self, rho: float) -> float:
         return min(self.v_f * rho, self.capacity)
@@ -1178,7 +1185,14 @@ class TriangularFD(FundamentalDiagram):
     def velocity_from_density(self, rho: float) -> float:
         q = self.demand(rho)
         return q / rho if rho > 1e-12 else self.v_f
-
+    
+    def shock_speed(self, rho_left: float, rho_right: float) -> float:
+        if ((rho_left <= rho_right) and (rho_right <= self.rho_c)):
+            return self.v_f
+        elif ((self.rho_c <= rho_left) and (rho_left <= rho_right)):
+            return -self.w
+        else:
+            return ((self.w * (self.rho_j - rho_right)) - (self.v_f * rho_left)) / (rho_right - rho_left)
 
 @dataclass
 class GreenshieldsFD(FundamentalDiagram):
@@ -2447,84 +2461,6 @@ class I24MicroMask(ArbitraryMaskingCell):
                 vehicle = self.vehicles[new_vehicle_key]
         return vehicle
 
-    """
-    Boundary flux calculations here form our core contributions — to be
-    derived from the constrained Riemann solver once the weak entropy
-    solution is in hand.
-    """
-    """
-    def rear_boundary_flux(self, rho_exterior: float, fd_exterior: "FundamentalDiagram", sim_time: float, dt: float) -> float:
-        rear_vehicle = self.get_rear_vehicle()
-        if rear_vehicle is not None:
-            rho_interior = 1.0 / rear_vehicle.s
-            rear_vehicle_flux = rho_interior * (rear_vehicle.s_dt - self.anchor_speed) * dt
-            rear_vehicle_flux = min(0.0, rear_vehicle_flux)
-        else:
-            rear_vehicle_flux = 0.0
-        rear_macro_flux = rho_exterior * fd_exterior.velocity_from_density(rho_exterior) * dt
-        rear_micro_geometric_flux = rho_exterior * fd_exterior.velocity_from_density(self.anchor_speed) * dt
-        total_non_clipped_flux = rear_macro_flux - rear_micro_geometric_flux + rear_vehicle_flux
-        self.rear_flux_memory += total_non_clipped_flux
-        return total_non_clipped_flux
-
-    def front_boundary_flux(self, rho_exterior: float, fd_exterior: "FundamentalDiagram", sim_time: float, dt: float) -> float:
-        front_vehicle = self.get_front_vehicle()
-        if front_vehicle is not None:
-            rho_interior = 1.0 / (self.middle_s + self.margin_s - front_vehicle.s)
-            front_vehicle_flux = rho_interior * (front_vehicle.s_dt - self.anchor_speed) * dt
-            front_vehicle_flux = max(0.0, front_vehicle_flux)
-        else:
-            front_vehicle_flux = 0.0
-        front_macro_flux = rho_exterior * fd_exterior.velocity_from_density(rho_exterior) * dt
-        front_micro_geometric_flux = rho_exterior * fd_exterior.velocity_from_density(self.anchor_speed) * dt
-        total_non_clipped_flux = front_micro_geometric_flux - front_macro_flux + front_vehicle_flux
-        self.front_flux_memory += total_non_clipped_flux
-        return total_non_clipped_flux
-    """
-
-    """
-    def rear_boundary_flux(self, rho_exterior: float, fd_exterior: "FundamentalDiagram", sim_time: float, dt: float) -> float:
-        rear_vehicle = self.get_rear_vehicle()
-        if rear_vehicle is not None:
-            interior_s = rear_vehicle.s
-            vehicle_leaving = (interior_s < 0)
-            rho_interior = min(1.0 / interior_s, fd_exterior.rho_j) if not vehicle_leaving else fd_exterior.rho_j
-        else:
-            rho_interior = 0.0
-            vehicle_leaving = False
-        available_supply = fd_exterior.supply(rho_interior) *  (0 if vehicle_leaving else 1) * dt
-        vehicle_leaving_flux = -1 if vehicle_leaving else 0
-        flux_cap = available_supply + vehicle_leaving_flux
-
-        flux_demand_moving = (fd_exterior.demand(rho_exterior) - rho_exterior*self.anchor_speed) * dt
-        flux_reconciled = min(flux_cap, max(flux_demand_moving, 0))
-        if (flux_reconciled < 0):
-            print((fd_exterior.demand(rho_exterior) - rho_exterior*self.anchor_speed) * dt, rho_exterior, fd_exterior.demand(rho_exterior), self.anchor_speed, dt)
-        self.rear_flux_memory += flux_reconciled
-        return flux_reconciled
-
-    def front_boundary_flux(self, rho_exterior: float, fd_exterior: "FundamentalDiagram", sim_time: float, dt: float) -> float:
-        front_vehicle = self.get_front_vehicle()
-        if front_vehicle is not None:
-            interior_s = front_vehicle.s
-            vehicle_leaving = ((self.middle_s + self.margin_s - interior_s) < 0)
-            rho_interior = min(1.0 / (self.middle_s + self.margin_s - interior_s), fd_exterior.rho_j) if not vehicle_leaving else fd_exterior.rho_j
-        else:
-            rho_interior = 0.0
-            vehicle_leaving = False
-
-        available_exterior_supply = fd_exterior.supply(rho_exterior) - rho_exterior*self.anchor_speed * dt
-        vehicle_leaving_flux = 1 if vehicle_leaving else 0
-        flux_capped_for_external = min(available_exterior_supply, vehicle_leaving_flux)
-
-        vehicle_can_enter = (not vehicle_leaving) and (rho_interior < fd_exterior.rho_j)
-        vehicle_entering_flux_allowed = 1 if vehicle_can_enter else 0
-        available_interior_supply = -fd_exterior.supply(rho_interior) * vehicle_entering_flux_allowed * dt
-        flux_reconciled = max(available_interior_supply, flux_capped_for_external)
-
-        self.front_flux_memory += flux_reconciled
-        return flux_reconciled
-    """
     def rear_boundary_flux(self, rho_exterior: float, fd_exterior: "FundamentalDiagram", sim_time: float, dt: float) -> float:
         rear_vehicle = self.get_rear_vehicle()
         leaving_region = 1 / fd_exterior.rho_c
@@ -2538,24 +2474,44 @@ class I24MicroMask(ArbitraryMaskingCell):
             vehicle_leaving = False
             rho_interior = 0.0
             rear_velocity = 0
-        
-        p_star = None
-        # Rarefaction
-        if (rho_exterior > rho_interior):
-            p_s = fd_exterior.sonic_point(self.anchor_speed)
-            if (rho_exterior < p_s):
-                p_star = rho_exterior
-            elif ((rho_interior <= p_s) and (p_s <= rho_exterior)):
-                p_star = p_s
+
+        if isinstance(fd_exterior, GreenshieldsFD):            
+            p_star = None
+            # Rarefaction
+            if (rho_exterior > rho_interior):
+                p_s = fd_exterior.sonic_point(self.anchor_speed)
+                if (rho_exterior < p_s):
+                    p_star = rho_exterior
+                elif ((rho_interior <= p_s) and (p_s <= rho_exterior)):
+                    p_star = p_s
+                else:
+                    p_star = rho_interior
+            # Shock
             else:
-                p_star = rho_interior
-        # Shock
-        else:
-            s = fd_exterior.shock_speed(rho_exterior, rho_interior)
-            p_star = rho_exterior if (s > self.anchor_speed) else rho_interior
-        
+                s = fd_exterior.shock_speed(rho_exterior, rho_interior)
+                p_star = rho_exterior if (s > self.anchor_speed) else rho_interior
+            
+        elif isinstance(fd_exterior, TriangularFD):
+            p_star = None
+            #Rarefaction
+            if (rho_exterior > rho_interior):
+                if (rho_exterior <= fd_exterior.rho_c):
+                    p_star = rho_exterior
+                elif (rho_interior > fd_exterior.rho_c):
+                    p_star = rho_interior
+                else:
+                    p_star = fd_exterior.rho_c
+            # Shock
+            else:
+                s = fd_exterior.shock_speed(rho_exterior, rho_interior)
+                if (s > self.anchor_speed):
+                    p_star = rho_exterior
+                else:
+                    p_star = rho_interior
+
         net_flux = fd_exterior._flow(p_star) - (self.anchor_speed * p_star)
-        print(f"Rear Boundary rear_speed: {rear_velocity}, anchor_speed: {self.anchor_speed}, rho_exterior: {rho_exterior}, interior_s: {interior_s}, rho_interior: {rho_interior}, p_star: {p_star}, net_flux: {net_flux}, leaving: {vehicle_leaving}")
+        rear_estimated_speed = fd_exterior._flow(p_star) / p_star
+        print(f"Rear Boundary rear_speed: {rear_velocity}, estimated_speed: {rear_estimated_speed} anchor_speed: {self.anchor_speed}, rho_exterior: {rho_exterior}, interior_s: {interior_s}, rho_interior: {rho_interior}, p_star: {p_star}, net_flux: {net_flux}, leaving: {vehicle_leaving}")
         if (not vehicle_leaving):
             net_flux = max(net_flux, 0.0)
 
@@ -2574,22 +2530,41 @@ class I24MicroMask(ArbitraryMaskingCell):
             interior_s = window_length
             rho_interior = 0.0
             vehicle_leaving = False
-
-        p_star = None
-        # Rarefaction
-        if (rho_interior > rho_exterior):
-            p_s = fd_exterior.sonic_point(self.anchor_speed)
-            if (rho_interior < p_s):
-                p_star = rho_interior
-            elif ((rho_exterior <= p_s) and (p_s <= rho_interior)):
-                p_star = p_s
+    
+        if isinstance(fd_exterior, GreenshieldsFD):
+            p_star = None
+            # Rarefaction
+            if (rho_interior > rho_exterior):
+                p_s = fd_exterior.sonic_point(self.anchor_speed)
+                if (rho_interior < p_s):
+                    p_star = rho_interior
+                elif ((rho_exterior <= p_s) and (p_s <= rho_interior)):
+                    p_star = p_s
+                else:
+                    p_star = rho_exterior
+            # Shock
             else:
-                p_star = rho_exterior
-        # Shock
-        else:
-            s = fd_exterior.shock_speed(rho_interior, rho_exterior)
-            p_star = rho_interior if (s > self.anchor_speed) else rho_exterior
-        
+                s = fd_exterior.shock_speed(rho_interior, rho_exterior)
+                p_star = rho_interior if (s > self.anchor_speed) else rho_exterior
+
+        elif isinstance(fd_exterior, TriangularFD):
+            p_star = None
+            #Rarefaction
+            if (rho_interior > rho_exterior):
+                if (rho_interior <= fd_exterior.rho_c):
+                    p_star = rho_interior
+                elif (rho_exterior > fd_exterior.rho_c):
+                    p_star = rho_exterior
+                else:
+                    p_star = fd_exterior.rho_c
+            # Shock
+            else:
+                s = fd_exterior.shock_speed(rho_interior, rho_exterior)
+                if (s > self.anchor_speed):
+                    p_star = rho_interior
+                else:
+                    p_star = rho_exterior
+
         net_flux = fd_exterior._flow(p_star) - (self.anchor_speed * p_star)
         #print(f"Front Boundary rho_exterior: {rho_exterior}, interior_s: {interior_s}, rho_interior: {rho_interior}, p_star: {p_star}, net_flux: {net_flux}, leaving: {vehicle_leaving}")
         if (not vehicle_leaving):
@@ -2597,8 +2572,6 @@ class I24MicroMask(ArbitraryMaskingCell):
 
         self.front_flux_memory += net_flux
         return net_flux
-
-
 
     def render(self, rotate_fn) -> list:
         """Draw each vehicle in this lane as a filled rectangle."""

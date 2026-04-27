@@ -212,7 +212,7 @@ def run_demo():
         road_id="2",
         lanes=[-1, -2, -3, -4],
         initial_middle_s=150.0,
-        margin_s=50.0,
+        margin_s=150.0,
         max_middle_s=1450,
         update_micro_callback=replayer.step,
         bridge_callback_name="bridge_step"
