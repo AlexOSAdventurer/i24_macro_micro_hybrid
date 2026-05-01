@@ -27,10 +27,12 @@ def vehicle_count(sim):
 captured = {}
 orig_compute = Simulation._compute_active_edge_flows
 def patched_compute(self, active):
-    e, i, o = orig_compute(self, active)
+    e, i, o, m = orig_compute(self, active)
+    captured["in_internal"] = dict(e)
     captured["ext_in"]  = dict(i)
     captured["ext_out"] = dict(o)
-    return e, i, o
+    captured["mask_internal"] = dict(m)
+    return e, i, o, m
 Simulation._compute_active_edge_flows = patched_compute
 
 overwrite_deltas = []
@@ -54,34 +56,39 @@ gt = GroundTruthStore.from_parquet(
     os.path.join(config["storage_locations"]["simulation_dataset"], "macro.parquet"),
 )
 sim.initialize_from_ground_truth(gt, time_value=config["time_origin"])
+
 replayer = I24TrajectoryReplayer(gt, dt=1.0, lanes=[-1, -2, -3, -4])
 bridge = I24MicroSimBridge(
     sim=sim, road_id="2", lanes=[-1, -2, -3, -4],
-    initial_middle_s=150.0, margin_s=150.0, max_middle_s=1450,
+    initial_middle_s=375.0, margin_s=150.0, max_middle_s=1450,
     update_micro_callback=replayer.step, bridge_callback_name="bridge_step",
 )
 
 dt = sim.time_resolution
-print(f"{'step':>3} {'dM_macro':>9} {'dM_mask':>9} {'dM_tot':>9} {'in*dt':>7} {'out*dt':>7} {'GT_d':>7} {'d_vehic':>8} {'unexpl':>9}")
-
-prev_macro = macro_mass(sim.network)
-prev_mask  = mask_mass_field(sim.network)
-prev_veh   = vehicle_count(sim)
-for i in range(1, 16):
+print(f"{'step':>4} {'dM_total':>10} {'dM_macro':>10} {'dM_mask':>10} {'bridge_s':>10} {'anchor_speed':>13} {'flux_internal':>12} {'flux_in*dt':>11} {'flux_out*dt':>12} {'vehicles_in_mask':>17} {'GT_overwrite':>13} {'leak':>10}")
+M_prev = total_mass(sim.network)
+M_macro_prev = macro_mass(sim.network)
+M_mask_prev = mask_mass_field(sim.network)
+vehicles_prev = vehicle_count(sim)
+for i in range(1, 85):
+    bridge_s = bridge.middle_s
+    anchor_speed = bridge.anchor_speed
     sim.step()
-    Mmac = macro_mass(sim.network)
-    Mmsk = mask_mass_field(sim.network)
-    Mtot = Mmac + Mmsk
-    veh = vehicle_count(sim)
-    sum_in  = sum(captured["ext_in"].values())  * dt
-    sum_out = sum(captured["ext_out"].values()) * dt
-    gt_d = overwrite_deltas[-1] if overwrite_deltas else 0.0
-    dveh = veh - prev_veh
-    # Expected (non-bridge) total change excluding bridge vehicle injection:
-    expected = sum_in - sum_out + gt_d + dveh
-    actual = Mtot - (prev_macro + prev_mask)
-    unexplained = actual - expected
-    print(f"{i:>3} {Mmac - prev_macro:>9.4f} {Mmsk - prev_mask:>9.4f} "
-          f"{actual:>9.4f} {sum_in:>7.3f} {sum_out:>7.3f} {gt_d:>7.3f} "
-          f"{dveh:>8d} {unexplained:>9.4f}")
-    prev_macro, prev_mask, prev_veh = Mmac, Mmsk, veh
+    M_now = total_mass(sim.network)
+    M_macro_now = macro_mass(sim.network)
+    M_mask_now = mask_mass_field(sim.network)
+    M_macro_delta = M_macro_now - M_macro_prev
+    M_mask_delta = M_mask_now - M_mask_prev
+    sum_mask_internal = sum(captured["mask_internal"].values())  * dt if "mask_internal" in captured else 0.0
+    sum_internal = sum(captured["in_internal"].values())  * dt if "in_internal" in captured else 0.0
+    sum_in  = sum(captured["ext_in"].values())  * dt if "ext_in" in captured else 0.0
+    sum_out = sum(captured["ext_out"].values()) * dt if "ext_out" in captured else 0.0
+    vehicles = vehicle_count(sim)
+    gt_delta = overwrite_deltas[-1]
+    expected = sum_in - sum_out + gt_delta + sum_mask_internal
+    actual   = M_macro_now - M_macro_prev
+    print(f"{i:>4} {actual:>10.4f} {M_macro_delta:>10.4f} {M_mask_delta:>10.4f} {bridge_s:>10.4f} {anchor_speed:>13.4f} {sum_internal:>13.4f} {sum_in:>11.4f} {sum_out:>12.4f} {vehicles:>17.4f} {gt_delta:>13.4f} {actual - expected:>10.4f}")
+    M_prev = M_now
+    M_macro_prev = M_macro_now
+    M_mask_prev = M_mask_now
+    vehicles_prev = vehicles

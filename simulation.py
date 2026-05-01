@@ -22,7 +22,9 @@ class Cell:
     lane: int
     start_s: float
     end_s: float
-    density: float
+    mass: float
+    mask_mass: float
+    
     inflow_connections: List[Connection] = field(default_factory=list)
     outflow_connections: List[Connection] = field(default_factory=list)
     fd: Optional[FundamentalDiagram] = None
@@ -31,10 +33,14 @@ class Cell:
     @property
     def length(self) -> float:
         return float(self.end_s - self.start_s)
-
+    
     @property
-    def mass(self) -> float:
-        return float(self.density * self.length)
+    def density(self) -> float:
+        return float(self.mass / self.length)
+    
+    @property
+    def density_viz(self) -> float:
+        return float((self.mass + self.mask_mass) / self.length)
 
     def validate(self) -> None:
         if self.end_s <= self.start_s:
@@ -42,9 +48,9 @@ class Cell:
                 f"Cell {self.road_id}/{self.cell_id} has non-positive length: "
                 f"start_s={self.start_s}, end_s={self.end_s}"
             )
-        if self.density < 0.0:
+        if self.mass < 0.0:
             raise ValueError(
-                f"Cell {self.road_id}/{self.cell_id} has negative density: {self.density}"
+                f"Cell {self.road_id}/{self.cell_id} has negative mass: {self.mass}"
             )
 
 
@@ -129,7 +135,8 @@ class Network:
                     lane=cell.lane,
                     start_s=cell.start_s,
                     end_s=cell.end_s,
-                    density=cell.density,
+                    mass=cell.mass,
+                    mask_mass=cell.mask_mass,
                     inflow_connections=cell.inflow_connections,
                     outflow_connections=cell.outflow_connections,
                     fd=cell.fd,
@@ -217,7 +224,8 @@ class Network:
                             "lane": int(cell.lane),
                             "start_s": float(cell.start_s),
                             "end_s": float(cell.end_s),
-                            "density": float(cell.density),
+                            "mass": float(cell.mass),
+                            "mask_mass": float(cell.mask_mass),
                             "inflow_connections": [[r, c] for (r, c) in cell.inflow_connections],
                             "outflow_connections": [[r, c] for (r, c) in cell.outflow_connections],
                             "fd": Network._fd_to_dict(cell.fd),
@@ -256,7 +264,8 @@ class Network:
                     lane=int(cell_data["lane"]),
                     start_s=float(cell_data["start_s"]),
                     end_s=float(cell_data["end_s"]),
-                    density=float(cell_data["density"]),
+                    mass=float(cell_data["mass"]),
+                    mask_mass=float(cell_data["mask_mass"]),
                     inflow_connections=[
                         (str(x[0]), str(x[1]))
                         for x in cell_data.get("inflow_connections", [])
@@ -483,14 +492,15 @@ class I24WestBoundNetwork(NetworkGenerator):
                 cell_id = f"road_{road_id}_cell_{lane}_step_{i}"
                 start_s = step
                 end_s = step + longitudinal_step
-                density = 0
+                mass = 0
+                mask_mass = 0
                 inflow_connections = []
                 outflow_connections = []
                 if (i > 0):
                     inflow_connections.append((road_id, f"road_{road_id}_cell_{lane}_step_{i - 1}"))
                 if (i < (len(longitudinal_steps) - 1)):
                     outflow_connections.append((road_id, f"road_{road_id}_cell_{lane}_step_{i + 1}"))
-                cell = Cell(road_id=road_id, cell_id=cell_id, lane=lane, start_s=start_s, end_s=end_s, density=density, inflow_connections=inflow_connections, outflow_connections=outflow_connections, fd=self.fd, lane_change_model=self.lane_change_model)
+                cell = Cell(road_id=road_id, cell_id=cell_id, lane=lane, start_s=start_s, end_s=end_s, mass=mass, mask_mass=mask_mass, inflow_connections=inflow_connections, outflow_connections=outflow_connections, fd=self.fd, lane_change_model=self.lane_change_model)
                 cells[cell_id] = cell
 
         road = Road(road_id=road_id, left_polyline=road_left_polyline, right_polyline=road_right_polyline, lane_data=road_lane_data, cells=cells)
@@ -552,14 +562,15 @@ class I24EastBoundNetwork(NetworkGenerator):
                 cell_id = f"road_{road_id}_cell_{lane}_step_{i}"
                 start_s = step
                 end_s = step + longitudinal_step
-                density = 0
+                mass = 0
+                mask_mass = 0
                 inflow_connections = []
                 outflow_connections = []
                 if (i > 0):
                     inflow_connections.append((road_id, f"road_{road_id}_cell_{lane}_step_{i - 1}"))
                 if (i < (len(longitudinal_steps) - 1)):
                     outflow_connections.append((road_id, f"road_{road_id}_cell_{lane}_step_{i + 1}"))
-                cell = Cell(road_id=road_id, cell_id=cell_id, lane=lane, start_s=start_s, end_s=end_s, density=density, inflow_connections=inflow_connections, outflow_connections=outflow_connections, fd=self.fd, lane_change_model=self.lane_change_model)
+                cell = Cell(road_id=road_id, cell_id=cell_id, lane=lane, start_s=start_s, end_s=end_s, mass=mass, mask_mass=mask_mass, inflow_connections=inflow_connections, outflow_connections=outflow_connections, fd=self.fd, lane_change_model=self.lane_change_model)
                 cells[cell_id] = cell
 
         road = Road(road_id=road_id, left_polyline=road_left_polyline, right_polyline=road_right_polyline, lane_data=road_lane_data, cells=cells)
@@ -692,7 +703,7 @@ class GroundTruthStore:
     ) -> None:
         density_map = self._macro_density_lookup[self._nearest_time(time_value, tolerance)]
         for (road_id, cell_id), density in density_map.items():
-            network.get_cell(road_id, cell_id).density = density
+            network.get_cell(road_id, cell_id).mass = density * network.get_cell(road_id, cell_id).length
 
     def apply_density_snapshot_to_network_boundaries(
         self, network: Network, time_value: float, tolerance: float = 1e-1
@@ -701,7 +712,7 @@ class GroundTruthStore:
         for (road_id, cell_id), density in density_map.items():
             cell = network.get_cell(road_id, cell_id)
             if len(cell.inflow_connections) == 0 or len(cell.outflow_connections) == 0:
-                cell.density = density
+                cell.mass = density * cell.length
 
 
 # =========================
@@ -748,6 +759,10 @@ class ArbitraryMaskingCell(ABC):
                 raise KeyError(
                     f"Mask {self.mask_id}: lane {seg.lane} not in road {seg.road_id}."
                 )
+            
+    @property
+    def mass(self) -> float:
+        return 0
 
     @abstractmethod
     def rear_boundary_flux(self, rho_exterior: float, fd_exterior: "FundamentalDiagram", sim_time: float, dt: float) -> float:
@@ -763,12 +778,15 @@ class ArbitraryMaskingCell(ABC):
         """
         raise NotImplementedError
 
-    def update(self, sim_time: float, dt: float) -> None:
+    def update(self, sim_time: float, dt: float) -> float:
         """
-        Optional hook for moving masks.
+        Optional hook for moving masks. Returns the longitudinal forward
+        speed (m/s) at which the mask should be translated this step.
+        A return of 0.0 means the mask is stationary.
+
         Override in subclasses.
         """
-        return
+        return 0.0
 
     def render(self, rotate_fn) -> list:
         """Return a list of plotly traces for this mask's contents.
@@ -787,7 +805,7 @@ class ActiveCell:
     start_s: float
     end_s: float
     kind: str  # "normal" or "mask"
-    density: float
+    mass: float
     base_segments: List[Tuple[Connection, float, float]] = field(default_factory=list)
     mask_id: Optional[str] = None
     fd: Optional[FundamentalDiagram] = None
@@ -800,8 +818,8 @@ class ActiveCell:
         return float(self.end_s - self.start_s)
 
     @property
-    def mass(self) -> float:
-        return float(self.density * self.length)
+    def density(self) -> float:
+        return float(self.mass / self.length)
 
 
 @dataclass
@@ -830,7 +848,7 @@ class ActiveNetwork:
                 start_s=ac.start_s,
                 end_s=ac.end_s,
                 kind=ac.kind,
-                density=ac.density,
+                mass=ac.mass,
                 base_segments=ac.base_segments,
                 mask_id=ac.mask_id,
                 fd=ac.fd,
@@ -975,7 +993,7 @@ class ActiveMeshBuilder:
                         start_s=float(item["start_s"]),
                         end_s=float(item["end_s"]),
                         kind=str(item["kind"]),
-                        density=0.0,
+                        mass=0.0,
                         base_segments=list(item["base_segments"]),
                         mask_id=item["mask_id"],
                         fd=cell_fd,
@@ -1076,17 +1094,32 @@ class ActiveMeshBuilder:
 
 class ConservativeRemapper:
     @staticmethod
-    def base_to_active(network: Network, active: ActiveNetwork) -> None:
+    def base_to_active(simulation: Simulation, network: Network, active: ActiveNetwork) -> None:
+        # `cell.mass` represents macro mass on the *unmasked* portion of the base
+        # cell. To distribute it back to normal active cells, divide by the unmasked
+        # length (= sum of overlaps with normal active cells), not the full base
+        # length. Otherwise mass on partially-masked base cells decays each cycle
+        # because mass intended for the masked portion is silently dropped.
+        macro_length_per_base: Dict[Connection, float] = {}
         for ac in active.active_cells.values():
             if ac.kind == "mask":
-                continue  # mask interior is owned by the micro simulation
-            total_mass = 0.0
+                continue
             for (base_key, s0, s1) in ac.base_segments:
-                base_cell = network.get_cell(*base_key)
-                overlap_len = s1 - s0
-                total_mass += float(base_cell.density * overlap_len)
+                macro_length_per_base[base_key] = macro_length_per_base.get(base_key, 0.0) + (s1 - s0)
 
-            ac.density = 0.0 if ac.length <= 1e-12 else total_mass / ac.length
+        for ac in active.active_cells.values():
+            total_mass = 0.0
+            if ac.kind == "mask":
+                total_mass = float(simulation.masking_cells[ac.mask_id].mass)
+            else:
+                for (base_key, s0, s1) in ac.base_segments:
+                    base_cell = network.get_cell(*base_key)
+                    overlap_len = s1 - s0
+                    macro_len = macro_length_per_base.get(base_key, base_cell.length)
+                    macro_density = (base_cell.mass / macro_len) if macro_len > 1e-12 else 0.0
+                    total_mass += macro_density * overlap_len
+
+            ac.mass = 0.0 if ac.length <= 1e-12 else total_mass
 
     @staticmethod
     def active_to_base(network: Network, active: ActiveNetwork) -> None:
@@ -1101,34 +1134,107 @@ class ConservativeRemapper:
         # boundaries.  Dividing by covered_length preserves the correct density
         # for the normal portion and leaves the masked portion untouched.
         base_mass_updates: Dict[Connection, float] = {}
+        base_mask_mass_updates: Dict[Connection, float] = {}
         base_covered_lengths: Dict[Connection, float] = {}
+
+        # Reset all masses.
+        for ac in active.active_cells.values():
+            for (base_key, s0, s1) in ac.base_segments:
+                network.get_cell(*base_key).mass = 0.0
+                network.get_cell(*base_key).mask_mass = 0.0
 
         for ac in active.active_cells.values():
             if ac.kind == "mask":
-                continue
-            for (base_key, s0, s1) in ac.base_segments:
-                overlap_len = s1 - s0
-                if base_key not in base_mass_updates:
-                    base_mass_updates[base_key] = 0.0
-                    base_covered_lengths[base_key] = 0.0
-                base_mass_updates[base_key] += float(ac.density * overlap_len)
-                base_covered_lengths[base_key] += overlap_len
+                for (base_key, s0, s1) in ac.base_segments:
+                    overlap_len = s1 - s0
+                    if base_key not in base_mask_mass_updates:
+                        base_mask_mass_updates[base_key] = 0.0
+                    base_mask_mass_updates[base_key] += float(ac.density * overlap_len)
+            else:
+                for (base_key, s0, s1) in ac.base_segments:
+                    overlap_len = s1 - s0
+                    if base_key not in base_mass_updates:
+                        base_mass_updates[base_key] = 0.0
+                        base_covered_lengths[base_key] = 0.0
+                    base_mass_updates[base_key] += float(ac.density * overlap_len)
+                    base_covered_lengths[base_key] += overlap_len
 
         for base_key, mass in base_mass_updates.items():
             cell = network.get_cell(*base_key)
             covered_L = base_covered_lengths[base_key]
-            cell.density = 0.0 if covered_L <= 1e-12 else mass / covered_L
+            cell.mass = 0.0 if covered_L <= 1e-12 else mass
 
-        # Zero out base cells that are exclusively covered by a mask (not touched by
-        # any normal active cell above).  Vehicles in these cells have entered the
-        # micro domain; keeping stale non-zero density would inject ghost vehicles
-        # into the upstream normal cell when the mask moves away.
+        for base_key, mass in base_mask_mass_updates.items():
+            cell = network.get_cell(*base_key)
+            cell.mask_mass = mass
+
+    @staticmethod
+    def move_active_masks(simulation: "Simulation", active: ActiveNetwork) -> None:
+        """Translate every mask forward by `mask.update() * dt`.
+
+        For each mask:
+          - calls `mask.update(sim_time, dt)` to obtain a longitudinal forward speed,
+          - shifts the mask's own `MaskedSegmentRef`s by `dx = speed * dt`,
+          - shifts every active cell with `kind == "mask"` and matching `mask_id` by dx,
+          - shifts the abutting upstream cell's `end_s` and the abutting downstream
+            cell's `start_s` by dx so neighbours stay contiguous,
+          - rebuilds `base_segments` on every cell whose extent changed by intersecting
+            the new [start_s, end_s] with the underlying base cells in (road_id, lane).
+        """
+        sim_time = simulation.current_time
+        dt = simulation.time_resolution
+        network = simulation.network
+
+        def recompute_base_segments(ac: ActiveCell) -> None:
+            road = network.roads[ac.road_id]
+            new_segs: List[Tuple[Connection, float, float]] = []
+            for c in road.cells_for_lane(ac.lane):
+                s0 = max(float(ac.start_s), float(c.start_s))
+                s1 = min(float(ac.end_s), float(c.end_s))
+                if s1 > s0:
+                    new_segs.append(((c.road_id, c.cell_id), float(s0), float(s1)))
+            ac.base_segments = new_segs
+
+        mask_active_cells: Dict[str, List[ActiveCell]] = {}
         for ac in active.active_cells.values():
-            if ac.kind != "mask":
+            if ac.kind == "mask" and ac.mask_id is not None:
+                mask_active_cells.setdefault(ac.mask_id, []).append(ac)
+
+        cells_by_road_lane: Dict[Tuple[str, int], List[ActiveCell]] = {}
+        for ac in active.active_cells.values():
+            cells_by_road_lane.setdefault((ac.road_id, ac.lane), []).append(ac)
+
+        TOL = 1e-9
+        for mask_id, mask in simulation.masking_cells.items():
+            speed = float(mask.update(sim_time, dt))
+            dx = speed * dt
+            if dx == 0.0:
                 continue
-            for (base_key, s0, s1) in ac.base_segments:
-                if base_key not in base_mass_updates:
-                    network.get_cell(*base_key).density = 0.0
+
+            shifted: Set[str] = set()
+            for mac in mask_active_cells.get(mask_id, []):
+                old_start = float(mac.start_s)
+                old_end = float(mac.end_s)
+                lane_cells = cells_by_road_lane.get((mac.road_id, mac.lane), [])
+                for other in lane_cells:
+                    if other is mac or other.kind == "mask":
+                        continue
+                    if abs(other.end_s - old_start) < TOL:
+                        other.end_s = float(other.end_s + dx)
+                        shifted.add(other.active_cell_id)
+                    if abs(other.start_s - old_end) < TOL:
+                        other.start_s = float(other.start_s + dx)
+                        shifted.add(other.active_cell_id)
+                mac.start_s = float(old_start + dx)
+                mac.end_s = float(old_end + dx)
+                shifted.add(mac.active_cell_id)
+
+            for seg in mask.segments:
+                seg.start_s = float(seg.start_s + dx)
+                seg.end_s = float(seg.end_s + dx)
+
+            for aid in shifted:
+                recompute_base_segments(active.active_cells[aid])
 
 
 # =========================
@@ -1432,7 +1538,7 @@ class Simulation:
             active = builder.build()
             if not self.masking_cells:
                 self._cached_active_network = active
-        ConservativeRemapper.base_to_active(self.network, active)
+        ConservativeRemapper.base_to_active(self, self.network, active)
         return active
 
     def _compute_active_demand_supply(
@@ -1464,6 +1570,7 @@ class Simulation:
         demand_map, supply_map = self._compute_active_demand_supply(active)
 
         edge_flow: Dict[Tuple[str, str], float] = {}
+        mask_flow: Dict[Tuple[str, str], float] = {}
 
         active_ids = active.ordered_ids()
         for u in active_ids:
@@ -1485,12 +1592,14 @@ class Simulation:
                     edge_flow[(u, v)] = mask.rear_boundary_flux(
                         u_cell.density, u_cell.fd, self.current_time, self.time_resolution
                     )
+                    mask_flow[(u, v)] = -edge_flow[(u, v)]
                 elif u_cell.kind == "mask":
                     # Mask → normal: front boundary flux determined by mask's Riemann solver
                     mask = self.masking_cells[u_cell.mask_id]
                     edge_flow[(u, v)] = mask.front_boundary_flux(
                         v_cell.density, v_cell.fd, self.current_time, self.time_resolution
                     )
+                    mask_flow[(u, v)] = edge_flow[(u, v)]
                 else:
                     # Normal → normal: standard Godunov supply/demand
                     preds = list(v_cell.inflow_neighbors)
@@ -1545,7 +1654,7 @@ class Simulation:
             if len(ac.inflow_neighbors) == 0:
                 base_key = ac.base_segments[0][0]
                 external_inflow[aid] = min(
-                    float(self.inflow_boundary_map.get(base_key, cell_capacity)),
+                    float(self.inflow_boundary_map.get(base_key, 0.0)),
                     supply_map[aid],
                 ) if cell_capacity is not None else 0.0
             if len(ac.outflow_neighbors) == 0:
@@ -1555,21 +1664,20 @@ class Simulation:
                     float(self.outflow_boundary_map.get(base_key, cell_capacity)),
                 ) if cell_capacity is not None else demand_map[aid]
 
-        return edge_flow, external_inflow, external_outflow
+        return edge_flow, external_inflow, external_outflow, mask_flow
 
     def _step_active_network(self, active: ActiveNetwork) -> None:
         active_ids = active.ordered_ids()
         index_of = {aid: i for i, aid in enumerate(active_ids)}
 
-        densities = np.array([active.active_cells[aid].density for aid in active_ids], dtype=np.float64)
+        masses = np.array([active.active_cells[aid].mass for aid in active_ids], dtype=np.float64)
         lengths = np.array([active.active_cells[aid].length for aid in active_ids], dtype=np.float64)
 
         dt = self.time_resolution
 
-        edge_flow, external_inflow, external_outflow = self._compute_active_edge_flows(active)
+        edge_flow, external_inflow, external_outflow, mask_flow = self._compute_active_edge_flows(active)
         lateral_deltas = active.lateral_delta_density(dt)
 
-        #net_flow = np.zeros(len(active_ids), dtype=np.float64)
         rear_flow = np.zeros(len(active_ids), dtype=np.float64)
         front_flow = np.zeros(len(active_ids), dtype=np.float64)
         for (u, v), q in edge_flow.items():
@@ -1583,43 +1691,26 @@ class Simulation:
             front_flow[index_of[aid]] -= q
 
         net_flow = rear_flow + front_flow
-        new_densities = densities + (dt * (net_flow / np.maximum(lengths, 1e-12)))
-
-        """
-        for (u, v), q in edge_flow.items():
-            net_flow[index_of[u]] -= q
-            net_flow[index_of[v]] += q
-
-        for aid, q in external_inflow.items():
-            net_flow[index_of[aid]] += q
-
-        for aid, q in external_outflow.items():
-            net_flow[index_of[aid]] -= q
-
-        new_densities = densities + dt * net_flow / np.maximum(lengths, 1e-12)
+        # Mass-delta update. Mask faces return moving-frame flux, fixed faces return
+        # lab-frame flux; both feed `net_flow` directly. New density is recovered as
+        # `ac.mass / ac.length` *after* `move_active_masks` shifts the moving faces.
+        new_masses = masses + dt * net_flow
 
         for i, aid in enumerate(active_ids):
-            ac = active.active_cells[aid]
-            if ac.kind != "mask":
-                if ac.fd is None:
-                    raise ValueError(f"Active cell {aid} has no FundamentalDiagram assigned.")
-                new_rho = float(new_densities[i]) + lateral_deltas.get(aid, 0.0)
-                ac.density = float(np.clip(new_rho, 0.0, ac.fd.rho_j))
-        """
-        for i, aid in enumerate(active_ids):
-            ac = active.active_cells[aid]
-            if ac.kind != "mask":
-                if ac.fd is None:
-                    raise ValueError(f"Active cell {aid} has no FundamentalDiagram assigned.")
-                new_rho = float(new_densities[i]) + lateral_deltas.get(aid, 0.0)
-                ac.density = float(np.clip(new_rho, 0.0, ac.fd.rho_j))
-            else:
-                # We need to impart the new flow into the masked cells as needed.
-                # We separately compute the flow in the rear of the cell and the front of the cell.
+            ac = active.active_cells[aid]            
+            #if ac.fd is None:
+            #    raise ValueError(f"Active cell {aid} has no FundamentalDiagram assigned.")
+            if ac.kind == "mask":
+                # Mask active-cell mass is owned by the mask itself (set by base_to_active);
+                # we just hand each mask the per-face flux it saw this step.
+                ac.mass = float(new_masses[i])
                 rear_flow_ac = float(rear_flow[i]) * dt
                 front_flow_ac = float(front_flow[i]) * dt
                 self.masking_cells[ac.mask_id].rear_flow += rear_flow_ac
                 self.masking_cells[ac.mask_id].front_flow += front_flow_ac
+            else:
+                lateral_mass = lateral_deltas.get(aid, 0.0) * lengths[i]
+                ac.mass = float(new_masses[i] + lateral_mass)
 
     def step(self) -> None:
         self._snapshot()
@@ -1632,6 +1723,15 @@ class Simulation:
         if self.masking_cells:
             self.rollout_results[-1].mask_snapshots = dict(self.masking_cells)
         self._step_active_network(active)
+        ConservativeRemapper.move_active_masks(self, active)
+        """
+        for ac in active.active_cells.values():
+            if ac.kind == "mask" or ac.fd is None or ac.length <= 1e-12:
+                continue
+            rho = ac.mass / ac.length
+            rho = max(0.0, min(rho, ac.fd.rho_j * 2.0))
+            ac.mass = float(rho * ac.length)
+        """
         ConservativeRemapper.active_to_base(self.network, active)
         self.current_time += self.time_resolution
         self.gt_store.apply_density_snapshot_to_network_boundaries(self.network, self.current_time)
@@ -1699,11 +1799,11 @@ class Simulation:
             for rs in self.rollout_results:
                 for road in rs.network.roads.values():
                     for cell in road.cells.values():
-                        vals.append(_q_value(cell.density, cell.fd, q))
+                        vals.append(_q_value(cell.density_viz, cell.fd, q))
                 if rs.active_network:
                     for ac in rs.active_network.active_cells.values():
                         if ac.kind == "normal" and ac.fd is not None:
-                            vals.append(_q_value(ac.density, ac.fd, q))
+                            vals.append(_q_value(ac.density_viz, ac.fd, q))
             ranges[q] = (float(min(vals)) if vals else 0.0, float(max(vals)) if vals else 1.0)
 
         # Base cell polygons — geometry fixed, only densities vary
@@ -1758,7 +1858,7 @@ class Simulation:
                 traces.append(go.Scatter(
                     x=px, y=py,
                     fill="toself",
-                    fillcolor=_rgba(_q_value(cell.density, fd, q), vmin, vmax),
+                    fillcolor=_rgba(_q_value(cell.density_viz, fd, q), vmin, vmax),
                     mode="lines",
                     line=dict(color=NORMAL_LINE, width=0.5),
                     showlegend=False,
@@ -1775,7 +1875,7 @@ class Simulation:
                     ac = first_active[i]
                     road = self.network.roads[ac.road_id]
                     px, py = _rotate(*Network._cell_polygon(road, ac.start_s, ac.end_s, ac.lane))
-                    fill = MASK_FILL if ac.kind == "mask" else _rgba(_q_value(ac.density, ac.fd, q), vmin, vmax)
+                    fill = MASK_FILL if ac.kind == "mask" else _rgba(_q_value(ac.density_viz, ac.fd, q), vmin, vmax)
                     lcolor = MASK_LINE if ac.kind == "mask" else NORMAL_LINE
                 else:
                     px, py = [], []
@@ -1831,7 +1931,7 @@ class Simulation:
 
         # Base: density matrix (N_frames, N_base), then derive other quantities per cell
         base_rho = np.array([
-            [rs.network.get_cell(rid, cid).density for rid, cid, _px, _py, _fd in base_cells]
+            [rs.network.get_cell(rid, cid).density_viz for rid, cid, _px, _py, _fd in base_cells]
             for rs in self.rollout_results
         ])  # (N_frames, N_base)
 
@@ -2010,31 +2110,6 @@ class Simulation:
         """
         return RolloutRenderer(self, rotation_deg)
 
-    def current_state_dataframe(self) -> pd.DataFrame:
-        rows = []
-        for road_id, road in self.network.roads.items():
-            for cell_id, cell in road.cells.items():
-                rho = float(cell.density)
-                if cell.fd is None:
-                    raise ValueError(f"Cell {road_id}/{cell_id} has no FundamentalDiagram assigned.")
-                q = cell.fd.demand(rho)
-                v = cell.fd.velocity_from_density(rho)
-                rows.append(
-                    {
-                        "time": self.current_time,
-                        "road_id": road_id,
-                        "cell_id": cell_id,
-                        "lane": cell.lane,
-                        "start_s": cell.start_s,
-                        "end_s": cell.end_s,
-                        "length": cell.length,
-                        "density": rho,
-                        "flow": q,
-                        "velocity": v,
-                    }
-                )
-        return pd.DataFrame(rows)
-
     def rollout_dataframe(self) -> pd.DataFrame:
         rows = []
         for step in self.rollout_results:
@@ -2055,6 +2130,7 @@ class Simulation:
                             "start_s": cell.start_s,
                             "end_s": cell.end_s,
                             "length": cell.length,
+                            "mass": cell.mass,
                             "density": rho,
                             "flow": q,
                             "velocity": v,
@@ -2233,7 +2309,7 @@ class RolloutRenderer:
                 s_mids = [(c.start_s + c.end_s) / 2.0 for c in cells]
                 fds = [c.fd for c in cells]
                 rho_ts = np.array([
-                    [rs.network.get_cell(road.road_id, cid).density for cid in cell_ids]
+                    [rs.network.get_cell(road.road_id, cid).density_viz for cid in cell_ids]
                     for rs in sim.rollout_results
                 ])  # (N_frames, N_cells)
                 for version in ["sim", "empirical"]:
@@ -2447,6 +2523,10 @@ class I24MicroMask(ArbitraryMaskingCell):
         self.rear_flux_memory = rear_flux_memory
         self.front_flux_memory = front_flux_memory
 
+    @property
+    def mass(self):
+        return float(len(self.vehicles))
+
     def get_rear_vehicle(self):
         vehicle = None
         for new_vehicle_key in self.vehicles:
@@ -2461,13 +2541,36 @@ class I24MicroMask(ArbitraryMaskingCell):
                 vehicle = self.vehicles[new_vehicle_key]
         return vehicle
 
+    def get_rear_vehicles(self, region):
+        vehicles = []
+        for new_vehicle_key in self.vehicles:
+            if (self.vehicles[new_vehicle_key].s <= region):
+                vehicles.append(self.vehicles[new_vehicle_key])
+        return vehicles
+    
+    def get_front_vehicles(self, region):
+        vehicles = []
+        window_length = (self.margin_s * 2)
+        for new_vehicle_key in self.vehicles:
+            if (self.vehicles[new_vehicle_key].s >= (window_length - region)):
+                vehicles.append(self.vehicles[new_vehicle_key])
+        return vehicles
+
     def rear_boundary_flux(self, rho_exterior: float, fd_exterior: "FundamentalDiagram", sim_time: float, dt: float) -> float:
-        rear_vehicle = self.get_rear_vehicle()
         leaving_region = 1 / fd_exterior.rho_c
+        rear_vehicle = self.get_rear_vehicle()
         if rear_vehicle is not None:
             interior_s = rear_vehicle.s
             vehicle_leaving = (interior_s < leaving_region)
-            rho_interior = 1.0 / interior_s if not vehicle_leaving else fd_exterior.rho_c
+            if vehicle_leaving:
+                # Mass estimation
+                rear_vehicles = self.get_rear_vehicles(leaving_region)
+                mass = 0.0
+                for vehicle in rear_vehicles:
+                    mass += (vehicle.s / leaving_region)
+                rho_interior = min(mass / leaving_region, fd_exterior.rho_j)
+            else:
+                rho_interior = 1.0 / interior_s
             rear_velocity = rear_vehicle.s_dt
         else:
             interior_s = 2 * self.margin_s
@@ -2509,14 +2612,14 @@ class I24MicroMask(ArbitraryMaskingCell):
                 else:
                     p_star = rho_interior
 
-        net_flux = fd_exterior._flow(p_star) - (self.anchor_speed * p_star)
+        net_flux = (fd_exterior._flow(p_star) - (self.anchor_speed * p_star))
         rear_estimated_speed = fd_exterior._flow(p_star) / p_star
-        print(f"Rear Boundary rear_speed: {rear_velocity}, estimated_speed: {rear_estimated_speed} anchor_speed: {self.anchor_speed}, rho_exterior: {rho_exterior}, interior_s: {interior_s}, rho_interior: {rho_interior}, p_star: {p_star}, net_flux: {net_flux}, leaving: {vehicle_leaving}")
-        if (not vehicle_leaving):
-            net_flux = max(net_flux, 0.0)
-
+        #print(f"Rear Boundary rear_speed: {rear_velocity}, estimated_speed: {rear_estimated_speed} anchor_speed: {self.anchor_speed}, rho_exterior: {rho_exterior}, interior_s: {interior_s}, rho_interior: {rho_interior}, p_star: {p_star}, net_flux: {net_flux}, leaving: {vehicle_leaving}")
+        #if (not vehicle_leaving):
+        #    net_flux = max(net_flux, 0.0)
         self.rear_flux_memory += net_flux
         return net_flux
+        #return 0.0
 
     def front_boundary_flux(self, rho_exterior: float, fd_exterior: "FundamentalDiagram", sim_time: float, dt: float) -> float:
         front_vehicle = self.get_front_vehicle()
@@ -2525,7 +2628,14 @@ class I24MicroMask(ArbitraryMaskingCell):
         if front_vehicle is not None:
             interior_s = window_length - front_vehicle.s
             vehicle_leaving = (interior_s < leaving_region)
-            rho_interior = 1.0 / interior_s if not vehicle_leaving else fd_exterior.rho_c
+            if vehicle_leaving:
+                front_vehicles = self.get_front_vehicles(leaving_region)
+                mass = 0.0
+                for vehicle in front_vehicles:
+                    mass += ((window_length - vehicle.s) / leaving_region)
+                rho_interior = min(mass / leaving_region, fd_exterior.rho_j)
+            else:
+                rho_interior = 1.0 / interior_s
         else:
             interior_s = window_length
             rho_interior = 0.0
@@ -2565,13 +2675,14 @@ class I24MicroMask(ArbitraryMaskingCell):
                 else:
                     p_star = rho_exterior
 
-        net_flux = fd_exterior._flow(p_star) - (self.anchor_speed * p_star)
+        net_flux = (fd_exterior._flow(p_star) - (self.anchor_speed * p_star))
         #print(f"Front Boundary rho_exterior: {rho_exterior}, interior_s: {interior_s}, rho_interior: {rho_interior}, p_star: {p_star}, net_flux: {net_flux}, leaving: {vehicle_leaving}")
-        if (not vehicle_leaving):
-            net_flux = min(net_flux, 0.0)
+        #if (not vehicle_leaving):
+        #    net_flux = min(net_flux, 0.0)
 
         self.front_flux_memory += net_flux
         return net_flux
+        #return 0.0
 
     def render(self, rotate_fn) -> list:
         """Draw each vehicle in this lane as a filled rectangle."""
@@ -2622,11 +2733,15 @@ class I24MicroMask(ArbitraryMaskingCell):
         ))
         return traces
 
+    def update(self, sim_time: float, dt: float) -> float:
+        return self.anchor_speed
+
 # =========================
 # Example usage
 # =========================
 
 if __name__ == "__main__":
+
     # sim = Simulation.from_json(
     #     json_path="network.json",
     #     time_resolution=1.0,

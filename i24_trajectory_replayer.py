@@ -46,6 +46,7 @@ class I24TrajectoryReplayer:
         self.motion_data = motion_data
         self.lanes = lanes
         self.dt = float(dt)
+        self.current_anchor_speed = None
 
     def get_lane_dfs(self, timestamp_min, timestamp_max, s_min, s_max):
         df = self.motion_data.micro_df
@@ -114,7 +115,7 @@ class I24TrajectoryReplayer:
 
                 # Track the vehicle closest to middle_s as the window anchor
                 dist = abs(s_abs - middle_s)
-                if dist < anchor_dist and len(group) >= 2:
+                if dist < anchor_dist and len(group) >= 2 and (s_abs > middle_s):
                     ds = float(group["s"].iloc[-1]) - float(group["s"].iloc[0])
                     dt_obs = float(group["time"].iloc[-1]) - float(group["time"].iloc[0])
                     if dt_obs > 1e-9:
@@ -123,7 +124,9 @@ class I24TrajectoryReplayer:
 
         bridge.update_vehicles(vehicles)
         bridge.anchor_speed = anchor_speed
-        return self._compute_next_middle_s(middle_s, anchor_speed)
+        result = self._compute_next_middle_s(middle_s, self.current_anchor_speed if self.current_anchor_speed is not None else anchor_speed)
+        self.current_anchor_speed = anchor_speed
+        return result
 
     # ------------------------------------------------------------------
 

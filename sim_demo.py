@@ -192,6 +192,31 @@ def run_app(
 
     app.run(host=host, port=port, debug=debug)
 
+"""
+with open("i24_motion_to_dataset.json", "r") as f:
+    config = json.load(f)
+
+sim = Simulation.from_json(
+    json_path=os.path.join(config["storage_locations"]["simulation_dataset"], "network.json"),
+    time_resolution=config["time_step"],
+    origin_time=config["time_origin"],
+    min_cell_length=100.0
+)
+
+gt = GroundTruthStore.from_parquet(os.path.join(config["storage_locations"]["simulation_dataset"], "micro.parquet"), os.path.join(config["storage_locations"]["simulation_dataset"], "macro.parquet"))
+sim.initialize_from_ground_truth(gt, time_value=config["time_origin"])
+replayer = I24TrajectoryReplayer(gt, dt=1.0, lanes=[-1, -2, -3, -4])
+bridge = I24MicroSimBridge(
+    sim=sim,
+    road_id="2",
+    lanes=[-1, -2, -3, -4],
+    initial_middle_s=150.0,
+    margin_s=150.0,
+    max_middle_s=1450,
+    update_micro_callback=replayer.step,
+    bridge_callback_name="bridge_step"
+)
+"""
 
 def run_demo():
     with open("i24_motion_to_dataset.json", "r") as f:
@@ -207,13 +232,14 @@ def run_demo():
     gt = GroundTruthStore.from_parquet(os.path.join(config["storage_locations"]["simulation_dataset"], "micro.parquet"), os.path.join(config["storage_locations"]["simulation_dataset"], "macro.parquet"))
     sim.initialize_from_ground_truth(gt, time_value=config["time_origin"])
     replayer = I24TrajectoryReplayer(gt, dt=1.0, lanes=[-1, -2, -3, -4])
+    
     bridge = I24MicroSimBridge(
         sim=sim,
         road_id="2",
         lanes=[-1, -2, -3, -4],
-        initial_middle_s=150.0,
+        initial_middle_s=350.0,
         margin_s=150.0,
-        max_middle_s=1450,
+        max_middle_s=1300,
         update_micro_callback=replayer.step,
         bridge_callback_name="bridge_step"
     )
@@ -231,7 +257,7 @@ def run_demo():
                 sim=sim,
                 road_id="2",
                 lanes=[-1, -2, -3, -4],
-                initial_middle_s=150.0,
+                initial_middle_s=350.0,
                 margin_s=150.0,
                 max_middle_s=1450,
                 update_micro_callback=replayer.step,

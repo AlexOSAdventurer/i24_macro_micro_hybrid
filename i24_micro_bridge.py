@@ -62,6 +62,11 @@ class I24MicroSimBridge:
         self.vehicles: Dict[str, Vehicle] = {}
         self.anchor_speed = 0.0
 
+        self.bridge_callback_name = bridge_callback_name
+        sim.register_step_callback(partial(I24MicroSimBridge._step, self), bridge_callback_name)
+        self.update_micro_callback = update_micro_callback
+        self.update_micro_callback(self)
+        self.middle_s = float(initial_middle_s) # Cringe to patch it like this, but eh.
         # Create one mask per lane and register with the simulation
         for lane in self.lanes:
             mask = I24MicroMask(
@@ -75,10 +80,8 @@ class I24MicroSimBridge:
                 rear_flux_memory=0.0,
                 front_flux_memory=0.0
             )
+            mask.vehicles = {vehicle: self.vehicles[vehicle] for vehicle in self.vehicles if self.vehicles[vehicle].lane == lane}
             sim.add_masking_cell(mask)
-        self.bridge_callback_name = bridge_callback_name
-        sim.register_step_callback(partial(I24MicroSimBridge._step, self), bridge_callback_name)
-        self.update_micro_callback = update_micro_callback
 
 
     # ------------------------------------------------------------------
@@ -130,4 +133,8 @@ class I24MicroSimBridge:
             self.running = False
             for lane in self.lanes:
                 del self.sim.masking_cells[self._mask_id(lane)]
+            for road_id, cell_id in self.sim.network.all_cell_keys():
+                cell = self.sim.network.get_cell(road_id, cell_id)
+                cell.mass += cell.mask_mass
+                cell.mask_mass = 0
             self.sim.unregister_step_callback(self.bridge_callback_name)
