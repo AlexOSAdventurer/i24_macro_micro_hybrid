@@ -2562,6 +2562,8 @@ class I24MicroMask(ArbitraryMaskingCell):
         if rear_vehicle is not None:
             interior_s = rear_vehicle.s
             vehicle_leaving = (interior_s < leaving_region)
+            vehicle_velocity = rear_vehicle.s_dt
+            """
             if vehicle_leaving:
                 # Mass estimation
                 rear_vehicles = self.get_rear_vehicles(leaving_region)
@@ -2571,12 +2573,27 @@ class I24MicroMask(ArbitraryMaskingCell):
                 rho_interior = min(mass / leaving_region, fd_exterior.rho_j)
             else:
                 rho_interior = 1.0 / interior_s
-            rear_velocity = rear_vehicle.s_dt
+            """
+            """
+            if vehicle_leaving:
+                rho_interior = min(interior_s / leaving_region, fd_exterior.rho_j)
+            else:
+                rho_interior = 0.0
+            """
+            if vehicle_leaving:
+                # Mass estimation
+                rear_vehicles = self.get_rear_vehicles(leaving_region)
+                mass = 0.0
+                for vehicle in rear_vehicles:
+                    mass += 1.0
+                rho_interior = min(mass / leaving_region, fd_exterior.rho_j)
+            else:
+                rho_interior = 1.0 / interior_s
         else:
             interior_s = 2 * self.margin_s
             vehicle_leaving = False
             rho_interior = 0.0
-            rear_velocity = 0
+            vehicle_velocity = 0
 
         if isinstance(fd_exterior, GreenshieldsFD):            
             p_star = None
@@ -2617,6 +2634,10 @@ class I24MicroMask(ArbitraryMaskingCell):
         #print(f"Rear Boundary rear_speed: {rear_velocity}, estimated_speed: {rear_estimated_speed} anchor_speed: {self.anchor_speed}, rho_exterior: {rho_exterior}, interior_s: {interior_s}, rho_interior: {rho_interior}, p_star: {p_star}, net_flux: {net_flux}, leaving: {vehicle_leaving}")
         #if (not vehicle_leaving):
         #    net_flux = max(net_flux, 0.0)
+        #if vehicle_leaving:
+        #    vehicle_based_net_flux = (vehicle_velocity - self.anchor_speed) * p_star
+        #    net_flux = min(net_flux, vehicle_based_net_flux)
+
         self.rear_flux_memory += net_flux
         return net_flux
         #return 0.0
@@ -2628,6 +2649,8 @@ class I24MicroMask(ArbitraryMaskingCell):
         if front_vehicle is not None:
             interior_s = window_length - front_vehicle.s
             vehicle_leaving = (interior_s < leaving_region)
+            vehicle_velocity = front_vehicle.s_dt
+            """
             if vehicle_leaving:
                 front_vehicles = self.get_front_vehicles(leaving_region)
                 mass = 0.0
@@ -2636,9 +2659,23 @@ class I24MicroMask(ArbitraryMaskingCell):
                 rho_interior = min(mass / leaving_region, fd_exterior.rho_j)
             else:
                 rho_interior = 1.0 / interior_s
+            """
+            if vehicle_leaving:
+                rho_interior = min(interior_s / leaving_region, fd_exterior.rho_j)
+            else:
+                rho_interior = 0.0
+            if vehicle_leaving:
+                front_vehicles = self.get_front_vehicles(leaving_region)
+                mass = 0.0
+                for vehicle in front_vehicles:
+                    mass += 1.0
+                rho_interior = min(mass / leaving_region, fd_exterior.rho_j)
+            else:
+                rho_interior = 1.0 / interior_s
         else:
             interior_s = window_length
             rho_interior = 0.0
+            vehicle_velocity = 0.0
             vehicle_leaving = False
     
         if isinstance(fd_exterior, GreenshieldsFD):
@@ -2679,6 +2716,9 @@ class I24MicroMask(ArbitraryMaskingCell):
         #print(f"Front Boundary rho_exterior: {rho_exterior}, interior_s: {interior_s}, rho_interior: {rho_interior}, p_star: {p_star}, net_flux: {net_flux}, leaving: {vehicle_leaving}")
         #if (not vehicle_leaving):
         #    net_flux = min(net_flux, 0.0)
+        #if vehicle_leaving:
+        #    vehicle_based_net_flux = (vehicle_velocity - self.anchor_speed) * p_star
+        #    net_flux = min(net_flux, vehicle_based_net_flux)
 
         self.front_flux_memory += net_flux
         return net_flux

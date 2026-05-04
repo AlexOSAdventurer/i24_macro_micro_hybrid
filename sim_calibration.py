@@ -47,7 +47,7 @@ def run_calibration(trial):
         update_micro_callback=replayer.step,
         bridge_callback_name="bridge_step"
     )
-    bridge_time_window = 180.0 #1080.0
+    bridge_time_window = 1080.0
     current_bridge_iteration = 1.0
 
     rear_flux_entry = []
