@@ -19,7 +19,7 @@ def run_calibration(trial):
     v_f = trial.suggest_float("v_f", 30.0, 50.0)
     rho_j = trial.suggest_float("rho_j", 0.07, 0.15)
     lambda_lc = trial.suggest_float("lambda_lc", 0.05, 0.2)
-    w = trial.suggest_float("w", 3.0, 8.0)
+    w = trial.suggest_float("w", 5.0, 8.0)
     sim_data = I24SimulationData()
     sim_data.network_generator = I24WestAndEastNetwork(TriangularFD(v_f, w, rho_j), lambda_lc)
     sim_data.network_generator.create_network(sim_data.config["road_data"]["2"]["road_length"], sim_data.config["road_data"]["2"]["cell_length"], sim_data.config["road_data"]["2"]["lanes"], lane_width=sim_data.config["road_data"]["2"]["lane_width"])

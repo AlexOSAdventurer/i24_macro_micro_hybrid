@@ -1256,6 +1256,10 @@ class FundamentalDiagram(ABC):
     def velocity_from_density(self, rho: float) -> float:
         raise NotImplementedError
 
+    @abstractmethod
+    def density_from_velocity(self, v: float) -> float:
+        raise NotImplementedError
+
 
 @dataclass
 class TriangularFD(FundamentalDiagram):
@@ -1289,8 +1293,16 @@ class TriangularFD(FundamentalDiagram):
         return min(self.capacity, self.w * max(self.rho_j - rho, 0.0))
 
     def velocity_from_density(self, rho: float) -> float:
-        q = self.demand(rho)
+        q = self._flow(rho)
         return q / rho if rho > 1e-12 else self.v_f
+
+    def density_from_velocity(self, v: float) -> float:
+        if (v >= self.v_f):
+            return self.rho_c
+        elif (v >= 0.0):
+            return (self.w * self.rho_j) / (v + self.w)
+        else:
+            return self.rho_j
     
     def shock_speed(self, rho_left: float, rho_right: float) -> float:
         if ((rho_left <= rho_right) and (rho_right <= self.rho_c)):
@@ -1298,7 +1310,7 @@ class TriangularFD(FundamentalDiagram):
         elif ((self.rho_c <= rho_left) and (rho_left <= rho_right)):
             return -self.w
         else:
-            return ((self.w * (self.rho_j - rho_right)) - (self.v_f * rho_left)) / (rho_right - rho_left)
+            return ((self.w * (self.rho_j - rho_right)) - (self.v_f * rho_left)) / ((rho_right - rho_left) + 1e-12)
 
 @dataclass
 class GreenshieldsFD(FundamentalDiagram):
@@ -1336,6 +1348,14 @@ class GreenshieldsFD(FundamentalDiagram):
     def velocity_from_density(self, rho: float) -> float:
         q = self._flow(max(0.0, min(rho, self.rho_j)))
         return q / rho if rho > 1e-12 else self.v_f
+    
+    def density_from_velocity(self, v: float) -> float:
+        if (v >= self.v_f):
+            return 0.0
+        elif (v >= 0.0):
+            return self.rho_j * (1.0 - (v/self.v_f))
+        else:
+            return self.rho_j
     
     def sonic_point(self, y: float) -> float:
         return ((self.v_f - y) * self.rho_j) / (2 * self.v_f)
@@ -2563,30 +2583,9 @@ class I24MicroMask(ArbitraryMaskingCell):
             interior_s = rear_vehicle.s
             vehicle_leaving = (interior_s < leaving_region)
             vehicle_velocity = rear_vehicle.s_dt
-            """
+
             if vehicle_leaving:
-                # Mass estimation
-                rear_vehicles = self.get_rear_vehicles(leaving_region)
-                mass = 0.0
-                for vehicle in rear_vehicles:
-                    mass += (vehicle.s / leaving_region)
-                rho_interior = min(mass / leaving_region, fd_exterior.rho_j)
-            else:
-                rho_interior = 1.0 / interior_s
-            """
-            """
-            if vehicle_leaving:
-                rho_interior = min(interior_s / leaving_region, fd_exterior.rho_j)
-            else:
-                rho_interior = 0.0
-            """
-            if vehicle_leaving:
-                # Mass estimation
-                rear_vehicles = self.get_rear_vehicles(leaving_region)
-                mass = 0.0
-                for vehicle in rear_vehicles:
-                    mass += 1.0
-                rho_interior = min(mass / leaving_region, fd_exterior.rho_j)
+                rho_interior = fd_exterior.density_from_velocity(vehicle_velocity)
             else:
                 rho_interior = 1.0 / interior_s
         else:
@@ -2631,12 +2630,6 @@ class I24MicroMask(ArbitraryMaskingCell):
 
         net_flux = (fd_exterior._flow(p_star) - (self.anchor_speed * p_star))
         rear_estimated_speed = fd_exterior._flow(p_star) / p_star
-        #print(f"Rear Boundary rear_speed: {rear_velocity}, estimated_speed: {rear_estimated_speed} anchor_speed: {self.anchor_speed}, rho_exterior: {rho_exterior}, interior_s: {interior_s}, rho_interior: {rho_interior}, p_star: {p_star}, net_flux: {net_flux}, leaving: {vehicle_leaving}")
-        #if (not vehicle_leaving):
-        #    net_flux = max(net_flux, 0.0)
-        #if vehicle_leaving:
-        #    vehicle_based_net_flux = (vehicle_velocity - self.anchor_speed) * p_star
-        #    net_flux = min(net_flux, vehicle_based_net_flux)
 
         self.rear_flux_memory += net_flux
         return net_flux
@@ -2650,26 +2643,8 @@ class I24MicroMask(ArbitraryMaskingCell):
             interior_s = window_length - front_vehicle.s
             vehicle_leaving = (interior_s < leaving_region)
             vehicle_velocity = front_vehicle.s_dt
-            """
             if vehicle_leaving:
-                front_vehicles = self.get_front_vehicles(leaving_region)
-                mass = 0.0
-                for vehicle in front_vehicles:
-                    mass += ((window_length - vehicle.s) / leaving_region)
-                rho_interior = min(mass / leaving_region, fd_exterior.rho_j)
-            else:
-                rho_interior = 1.0 / interior_s
-            """
-            if vehicle_leaving:
-                rho_interior = min(interior_s / leaving_region, fd_exterior.rho_j)
-            else:
-                rho_interior = 0.0
-            if vehicle_leaving:
-                front_vehicles = self.get_front_vehicles(leaving_region)
-                mass = 0.0
-                for vehicle in front_vehicles:
-                    mass += 1.0
-                rho_interior = min(mass / leaving_region, fd_exterior.rho_j)
+                rho_interior = fd_exterior.density_from_velocity(vehicle_velocity)
             else:
                 rho_interior = 1.0 / interior_s
         else:
@@ -2713,13 +2688,6 @@ class I24MicroMask(ArbitraryMaskingCell):
                     p_star = rho_exterior
 
         net_flux = (fd_exterior._flow(p_star) - (self.anchor_speed * p_star))
-        #print(f"Front Boundary rho_exterior: {rho_exterior}, interior_s: {interior_s}, rho_interior: {rho_interior}, p_star: {p_star}, net_flux: {net_flux}, leaving: {vehicle_leaving}")
-        #if (not vehicle_leaving):
-        #    net_flux = min(net_flux, 0.0)
-        #if vehicle_leaving:
-        #    vehicle_based_net_flux = (vehicle_velocity - self.anchor_speed) * p_star
-        #    net_flux = min(net_flux, vehicle_based_net_flux)
-
         self.front_flux_memory += net_flux
         return net_flux
         #return 0.0
