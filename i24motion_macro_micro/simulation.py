@@ -2377,7 +2377,13 @@ class RolloutRenderer:
         if key not in self.ts_data:
             return go.Figure()
         entry = self.ts_data[key]
-        vmin, vmax = self.ranges[quantity]
+        #vmin, vmax = self.ranges[quantity]
+        if (quantity == "density"):
+            vmin, vmax = 0.0, 0.20
+        elif (quantity == "velocity"):
+            vmin, vmax = 0.0, 60.0
+        elif (quantity == "flow"):
+            vmin, vmax = 0.0, 12.0
         z = entry[quantity].T  # (N_cells, N_frames)
         fig = go.Figure(go.Heatmap(
             x=self.sim_times,

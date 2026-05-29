@@ -1,7 +1,7 @@
 """Verify conservation with a moving mask: dM_macro should equal
    external_in − external_out + GT_overwrite − mass_into_mask."""
 import os, sys, json
-sys.path.insert(0, "/home/richarwa/SecondSSD/I24/i24_macroscopic")
+sys.path.insert(0, ".")
 
 import simulation as S
 from simulation import Simulation, GroundTruthStore

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from simulation import Simulation, RolloutRenderer, GroundTruthStore
 from i24_trajectory_replayer import I24TrajectoryReplayer
+from i24_carla_coupler import I24CarlaCoupler
 from i24_micro_bridge import I24MicroSimBridge
 from dash import Dash, dcc, html, Input, Output, State, callback
 import plotly.graph_objects as go
@@ -218,7 +219,7 @@ bridge = I24MicroSimBridge(
 )
 """
 
-def run_demo():
+def run_demo_open_loop():
     with open("i24_motion_to_dataset.json", "r") as f:
         config = json.load(f)
 
@@ -240,10 +241,10 @@ def run_demo():
         initial_middle_s=350.0,
         margin_s=150.0,
         max_middle_s=1300,
-        update_micro_callback=replayer.step,
+        micro_coupler=replayer,
         bridge_callback_name="bridge_step"
     )
-    bridge_time_window = 180.0 #360.0 #1080.0
+    bridge_time_window = 1800.0 #360.0 #1080.0
     current_bridge_iteration = 1.0
     def update_bridge_callback(current_time, resolution):
         nonlocal bridge
@@ -260,7 +261,63 @@ def run_demo():
                 initial_middle_s=350.0,
                 margin_s=150.0,
                 max_middle_s=1450,
-                update_micro_callback=replayer.step,
+                micro_coupler=replayer,
+                bridge_callback_name="bridge_step"
+            )
+            #bridge._step(sim.current_time, sim.time_resolution)
+            print("Bridge reset!")
+            current_bridge_iteration += 1
+    sim.register_step_callback(update_bridge_callback, "bridge_restart")
+    for i in range(3599):
+        sim.step()
+    run_app(sim, rotation_deg=82.8192)
+
+def run_demo_carla():
+    with open("i24_motion_to_dataset.json", "r") as f:
+        config = json.load(f)
+
+    sim = Simulation.from_json(
+        json_path=os.path.join(config["storage_locations"]["simulation_dataset"], "network.json"),
+        time_resolution=config["time_step"],
+        origin_time=config["time_origin"],
+        min_cell_length=100.0
+    )
+
+    gt = GroundTruthStore.from_parquet(os.path.join(config["storage_locations"]["simulation_dataset"], "micro.parquet"), os.path.join(config["storage_locations"]["simulation_dataset"], "macro.parquet"))
+    sim.initialize_from_ground_truth(gt, time_value=config["time_origin"])
+    coupler = I24CarlaCoupler(gt, dt=1.0, lanes=[-1, -2, -3, -4], mapping=config, hero_road="2", desired_time=config["time_origin"], desired_s=350.0, visible_window=150.0, ghost_window=0.0)
+    
+    bridge = I24MicroSimBridge(
+        sim=sim,
+        road_id="2",
+        lanes=[-1, -2, -3, -4],
+        initial_middle_s=350.0,
+        margin_s=150.0,
+        max_middle_s=1300,
+        micro_coupler=coupler,
+        update_micro_callback=coupler.step,
+        bridge_callback_name="bridge_step"
+    )
+    bridge_time_window = 1800.0 #360.0 #1080.0
+    current_bridge_iteration = 1.0
+    def update_bridge_callback(current_time, resolution):
+        nonlocal bridge
+        nonlocal bridge_time_window
+        nonlocal current_bridge_iteration
+        nonlocal sim
+        if ((current_time - sim.origin_time) >= (bridge_time_window * current_bridge_iteration)):
+            print("Resetting bridge!")
+            bridge.destroy()
+            coupler = I24CarlaCoupler(gt, dt=1.0, lanes=[-1, -2, -3, -4], mapping=config, hero_road="2", desired_time=sim.current_time, desired_s=350.0, visible_window=150.0, ghost_window=0.0)
+            bridge = I24MicroSimBridge(
+                sim=sim,
+                road_id="2",
+                lanes=[-1, -2, -3, -4],
+                initial_middle_s=350.0,
+                margin_s=150.0,
+                max_middle_s=1450,
+                micro_coupler=coupler,
+                update_micro_callback=coupler.step,
                 bridge_callback_name="bridge_step"
             )
             #bridge._step(sim.current_time, sim.time_resolution)
@@ -272,4 +329,4 @@ def run_demo():
     run_app(sim, rotation_deg=82.8192)
 
 if __name__ == "__main__":
-    run_demo()
+    run_demo_open_loop()

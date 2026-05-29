@@ -13,7 +13,7 @@ Two checks per step:
    Surfaces which cells silently lost (or gained) mass during the step.
 """
 import os, sys, json
-sys.path.insert(0, "/home/richarwa/SecondSSD/I24/i24_macroscopic")
+sys.path.insert(0, ".")
 
 import simulation as S
 from simulation import Simulation, GroundTruthStore

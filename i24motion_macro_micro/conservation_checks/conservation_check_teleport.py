@@ -16,7 +16,7 @@ We instrument:
   - the macro-conservation leak (using mask2's ledger).
 """
 import os, sys, json
-sys.path.insert(0, "/home/richarwa/SecondSSD/I24/i24_macroscopic")
+sys.path.insert(0, ".")
 
 import simulation as S
 from simulation import Simulation, GroundTruthStore, ConservativeRemapper

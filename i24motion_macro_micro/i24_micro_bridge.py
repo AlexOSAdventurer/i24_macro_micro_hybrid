@@ -43,7 +43,7 @@ class I24MicroSimBridge:
         initial_middle_s: float,
         max_middle_s: float,
         margin_s: float,
-        update_micro_callback=None,
+        micro_coupler=None,
         bridge_callback_name=None
     ) -> None:
         self.sim = sim
@@ -64,9 +64,10 @@ class I24MicroSimBridge:
 
         self.bridge_callback_name = bridge_callback_name
         sim.register_step_callback(partial(I24MicroSimBridge._step, self), bridge_callback_name)
-        self.update_micro_callback = update_micro_callback
-        self.update_micro_callback(self)
-        self.middle_s = float(initial_middle_s) # Cringe to patch it like this, but eh.
+        self.micro_coupler = micro_coupler
+        self.micro_coupler.bridge = self
+        self.middle_s = self.micro_coupler.step()
+        #self.middle_s = float(initial_middle_s) # Cringe to patch it like this, but eh.
         # Create one mask per lane and register with the simulation
         for lane in self.lanes:
             mask = I24MicroMask(
@@ -105,7 +106,7 @@ class I24MicroSimBridge:
             self.flow_memory_rear[lane] = lane_cells[lane].rear_flux_memory
             self.flow_memory_front[lane] = lane_cells[lane].front_flux_memory
 
-        self.middle_s = self.update_micro_callback(self)
+        self.middle_s = self.micro_coupler.step()
         if self.middle_s >= self.max_middle_s:
             self.destroy()
             return
@@ -138,3 +139,4 @@ class I24MicroSimBridge:
                 cell.mass += cell.mask_mass
                 cell.mask_mass = 0
             self.sim.unregister_step_callback(self.bridge_callback_name)
+            self.micro_coupler.destroy()

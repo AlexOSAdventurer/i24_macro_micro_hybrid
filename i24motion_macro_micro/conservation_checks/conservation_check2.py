@@ -1,6 +1,6 @@
 """Check mass conservation more rigorously: compare dM to net boundary flux."""
 import os, sys, json
-sys.path.insert(0, "/home/richarwa/SecondSSD/I24/i24_macroscopic")
+sys.path.insert(0, ".")
 
 import simulation as S
 from simulation import Simulation, GroundTruthStore
@@ -25,7 +25,7 @@ Simulation._compute_active_edge_flows = patched_compute
 # Also patch boundary GT overwrite to a no-op so we can compare cleanly.
 S.GroundTruthStore.apply_density_snapshot_to_network_boundaries = lambda self, network, t, tolerance=1e-1: None
 
-with open("/home/richarwa/SecondSSD/I24/i24_macroscopic/i24_motion_to_dataset.json") as f:
+with open("./i24_motion_to_dataset.json") as f:
     config = json.load(f)
 
 sim = Simulation.from_json(

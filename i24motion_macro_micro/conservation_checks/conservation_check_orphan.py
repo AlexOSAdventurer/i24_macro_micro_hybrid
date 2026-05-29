@@ -6,7 +6,7 @@ base_to_active), check every base cell whose mask coverage went from
 that orphaned mass and compare against the macro-conservation leak.
 """
 import os, sys, json
-sys.path.insert(0, "/home/richarwa/SecondSSD/I24/i24_macroscopic")
+sys.path.insert(0, ".")
 
 import simulation as S
 from simulation import Simulation, GroundTruthStore, ConservativeRemapper

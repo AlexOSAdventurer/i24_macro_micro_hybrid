@@ -1,6 +1,6 @@
 """With GT boundary overwrite enabled (production path) — isolate its effect."""
 import os, sys, json
-sys.path.insert(0, "/home/richarwa/SecondSSD/I24/i24_macroscopic")
+sys.path.insert(0, ".")
 
 from simulation import Simulation, GroundTruthStore
 

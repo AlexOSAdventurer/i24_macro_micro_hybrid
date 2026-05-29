@@ -5,7 +5,7 @@ Expected change per step = ext_in*dt - ext_out*dt + GT_overwrite_delta_total.
 The bridge can also add/remove vehicles (discrete domain), so we report that too.
 """
 import os, sys, json
-sys.path.insert(0, "/home/richarwa/SecondSSD/I24/i24_macroscopic")
+sys.path.insert(0, ".")
 
 import simulation as S
 from simulation import Simulation, GroundTruthStore
@@ -43,7 +43,7 @@ def patched_overwrite(self, network, t, tolerance=1e-1):
     overwrite_deltas.append(boundary_total_mass(network) - before)
 S.GroundTruthStore.apply_density_snapshot_to_network_boundaries = patched_overwrite
 
-with open("/home/richarwa/SecondSSD/I24/i24_macroscopic/i24_motion_to_dataset.json") as f:
+with open("./i24_motion_to_dataset.json") as f:
     config = json.load(f)
 sim = Simulation.from_json(
     json_path=os.path.join(config["storage_locations"]["simulation_dataset"], "network.json"),
@@ -61,7 +61,7 @@ replayer = I24TrajectoryReplayer(gt, dt=1.0, lanes=[-1, -2, -3, -4])
 bridge = I24MicroSimBridge(
     sim=sim, road_id="2", lanes=[-1, -2, -3, -4],
     initial_middle_s=375.0, margin_s=150.0, max_middle_s=1450,
-    update_micro_callback=replayer.step, bridge_callback_name="bridge_step",
+    micro_coupler=replayer, bridge_callback_name="bridge_step",
 )
 
 dt = sim.time_resolution

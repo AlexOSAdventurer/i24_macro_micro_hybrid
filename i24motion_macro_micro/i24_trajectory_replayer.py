@@ -46,7 +46,9 @@ class I24TrajectoryReplayer:
         self.motion_data = motion_data
         self.lanes = lanes
         self.dt = float(dt)
+        self.bridge = None # Set by the bridge itself
         self.current_anchor_speed = None
+        self.initialized = False
 
     def get_lane_dfs(self, timestamp_min, timestamp_max, s_min, s_max):
         df = self.motion_data.micro_df
@@ -62,7 +64,7 @@ class I24TrajectoryReplayer:
     # Bridge callback — called each step with the bridge as argument
     # ------------------------------------------------------------------
 
-    def step(self, bridge: "I24MicroSimBridge") -> float:
+    def step(self) -> float:
         """Query empirical vehicles for this timestep, update the bridge,
         and return the new window centre position.
 
@@ -72,9 +74,9 @@ class I24TrajectoryReplayer:
 
         This method is passed directly as bridge.update_micro_callback.
         """
-        sim_time = bridge.sim.current_time
-        middle_s = bridge.middle_s
-        margin_s = bridge.margin_s
+        sim_time = self.bridge.sim.current_time
+        middle_s = self.bridge.middle_s
+        margin_s = self.bridge.margin_s
         s_min = middle_s - margin_s
         s_max = middle_s + margin_s
 
@@ -122,11 +124,15 @@ class I24TrajectoryReplayer:
                         anchor_dist = dist
                         anchor_speed = ds / dt_obs
 
-        bridge.update_vehicles(vehicles)
-        bridge.anchor_speed = anchor_speed
+        self.bridge.update_vehicles(vehicles)
+        self.bridge.anchor_speed = anchor_speed
         result = self._compute_next_middle_s(middle_s, self.current_anchor_speed if self.current_anchor_speed is not None else anchor_speed)
         self.current_anchor_speed = anchor_speed
-        return result
+        if self.initialized:
+            return result
+        else:
+            self.initialized = True
+            return middle_s
 
     # ------------------------------------------------------------------
 
@@ -140,3 +146,6 @@ class I24TrajectoryReplayer:
         if anchor_speed is None:
             return middle_s
         return middle_s + anchor_speed * self.dt
+
+    def destroy(self):
+        pass
