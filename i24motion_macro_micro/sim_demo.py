@@ -295,7 +295,6 @@ def run_demo_carla():
         margin_s=150.0,
         max_middle_s=1300,
         micro_coupler=coupler,
-        update_micro_callback=coupler.step,
         bridge_callback_name="bridge_step"
     )
     bridge_time_window = 1800.0 #360.0 #1080.0
@@ -317,7 +316,6 @@ def run_demo_carla():
                 margin_s=150.0,
                 max_middle_s=1450,
                 micro_coupler=coupler,
-                update_micro_callback=coupler.step,
                 bridge_callback_name="bridge_step"
             )
             #bridge._step(sim.current_time, sim.time_resolution)
@@ -329,4 +327,4 @@ def run_demo_carla():
     run_app(sim, rotation_deg=82.8192)
 
 if __name__ == "__main__":
-    run_demo_open_loop()
+    run_demo_carla()

@@ -857,6 +857,12 @@ class ActiveNetwork:
                 outflow_neighbors=ac.outflow_neighbors,
             )
         return snap
+    
+    def get_cell_with_mask(self, mask_id):
+        for aid, ac in self.active_cells.items():
+            if ac.mask_id == mask_id:
+                return ac
+        return None
 
     def lateral_delta_density(self, dt: float) -> Dict[str, float]:
         """Compute per-cell density deltas from lateral lane exchange.
@@ -1473,6 +1479,7 @@ class Simulation:
         min_cell_length: Optional[float] = None,
     ):
         self.network = network
+        self.active = None
         self.time_resolution = float(time_resolution)
         self.origin_time = float(origin_time)
         self.current_time = float(origin_time)
@@ -1738,12 +1745,12 @@ class Simulation:
         for cb in callbacks:
             self._step_callbacks[cb](self.current_time, self.time_resolution)
         self._update_masks()
-        active = self._build_active_network()
-        self.rollout_results[-1].active_network = active.snapshot()
+        self.active = self._build_active_network()
+        self.rollout_results[-1].active_network = self.active.snapshot()
         if self.masking_cells:
             self.rollout_results[-1].mask_snapshots = dict(self.masking_cells)
-        self._step_active_network(active)
-        ConservativeRemapper.move_active_masks(self, active)
+        self._step_active_network(self.active)
+        ConservativeRemapper.move_active_masks(self, self.active)
         """
         for ac in active.active_cells.values():
             if ac.kind == "mask" or ac.fd is None or ac.length <= 1e-12:
@@ -1752,15 +1759,20 @@ class Simulation:
             rho = max(0.0, min(rho, ac.fd.rho_j * 2.0))
             ac.mass = float(rho * ac.length)
         """
-        ConservativeRemapper.active_to_base(self.network, active)
+        ConservativeRemapper.active_to_base(self.network, self.active)
         self.current_time += self.time_resolution
         self.gt_store.apply_density_snapshot_to_network_boundaries(self.network, self.current_time)
         #print(self.current_time)
 
-    def run(self, duration: float) -> None:
+    def run(self, duration: float, initialize=True) -> None:
         if duration < 0.0:
             raise ValueError("duration must be non-negative.")
         num_steps = int(np.round(duration / self.time_resolution))
+        if initialize:
+            callbacks = [cb for cb in self._step_callbacks]
+            for cb in callbacks:
+                self._step_callbacks[cb](self.current_time, self.time_resolution)
+            self.active = self._build_active_network()
         for _ in range(num_steps):
             self.step()
 

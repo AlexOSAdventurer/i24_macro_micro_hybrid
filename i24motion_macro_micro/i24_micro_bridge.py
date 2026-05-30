@@ -53,6 +53,7 @@ class I24MicroSimBridge:
         self.max_middle_s = float(max_middle_s)
         self.running = True
         self.margin_s = float(margin_s)
+        self.initialized = False
         self.flow_memory_rear = {
             lane: 0.0 for lane in lanes
         }
@@ -66,24 +67,6 @@ class I24MicroSimBridge:
         sim.register_step_callback(partial(I24MicroSimBridge._step, self), bridge_callback_name)
         self.micro_coupler = micro_coupler
         self.micro_coupler.bridge = self
-        self.middle_s = self.micro_coupler.step()
-        #self.middle_s = float(initial_middle_s) # Cringe to patch it like this, but eh.
-        # Create one mask per lane and register with the simulation
-        for lane in self.lanes:
-            mask = I24MicroMask(
-                mask_id=self._mask_id(lane),
-                network=sim.network,
-                road_id=road_id,
-                lane=lane,
-                middle_s=self.middle_s,
-                margin_s=self.margin_s,
-                anchor_speed=0.0,
-                rear_flux_memory=0.0,
-                front_flux_memory=0.0
-            )
-            mask.vehicles = {vehicle: self.vehicles[vehicle] for vehicle in self.vehicles if self.vehicles[vehicle].lane == lane}
-            sim.add_masking_cell(mask)
-
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -99,12 +82,15 @@ class I24MicroSimBridge:
         """
         if not self.running:
             return
-        lane_cells = {
-            lane: self.sim.masking_cells[self._mask_id(lane)] for lane in self.lanes
-        }
-        for lane in lane_cells:
-            self.flow_memory_rear[lane] = lane_cells[lane].rear_flux_memory
-            self.flow_memory_front[lane] = lane_cells[lane].front_flux_memory
+        if self.initialized:
+            lane_cells = {
+                lane: self.sim.masking_cells[self._mask_id(lane)] for lane in self.lanes
+            }
+            for lane in lane_cells:
+                self.flow_memory_rear[lane] = lane_cells[lane].rear_flux_memory
+                self.flow_memory_front[lane] = lane_cells[lane].front_flux_memory
+        else:
+            self.initialized = True
 
         self.middle_s = self.micro_coupler.step()
         if self.middle_s >= self.max_middle_s:
