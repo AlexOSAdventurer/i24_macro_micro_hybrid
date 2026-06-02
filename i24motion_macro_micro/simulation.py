@@ -2605,7 +2605,7 @@ class I24MicroMask(ArbitraryMaskingCell):
             if vehicle_leaving:
                 rho_interior = fd_exterior.density_from_velocity(vehicle_velocity)
             else:
-                rho_interior = 1.0 / interior_s
+                rho_interior = 0.0
         else:
             interior_s = 2 * self.margin_s
             vehicle_leaving = False

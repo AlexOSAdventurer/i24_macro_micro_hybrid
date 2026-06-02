@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Dict, List
 import json
 import numpy
 import pandas
+import math
 
 import copy
 from simulation import GroundTruthStore
@@ -21,6 +22,8 @@ class I24CarlaCoupler:
     ghost_time_max_difference = 1.0 # Seconds
     desired_s_max_difference = 20.0 # Meters
     spawn_threshold = 5.0 # Meters
+    spawn_region = 40.0 # Meters
+    vehicle_spawn_limit = 3 # 2 cars per tick allowed
 
     def __init__(self, motion_data: GroundTruthStore, dt: float, lanes: List[int], mapping, hero_road: str, desired_time: float, desired_s: float, visible_window: float, ghost_window: float) -> None:
         self.motion_data = motion_data
@@ -83,10 +86,10 @@ class I24CarlaCoupler:
         middle_s = hero["s"]
 
         if self.initialized:
+            self.visible_state = self.injectVehiclesFromMacro(self.getVisibleData())
             self.carla_sim.updateSimulation()
             new_hero_state, new_visible_states = self.carla_sim.runSimulationOver(self.dt)
             self.updateHeroVehicleViaCARLA(new_hero_state)
-            new_visible_states = self.injectVehiclesFromMacro(new_visible_states)
             self.updateVisibleVehiclesViaCARLA(new_visible_states)
             vehicles = self.collateVisibleAndHeroVehicles(self.bridge)
 
@@ -118,7 +121,6 @@ class I24CarlaCoupler:
         fd = front_cell.fd
         mass = front_cell.mass
         cell_length = front_cell.end_s - front_cell.start_s
-        kind = front_cell.kind
         if front_cell.kind == "mask":
             return default_speed # We currently don't bother connecting masks together.
         return fd.velocity_from_density(mass / cell_length)
@@ -131,10 +133,31 @@ class I24CarlaCoupler:
         fd = behind_cell.fd
         mass = behind_cell.mass
         cell_length = behind_cell.end_s - behind_cell.start_s
-        kind = behind_cell.kind
         if behind_cell.kind == "mask":
             return default_speed # We currently don't bother connecting masks together.
         return fd.velocity_from_density(mass / cell_length)
+    
+    def getAheadLaneDensity(self, lane_id, default_density):
+        mask_cell = self.bridge.sim.active.get_cell_with_mask(self.bridge._mask_id(lane_id))
+        front_cell = self.bridge.sim.active.active_cells[mask_cell.outflow_neighbors[0]] if len(mask_cell.outflow_neighbors) > 0 else None
+        if front_cell is None:
+            return default_density
+        mass = front_cell.mass
+        cell_length = front_cell.end_s - front_cell.start_s
+        if front_cell.kind == "mask":
+            return default_density # We currently don't bother connecting masks together.
+        return mass / cell_length
+    
+    def getBehindLaneDensity(self, lane_id, default_density):
+        mask_cell = self.bridge.sim.active.get_cell_with_mask(self.bridge._mask_id(lane_id))
+        behind_cell = self.bridge.sim.active.active_cells[mask_cell.inflow_neighbors[0]] if len(mask_cell.inflow_neighbors) > 0 else None
+        if behind_cell is None:
+            return default_density
+        mass = behind_cell.mass
+        cell_length = behind_cell.end_s - behind_cell.start_s
+        if behind_cell.kind == "mask":
+            return default_density # We currently don't bother connecting masks together.
+        return mass / cell_length
     
     def destroy(self):
         self.carla_sim.destroySimulation()
@@ -146,7 +169,7 @@ class I24CarlaCoupler:
         estimated_s = float(row["s"]) + ((current_timestamp - float(row["time"])) * estimated_velocity)
         return {
             "id": self.generateNextVehicleID(),
-            "class": int(row["class"]),
+            "class": str(row["class"]),
             "length": float(row["length"]),
             "width": float(row["width"]),
             "time": current_timestamp,
@@ -167,10 +190,10 @@ class I24CarlaCoupler:
         return {
             "id": self.generateNextVehicleID(),
             "class": "spawned",
-            "length": s_max - s_min,
+            "length": float(s_max - s_min),
             "width": estimated_width,
             "time": new_time,
-            "s": s_min,
+            "s": float(s_min),
             "t": (lane * estimated_width) + (estimated_width / 2),
             "velocity": estimated_velocity,
             "lane_id": lane,
@@ -179,16 +202,16 @@ class I24CarlaCoupler:
     
     def generateUpdatedVehicleStateFromCARLA(self, vehicle_data):
         new_time = self.current_timestamp
-        estimated_velocity = self.estimateVehicleVelocityFromReal(int(vehicle_data["id"]), int(vehicle_data["lane_id"]), new_time)
+        #estimated_velocity = self.estimateVehicleVelocityFromReal(int(vehicle_data["id"]), int(vehicle_data["lane_id"]), new_time)
         return {
             "id": int(vehicle_data["id"]),
-            "class": int(vehicle_data["class"]),
+            "class": str(vehicle_data["class"]),
             "length": float(vehicle_data["length"]),
             "width": float(vehicle_data["width"]),
             "time": new_time,
             "s": float(vehicle_data["s"]),
             "t": float(vehicle_data["t"]),
-            "velocity": estimated_velocity,
+            "velocity": vehicle_data["velocity"],
             "lane_id": int(vehicle_data["lane_id"]),
             "road_id": self.hero_road
         }
@@ -387,23 +410,32 @@ class I24CarlaCoupler:
         hero_state_processed["velocity"] = float(new_hero_state["velocity"])
         self.hero_state = hero_state_processed
 
+    # behind_or_in_front is either "behind" or "front"
     def _createVehicleSpawnsInSRange(self, new_visible_states, lane, vehicle_count, s_min, s_max, behind_or_in_front):
-        spawn_lengths = (s_max - s_min) / vehicle_count
+        density = self.getBehindLaneDensity(lane, 0.001) if (behind_or_in_front == "behind") else self.getAheadLaneDensity(lane, 0.001)
+        spawn_lengths = 1.0 / density
+        vehicle_count = min(math.floor((s_max - s_min) / spawn_lengths), vehicle_count)
+        if (behind_or_in_front == "behind"):
+            s_max = s_min + (spawn_lengths * vehicle_count)
+        else:
+            s_min = s_max - (spawn_lengths * vehicle_count)
         for start_position in numpy.arange(s_min, s_max, spawn_lengths):
             end_position = start_position + spawn_lengths
             new_vehicle_data = self.generateVehicleStateFromSpawn(lane, start_position, end_position, behind_or_in_front)
-            new_visible_states[new_vehicle_data["id"]] = new_vehicle_data
-        return new_visible_states
+            print("Spawned Vehicle Data ", new_vehicle_data)
+            print("New states ", new_visible_states[lane])
+            new_visible_states[lane][new_vehicle_data["id"]] = new_vehicle_data
+        return new_visible_states, vehicle_count
 
     def _spawnVehiclesInRear(self, new_visible_states, lane, s_availability):
         rear_flux_memory = self.bridge.flow_memory_rear[lane]
         visible_window = self.getCurrentVisibleWindow()
         if (rear_flux_memory > 0.0):
             # Perform a poisson draw to determine the number of vehicles to create
-            vehicle_count = numpy.random.poisson(rear_flux_memory)
+            vehicle_count = min(numpy.random.poisson(rear_flux_memory), self.vehicle_spawn_limit)
             if (vehicle_count > 0):
+                new_visible_states, vehicle_count = self._createVehicleSpawnsInSRange(new_visible_states, lane, vehicle_count, visible_window[2], visible_window[2] + s_availability, "behind")
                 self.bridge.flow_memory_rear[lane] -= vehicle_count
-                return self._createVehicleSpawnsInSRange(new_visible_states, lane, vehicle_count, visible_window[2], visible_window[2] + s_availability, "behind")
         return new_visible_states
 
     def _spawnVehiclesInFront(self, new_visible_states, lane, s_availability):
@@ -411,10 +443,10 @@ class I24CarlaCoupler:
         visible_window = self.getCurrentVisibleWindow()
         if (front_flux_memory < 0.0):
             # Perform a poisson draw to determine the number of vehicles to create
-            vehicle_count = numpy.random.poisson(-front_flux_memory)
+            vehicle_count = min(numpy.random.poisson(-front_flux_memory), self.vehicle_spawn_limit)
             if (vehicle_count > 0):
+                new_visible_states, vehicle_count = self._createVehicleSpawnsInSRange(new_visible_states, lane, vehicle_count, visible_window[3] - s_availability, visible_window[3], "front")
                 self.bridge.flow_memory_front[lane] += vehicle_count
-                return self._createVehicleSpawnsInSRange(new_visible_states, lane, vehicle_count, visible_window[3] - s_availability, visible_window[3], "front")
         return new_visible_states
 
     def injectVehiclesFromMacro(self, new_visible_states):
@@ -428,9 +460,10 @@ class I24CarlaCoupler:
                 if (rear_s is None) or (rear_s > vehicle_data["s"]):
                     rear_s = vehicle_data["s"]
             if rear_s is None:
-                s_availability = (visible_window[3] - visible_window[2]) / 2.0
+                s_availability = (visible_window[3] - visible_window[2])
             else:
                 s_availability = rear_s - visible_window[2]
+            s_availability = min(s_availability, self.spawn_region)
             # Mandate a certain distance threshold of the rearmost vehicle for spawning in new stuff
             if (s_availability > self.spawn_threshold):
                 new_visible_states = self._spawnVehiclesInRear(new_visible_states, lane, s_availability)
@@ -439,11 +472,12 @@ class I24CarlaCoupler:
             for vehicle_id in new_visible_states[lane]:
                 vehicle_data = new_visible_states[lane][vehicle_id]
                 if (front_s is None) or (front_s < vehicle_data["s"]):
-                    front_s = vehicle_data["s"]
+                    front_s = vehicle_data["s"] + vehicle_data["length"]
             if front_s is None:
-                s_availability = (visible_window[3] - visible_window[2]) / 2.0
+                s_availability = (visible_window[3] - visible_window[2])
             else:
                 s_availability = visible_window[3] - front_s
+            s_availability = min(s_availability, self.spawn_region)
             # Mandate a certain distance threshold of the frontmost vehicle for spawning in new stuff
             if (s_availability > self.spawn_threshold):
                 new_visible_states = self._spawnVehiclesInFront(new_visible_states, lane, s_availability)

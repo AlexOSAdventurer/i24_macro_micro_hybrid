@@ -285,8 +285,7 @@ def run_demo_carla():
 
     gt = GroundTruthStore.from_parquet(os.path.join(config["storage_locations"]["simulation_dataset"], "micro.parquet"), os.path.join(config["storage_locations"]["simulation_dataset"], "macro.parquet"))
     sim.initialize_from_ground_truth(gt, time_value=config["time_origin"])
-    coupler = I24CarlaCoupler(gt, dt=1.0, lanes=[-1, -2, -3, -4], mapping=config, hero_road="2", desired_time=config["time_origin"], desired_s=350.0, visible_window=150.0, ghost_window=0.0)
-    
+    coupler = I24CarlaCoupler(gt, dt=1.0, lanes=[-1, -2, -3, -4], mapping=config, hero_road="2", desired_time=config["time_origin"], desired_s=350.0, visible_window=150.0, ghost_window=0.0)    
     bridge = I24MicroSimBridge(
         sim=sim,
         road_id="2",
@@ -297,16 +296,20 @@ def run_demo_carla():
         micro_coupler=coupler,
         bridge_callback_name="bridge_step"
     )
-    bridge_time_window = 1800.0 #360.0 #1080.0
+    bridge_time_step = 1800.0 #360.0 #1080.0
+    bridge_time_window = 90.0
     current_bridge_iteration = 1.0
     def update_bridge_callback(current_time, resolution):
         nonlocal bridge
-        nonlocal bridge_time_window
+        nonlocal bridge_time_step
         nonlocal current_bridge_iteration
         nonlocal sim
-        if ((current_time - sim.origin_time) >= (bridge_time_window * current_bridge_iteration)):
+        if ((current_time - sim.origin_time) >= ((bridge_time_step * (current_bridge_iteration - 1)) + bridge_time_window)) and (bridge.running):
             print("Resetting bridge!")
-            bridge.destroy()
+            if (bridge.running):
+                bridge.destroy()
+        if ((current_time - sim.origin_time) >= (bridge_time_step * (current_bridge_iteration))):
+            current_bridge_iteration += 1
             coupler = I24CarlaCoupler(gt, dt=1.0, lanes=[-1, -2, -3, -4], mapping=config, hero_road="2", desired_time=sim.current_time, desired_s=350.0, visible_window=150.0, ghost_window=0.0)
             bridge = I24MicroSimBridge(
                 sim=sim,
@@ -314,13 +317,12 @@ def run_demo_carla():
                 lanes=[-1, -2, -3, -4],
                 initial_middle_s=350.0,
                 margin_s=150.0,
-                max_middle_s=1450,
+                max_middle_s=1300,
                 micro_coupler=coupler,
                 bridge_callback_name="bridge_step"
             )
             #bridge._step(sim.current_time, sim.time_resolution)
             print("Bridge reset!")
-            current_bridge_iteration += 1
     sim.register_step_callback(update_bridge_callback, "bridge_restart")
     for i in range(3599):
         sim.step()
