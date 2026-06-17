@@ -18,14 +18,16 @@ if TYPE_CHECKING:
 
 
 class I24CarlaCoupler:
+    min_spawn_length = 3.0 # Meters
+    min_spawn_distance = 5.0 # Meters
     visible_time_max_difference = 0.1 # Seconds
     ghost_time_max_difference = 1.0 # Seconds
     desired_s_max_difference = 20.0 # Meters
-    spawn_threshold = 5.0 # Meters
-    spawn_region = 40.0 # Meters
-    vehicle_spawn_limit = 3 # 2 cars per tick allowed
+    spawn_threshold = 10.0 # Meters
+    spawn_region = 75.0 # Meters
+    vehicle_spawn_limit = 2.0 # 2 cars per tick allowed
 
-    def __init__(self, motion_data: GroundTruthStore, dt: float, lanes: List[int], mapping, hero_road: str, desired_time: float, desired_s: float, visible_window: float, ghost_window: float) -> None:
+    def __init__(self, motion_data: GroundTruthStore, dt: float, lanes: List[int], mapping, hero_road: str, desired_time: float, desired_s: float, visible_window: float, ghost_window: float, bev_video_path: str = "carla_camera_bev_view.mp4") -> None:
         self.motion_data = motion_data
         self.lanes = lanes
         self.dt = float(dt)
@@ -46,7 +48,7 @@ class I24CarlaCoupler:
         self.loadHero(int(hero_road), desired_time, desired_s)
         self.loadVisible()
         self.loadGhosts()
-        self.carla_sim = I24MotionCarlaSimulationCoupled("localhost", 2000, self, self.mapping["road_data"], "result_new_road_2_lane_1.csv", "result_bev_road_2_lane_1.mp4")
+        self.carla_sim = I24MotionCarlaSimulationCoupled("localhost", 2000, self, self.mapping["road_data"], bev_video_path)
 
     def get_lane_dfs(self, timestamp_min, timestamp_max, s_min, s_max):
         df = self.motion_data.micro_df
@@ -193,7 +195,7 @@ class I24CarlaCoupler:
             "length": float(s_max - s_min),
             "width": estimated_width,
             "time": new_time,
-            "s": float(s_min),
+            "s": float(s_min) if (behind_or_in_front == "behind") else float(s_max),
             "t": (lane * estimated_width) + (estimated_width / 2),
             "velocity": estimated_velocity,
             "lane_id": lane,
@@ -530,7 +532,7 @@ class I24CarlaCoupler:
     def checkVehicleBoundingBoxNoOverlap(self, vehicle1, vehicle2):
         vehicle_first = vehicle1 if (vehicle1["s"] < vehicle2["s"]) else vehicle2
         vehicle_second = vehicle1 if (vehicle1["s"] > vehicle2["s"]) else vehicle2 
-        vehicle_first_min, vehicle_first_max = vehicle_first["s"], vehicle_first["s"] + vehicle_first["length"]
+        vehicle_first_min, vehicle_first_max = vehicle_first["s"], vehicle_first["s"] + vehicle_first["length"] + self.min_spawn_distance
         vehicle_second_min, vehicle_second_max = vehicle_second["s"], vehicle_second["s"] + vehicle_second["length"]
 
         return (vehicle_first_min < vehicle_second_min) and (vehicle_first_max < vehicle_second_min)

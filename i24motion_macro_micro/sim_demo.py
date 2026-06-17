@@ -244,7 +244,7 @@ def run_demo_open_loop():
         micro_coupler=replayer,
         bridge_callback_name="bridge_step"
     )
-    bridge_time_window = 1800.0 #360.0 #1080.0
+    bridge_time_window = 600.0 #360.0 #1080.0
     current_bridge_iteration = 1.0
     def update_bridge_callback(current_time, resolution):
         nonlocal bridge
@@ -285,7 +285,7 @@ def run_demo_carla():
 
     gt = GroundTruthStore.from_parquet(os.path.join(config["storage_locations"]["simulation_dataset"], "micro.parquet"), os.path.join(config["storage_locations"]["simulation_dataset"], "macro.parquet"))
     sim.initialize_from_ground_truth(gt, time_value=config["time_origin"])
-    coupler = I24CarlaCoupler(gt, dt=1.0, lanes=[-1, -2, -3, -4], mapping=config, hero_road="2", desired_time=config["time_origin"], desired_s=350.0, visible_window=150.0, ghost_window=0.0)    
+    coupler = I24CarlaCoupler(gt, dt=1.0, lanes=[-1, -2, -3, -4], mapping=config, hero_road="2", desired_time=config["time_origin"], desired_s=350.0, visible_window=150.0, ghost_window=0.0, bev_video_path="carla_camera_bev_view_1.mp4")
     bridge = I24MicroSimBridge(
         sim=sim,
         road_id="2",
@@ -296,9 +296,9 @@ def run_demo_carla():
         micro_coupler=coupler,
         bridge_callback_name="bridge_step"
     )
-    bridge_time_step = 1800.0 #360.0 #1080.0
+    bridge_time_step = 1200.0 #360.0 #1080.0
     bridge_time_window = 90.0
-    current_bridge_iteration = 1.0
+    current_bridge_iteration = 1
     def update_bridge_callback(current_time, resolution):
         nonlocal bridge
         nonlocal bridge_time_step
@@ -310,7 +310,7 @@ def run_demo_carla():
                 bridge.destroy()
         if ((current_time - sim.origin_time) >= (bridge_time_step * (current_bridge_iteration))):
             current_bridge_iteration += 1
-            coupler = I24CarlaCoupler(gt, dt=1.0, lanes=[-1, -2, -3, -4], mapping=config, hero_road="2", desired_time=sim.current_time, desired_s=350.0, visible_window=150.0, ghost_window=0.0)
+            coupler = I24CarlaCoupler(gt, dt=1.0, lanes=[-1, -2, -3, -4], mapping=config, hero_road="2", desired_time=sim.current_time, desired_s=350.0, visible_window=150.0, ghost_window=0.0, bev_video_path=f"carla_camera_bev_view_{current_bridge_iteration}.mp4")
             bridge = I24MicroSimBridge(
                 sim=sim,
                 road_id="2",

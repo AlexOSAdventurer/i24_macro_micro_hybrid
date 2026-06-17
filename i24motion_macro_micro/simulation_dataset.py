@@ -7,6 +7,11 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import json
 import os
+"""
+[I 2026-06-05 03:16:21,985] Trial 99 finished with value: -1.4247049284076403 and parameters: {'v_f': 36.833188698970794, 'rho_j': 0.13426972640115076, 'lambda_lc': 0.12607510767478558, 'w': 5.244198786834116}. Best is trial 41 with value: -1.4780850809769102.
+{'v_f': 38.82661919086127, 'rho_j': 0.13273852897987434, 'lambda_lc': 0.12801469008205105, 'w': 5.52936062831337}
+
+"""
 
 class I24SimulationData:
     def __init__(self, config_path="i24_motion_to_dataset.json", network_path="network.json", macro_path="macro.parquet", micro_path="micro.parquet"):

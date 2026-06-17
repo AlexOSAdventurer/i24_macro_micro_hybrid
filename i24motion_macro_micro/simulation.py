@@ -1743,7 +1743,8 @@ class Simulation:
         self._snapshot()
         callbacks = [cb for cb in self._step_callbacks]
         for cb in callbacks:
-            self._step_callbacks[cb](self.current_time, self.time_resolution)
+            if cb in self._step_callbacks:
+                self._step_callbacks[cb](self.current_time, self.time_resolution)
         self._update_masks()
         self.active = self._build_active_network()
         self.rollout_results[-1].active_network = self.active.snapshot()
