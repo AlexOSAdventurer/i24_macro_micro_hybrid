@@ -94,6 +94,7 @@ class I24MicroSimBridge:
 
         self.middle_s = self.micro_coupler.step()
         if self.middle_s >= self.max_middle_s:
+            print("bridge memories: ", self.flow_memory_front, self.flow_memory_rear)
             self.destroy()
             return
                     

@@ -296,7 +296,7 @@ def run_demo_carla():
         micro_coupler=coupler,
         bridge_callback_name="bridge_step"
     )
-    bridge_time_step = 1200.0 #360.0 #1080.0
+    bridge_time_step = 3600.0 #360.0 #1080.0
     bridge_time_window = 90.0
     current_bridge_iteration = 1
     def update_bridge_callback(current_time, resolution):

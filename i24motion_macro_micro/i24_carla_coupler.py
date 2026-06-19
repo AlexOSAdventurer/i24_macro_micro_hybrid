@@ -18,14 +18,14 @@ if TYPE_CHECKING:
 
 
 class I24CarlaCoupler:
-    min_spawn_length = 3.0 # Meters
-    min_spawn_distance = 5.0 # Meters
+    min_spawn_length = 10.0 # Meters
+    min_spawn_distance = 2.0 # Meters
     visible_time_max_difference = 0.1 # Seconds
     ghost_time_max_difference = 1.0 # Seconds
     desired_s_max_difference = 20.0 # Meters
-    spawn_threshold = 10.0 # Meters
+    spawn_threshold = 0.0 # Meters
     spawn_region = 75.0 # Meters
-    vehicle_spawn_limit = 2.0 # 2 cars per tick allowed
+    vehicle_spawn_limit = 5.0 # 2 cars per tick allowed
 
     def __init__(self, motion_data: GroundTruthStore, dt: float, lanes: List[int], mapping, hero_road: str, desired_time: float, desired_s: float, visible_window: float, ghost_window: float, bev_video_path: str = "carla_camera_bev_view.mp4") -> None:
         self.motion_data = motion_data
@@ -99,6 +99,7 @@ class I24CarlaCoupler:
             self.bridge.anchor_speed = anchor_speed
             result = self._compute_next_middle_s(middle_s, self.current_anchor_speed if self.current_anchor_speed is not None else anchor_speed)
             self.current_anchor_speed = anchor_speed
+            self.current_timestamp += self.dt
             return result
         else:
             self.initialize()
@@ -195,7 +196,7 @@ class I24CarlaCoupler:
             "length": float(s_max - s_min),
             "width": estimated_width,
             "time": new_time,
-            "s": float(s_min) if (behind_or_in_front == "behind") else float(s_max),
+            "s": float(s_min), # if (behind_or_in_front == "behind") else float(s_max),
             "t": (lane * estimated_width) + (estimated_width / 2),
             "velocity": estimated_velocity,
             "lane_id": lane,
@@ -386,7 +387,7 @@ class I24CarlaCoupler:
             potential_visibles_lane_sorted = potential_visibles[lane].sort_values(by=["time"], ascending=True)
             uniques = list(potential_visibles_lane_sorted["id"].unique())
             for unique in uniques:
-                print(self.hero_state["id"], unique)
+                #print(self.hero_state["id"], unique)
                 if unique != self.hero_state["id"]:
                     unique_vehicle_data = potential_visibles_lane_sorted[potential_visibles_lane_sorted["id"] == unique].copy()
                     unique_vehicle_data["time_delta"] = (unique_vehicle_data["time"] - self.current_timestamp).abs()
@@ -413,17 +414,32 @@ class I24CarlaCoupler:
         self.hero_state = hero_state_processed
 
     # behind_or_in_front is either "behind" or "front"
-    def _createVehicleSpawnsInSRange(self, new_visible_states, lane, vehicle_count, s_min, s_max, behind_or_in_front):
+    def _createVehicleSpawnsInSRange(self, new_visible_states, lane, vehicle_count, s_min, s_max, behind_or_in_front, toprint=False):
         density = self.getBehindLaneDensity(lane, 0.001) if (behind_or_in_front == "behind") else self.getAheadLaneDensity(lane, 0.001)
-        spawn_lengths = 1.0 / density
+        spawn_lengths = min(max(1.0 / density, self.min_spawn_length), max(s_max - s_min, self.min_spawn_length))
         vehicle_count = min(math.floor((s_max - s_min) / spawn_lengths), vehicle_count)
         if (behind_or_in_front == "behind"):
             s_max = s_min + (spawn_lengths * vehicle_count)
         else:
             s_min = s_max - (spawn_lengths * vehicle_count)
-        for start_position in numpy.arange(s_min, s_max, spawn_lengths):
-            end_position = start_position + spawn_lengths
-            new_vehicle_data = self.generateVehicleStateFromSpawn(lane, start_position, end_position, behind_or_in_front)
+        if toprint:
+            print("density: ", density)
+            print("s_max, s_min: ", s_max, s_min)
+            print("spawn_lengths: ", spawn_lengths)
+            print("vehicle count: ", vehicle_count)
+        for i in range(vehicle_count):
+#        for start_position in numpy.arange(s_min, s_max, spawn_lengths):
+            start_position = s_min + (i * spawn_lengths)
+            start_position_calculated = None
+            end_position_calculated = None
+            if (behind_or_in_front == "behind"):
+                start_position_calculated = start_position
+                end_position_calculated = start_position + spawn_lengths - self.min_spawn_distance
+            elif (behind_or_in_front == "front"):
+                start_position_calculated = start_position + self.min_spawn_distance
+                end_position_calculated = start_position + spawn_lengths
+
+            new_vehicle_data = self.generateVehicleStateFromSpawn(lane, start_position_calculated, end_position_calculated, behind_or_in_front)
             print("Spawned Vehicle Data ", new_vehicle_data)
             print("New states ", new_visible_states[lane])
             new_visible_states[lane][new_vehicle_data["id"]] = new_vehicle_data
@@ -434,9 +450,12 @@ class I24CarlaCoupler:
         visible_window = self.getCurrentVisibleWindow()
         if (rear_flux_memory > 0.0):
             # Perform a poisson draw to determine the number of vehicles to create
-            vehicle_count = min(numpy.random.poisson(rear_flux_memory), self.vehicle_spawn_limit)
+            vehicle_count = min(math.floor(rear_flux_memory), self.vehicle_spawn_limit) # min(numpy.random.poisson(rear_flux_memory), self.vehicle_spawn_limit)
             if (vehicle_count > 0):
-                new_visible_states, vehicle_count = self._createVehicleSpawnsInSRange(new_visible_states, lane, vehicle_count, visible_window[2], visible_window[2] + s_availability, "behind")
+                print("window: ", visible_window)
+                print("availability: ", s_availability)
+                print("spawn_length info: ")
+                new_visible_states, vehicle_count = self._createVehicleSpawnsInSRange(new_visible_states, lane, vehicle_count, visible_window[2], visible_window[2] + s_availability, "behind", True)
                 self.bridge.flow_memory_rear[lane] -= vehicle_count
         return new_visible_states
 
@@ -445,7 +464,7 @@ class I24CarlaCoupler:
         visible_window = self.getCurrentVisibleWindow()
         if (front_flux_memory < 0.0):
             # Perform a poisson draw to determine the number of vehicles to create
-            vehicle_count = min(numpy.random.poisson(-front_flux_memory), self.vehicle_spawn_limit)
+            vehicle_count = min(math.floor(-front_flux_memory), self.vehicle_spawn_limit) # min(numpy.random.poisson(-front_flux_memory), self.vehicle_spawn_limit)
             if (vehicle_count > 0):
                 new_visible_states, vehicle_count = self._createVehicleSpawnsInSRange(new_visible_states, lane, vehicle_count, visible_window[3] - s_availability, visible_window[3], "front")
                 self.bridge.flow_memory_front[lane] += vehicle_count
@@ -495,12 +514,12 @@ class I24CarlaCoupler:
                 vehicle_data = new_visible_states[lane][vehicle_id]
                 visible_window = self.getCurrentVisibleWindow()
                 if (vehicle_data["s"] < visible_window[2]):
-                    print(f"WARNING: Threw away {vehicle_data} because it was visible but then slipped behind the visible cell!")
+                    #print(f"WARNING: Threw away {vehicle_data} because it was visible but then slipped behind the visible cell!")
                     self.bridge.flow_memory_rear[lane] += 1
                     #self.vehicles_to_completely_ignore.append(vehicle_id)
                     #continue # Throw away this vehicle from now on
                 elif (vehicle_data["s"] > visible_window[3]):
-                    print(f"WARNING: Threw away {vehicle_data} because it was visible but then slipped ahead the visible cell!")
+                    #print(f"WARNING: Threw away {vehicle_data} because it was visible but then slipped ahead the visible cell!")
                     self.bridge.flow_memory_front[lane] -= 1
                 else:
                     new_data = self.generateUpdatedVehicleStateFromCARLA(vehicle_data)
@@ -512,13 +531,14 @@ class I24CarlaCoupler:
             for id in ghost_data[lane]:
                 candidate = ghost_data[lane][id]
                 candidate_new_s = candidate["s"] + (candidate["velocity"] * (self.current_timestamp - candidate["time"]))
-                print(f"Candidate visible {candidate} which is a ghost has a projected {candidate_new_s} position with this window {visible_window}")
+                #print(f"Candidate visible {candidate} which is a ghost has a projected {candidate_new_s} position with this window {visible_window}")
                 if (candidate_new_s > visible_window[2]) and (candidate_new_s < visible_window[3]):
                     if (self.checkIfCandidateVisibleNoOverlapWithCurrentVisible(lane, candidate)):
                         candidate["s"] = candidate_new_s
                         self.registerNewVisibleVehicle(candidate)
                     else:
-                        print(f"WARNING: Threw away {candidate} visible vehicle because it overlapped with the other visible vehicles!")
+                        pass
+                        #print(f"WARNING: Threw away {candidate} visible vehicle because it overlapped with the other visible vehicles!")
                         # No need to remove. Will be dealt with when we reload the ghost data.
 
     def updateVisibleVehiclesViaGhosts(self):
@@ -557,7 +577,8 @@ class I24CarlaCoupler:
             return True
         result = ((candidate["s"] + candidate["length"]) < lowest_vehicle["s"]) or (candidate["s"] > (highest_vehicle["s"] + highest_vehicle["length"]))
         if not result:
-            print(f"WARNING: Threw away {candidate} because it was in an invalid visible position with respect to {lowest_vehicle} and {highest_vehicle}.\n")
+            pass
+            #print(f"WARNING: Threw away {candidate} because it was in an invalid visible position with respect to {lowest_vehicle} and {highest_vehicle}.\n")
         return result
     
     def registerNewVisibleVehicle(self, vehicle_data, ignore_invalid_visible_cell_position=False):
@@ -570,10 +591,12 @@ class I24CarlaCoupler:
             if ignore_invalid_visible_cell_position or self.checkIfInitVisibleNoOverlapWithCurrentVisible(vehicle_data["lane_id"], vehicle_data):
                 self.visible_state[vehicle_data["lane_id"]][vehicle_data["id"]] = vehicle_data
             else:
-                print(f"WARNING: Threw away {vehicle_data} because it was in an invalid visible position")
+                pass
+                #print(f"WARNING: Threw away {vehicle_data} because it was in an invalid visible position")
                 #self.vehicles_to_completely_ignore.append(vehicle_data["id"]) # Permanently throw away
         else:
-            print(f"WARNING: Threw away {vehicle_data} because it wasn't in a valid visible position")
+            pass
+            #print(f"WARNING: Threw away {vehicle_data} because it wasn't in a valid visible position")
             #self.vehicles_to_completely_ignore.append(vehicle_data["id"]) # Permanently throw away
 
     def registerNewGhostVehicle(self, vehicle_data, ignore_invalid_ghost_cell_position=False):
