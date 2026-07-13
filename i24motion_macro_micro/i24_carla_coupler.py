@@ -18,14 +18,16 @@ if TYPE_CHECKING:
 
 
 class I24CarlaCoupler:
-    min_spawn_length = 10.0 # Meters
-    min_spawn_distance = 2.0 # Meters
+    #min_spawn_length = 8.368510445032973 + 5.114319171517062 # Meters
+    #min_spawn_distance = 5.114319171517062 # Meters
+    min_spawn_length = 8.49003635626501 + 3.9448110506084197 # Meters
+    min_spawn_distance = 3.9448110506084197 # Meters
     visible_time_max_difference = 0.1 # Seconds
     ghost_time_max_difference = 1.0 # Seconds
-    desired_s_max_difference = 20.0 # Meters
+    desired_s_max_difference = 50.0 # Meters
     spawn_threshold = 0.0 # Meters
     spawn_region = 75.0 # Meters
-    vehicle_spawn_limit = 5.0 # 2 cars per tick allowed
+    vehicle_spawn_limit = 5.0 # 5 cars per tick allowed
 
     def __init__(self, motion_data: GroundTruthStore, dt: float, lanes: List[int], mapping, hero_road: str, desired_time: float, desired_s: float, visible_window: float, ghost_window: float, bev_video_path: str = "carla_camera_bev_view.mp4") -> None:
         self.motion_data = motion_data
@@ -56,7 +58,8 @@ class I24CarlaCoupler:
             (df["time"] >= timestamp_min) &
             (df["time"] <= timestamp_max) &
             (df["s"] >= s_min) &
-            (df["s"] <= s_max)
+            (df["s"] <= s_max) &
+            (df["road_id"] == str(self.hero_road))
         ]
         return {lane: window[window["lane_id"] == lane] for lane in self.lanes}
     
@@ -116,7 +119,7 @@ class I24CarlaCoupler:
             return middle_s
         return middle_s + anchor_speed * self.dt
     
-    def getAheadLaneVelocity(self, lane_id, default_speed):
+    def getAheadLaneVelocityMacro(self, lane_id, default_speed, min_cell_size=25.0):
         mask_cell = self.bridge.sim.active.get_cell_with_mask(self.bridge._mask_id(lane_id))
         front_cell = self.bridge.sim.active.active_cells[mask_cell.outflow_neighbors[0]] if len(mask_cell.outflow_neighbors) > 0 else None
         if front_cell is None:
@@ -128,7 +131,7 @@ class I24CarlaCoupler:
             return default_speed # We currently don't bother connecting masks together.
         return fd.velocity_from_density(mass / cell_length)
     
-    def getBehindLaneVelocity(self, lane_id, default_speed):
+    def getBehindLaneVelocityMacro(self, lane_id, default_speed):
         mask_cell = self.bridge.sim.active.get_cell_with_mask(self.bridge._mask_id(lane_id))
         behind_cell = self.bridge.sim.active.active_cells[mask_cell.inflow_neighbors[0]] if len(mask_cell.inflow_neighbors) > 0 else None
         if behind_cell is None:
@@ -139,6 +142,26 @@ class I24CarlaCoupler:
         if behind_cell.kind == "mask":
             return default_speed # We currently don't bother connecting masks together.
         return fd.velocity_from_density(mass / cell_length)
+    
+    def getAheadLaneVelocityMicro(self, lane_id, default_speed, min_cell_size=25.0):
+        vehicles = self.visible_state[lane_id]
+        front_most_vehicle = None
+        for vehicle in vehicles:
+            if (front_most_vehicle is None) or (vehicles[vehicle]["s"] > front_most_vehicle["s"]):
+                front_most_vehicle = vehicles[vehicle]
+        if front_most_vehicle is None:
+            return self.getAheadLaneVelocityMacro(lane_id, default_speed, min_cell_size)
+        return front_most_vehicle["velocity"]
+    
+    def getBehindLaneVelocityMicro(self, lane_id, default_speed, min_cell_size=25.0):
+        vehicles = self.visible_state[lane_id]
+        rear_most_vehicle = None
+        for vehicle in vehicles:
+            if (rear_most_vehicle is None) or (vehicles[vehicle]["s"] < rear_most_vehicle["s"]):
+                rear_most_vehicle = vehicles[vehicle]
+        if rear_most_vehicle is None:
+            return self.getBehindLaneVelocityMacro(lane_id, default_speed, min_cell_size)
+        return rear_most_vehicle["velocity"]
     
     def getAheadLaneDensity(self, lane_id, default_density):
         mask_cell = self.bridge.sim.active.get_cell_with_mask(self.bridge._mask_id(lane_id))
@@ -188,7 +211,7 @@ class I24CarlaCoupler:
         if (behind_or_in_front != "behind") and (behind_or_in_front != "front"):
             return None # Force failure upstream. Hacky but whatevs. We can improve all of this later.
         new_time = self.current_timestamp
-        estimated_velocity = self.getBehindLaneVelocity(lane, 0.0) if (behind_or_in_front == "behind") else self.getAheadLaneVelocity(lane, 0.0)
+        estimated_velocity = self.getBehindLaneVelocityMicro(lane, 0.0) if (behind_or_in_front == "behind") else self.getAheadLaneVelocityMicro(lane, 0.0)
         estimated_width = 3.5 # We're hardcoding this for now. We'll need to add lane/road cross-referencing lookup later
         return {
             "id": self.generateNextVehicleID(),

@@ -17,10 +17,17 @@ gt = GroundTruthStore.from_parquet(os.path.join(config["storage_locations"]["sim
 def run_calibration(trial):
     #{'v_f': 38.00311919090539, 'rho_j': 0.09305952185516403, 'lambda_lc': 0.09997312297982588, 'w': 6.98263909134981}
     #  {'v_f': 36.84345956738889, 'rho_j': 0.11911626274100441, 'lambda_lc': 0.07329849477541688, 'w': 5.5232290087351155}
-    v_f = trial.suggest_float("v_f", 30.0, 50.0)
-    rho_j = trial.suggest_float("rho_j", 0.07, 0.15)
-    lambda_lc = trial.suggest_float("lambda_lc", 0.05, 0.2)
-    w = trial.suggest_float("w", 5.0, 8.0)
+    #v_f = trial.suggest_float("v_f", 30.0, 50.0)
+    #rho_j = trial.suggest_float("rho_j", 0.07, 0.15)
+    #lambda_lc = trial.suggest_float("lambda_lc", 0.05, 0.2)
+    #w = trial.suggest_float("w", 5.0, 8.0)
+    v_f=49.816011505539535
+    w=6.053452290089522
+    rho_j=0.12998583138493472
+    lambda_lc=0.10076621081371681
+    min_spawn_length = trial.suggest_float("min_spawn_length", 4.0, 15.0)
+    min_spawn_distance = trial.suggest_float("min_spawn_distance", 1.0, 10.0)
+    min_spawn_length += min_spawn_distance
     sim_data = I24SimulationData()
     sim_data.network_generator = I24WestAndEastNetwork(TriangularFD(v_f, w, rho_j), lambda_lc)
     sim_data.network_generator.create_network(sim_data.config["road_data"]["2"]["road_length"], sim_data.config["road_data"]["2"]["cell_length"], sim_data.config["road_data"]["2"]["lanes"], lane_width=sim_data.config["road_data"]["2"]["lane_width"])
@@ -37,7 +44,9 @@ def run_calibration(trial):
     )
 
     sim.initialize_from_ground_truth(gt, time_value=config["time_origin"])
-    coupler = I24CarlaCoupler(gt, dt=1.0, lanes=[-1, -2, -3, -4], mapping=config, hero_road="2", desired_time=config["time_origin"], desired_s=350.0, visible_window=150.0, ghost_window=0.0)    
+    coupler = I24CarlaCoupler(gt, dt=1.0, lanes=[-1, -2, -3, -4], mapping=config, hero_road="2", desired_time=config["time_origin"], desired_s=350.0, visible_window=150.0, ghost_window=0.0)
+    coupler.min_spawn_length = min_spawn_length
+    coupler.min_spawn_distance = min_spawn_distance
     bridge = I24MicroSimBridge(
         sim=sim,
         road_id="2",
@@ -77,6 +86,8 @@ def run_calibration(trial):
         if ((current_time - sim.origin_time) >= (bridge_time_step * (current_bridge_iteration))):
             current_bridge_iteration += 1
             coupler = I24CarlaCoupler(gt, dt=1.0, lanes=[-1, -2, -3, -4], mapping=config, hero_road="2", desired_time=sim.current_time, desired_s=350.0, visible_window=150.0, ghost_window=0.0)
+            coupler.min_spawn_length = min_spawn_length
+            coupler.min_spawn_distance = min_spawn_distance
             bridge = I24MicroSimBridge(
                 sim=sim,
                 road_id="2",

@@ -2443,8 +2443,27 @@ class RolloutRenderer:
         )
         return fig
 
-    def get_figure(self, step_idx: int, show_base: bool = True, quantity: str = "density") -> go.Figure:
-        """Return a static go.Figure for a single simulation timestep."""
+    def _white_template(self) -> dict:
+        """Resolve the named 'plotly_white' template to a plain dict, once.
+
+        plotly.js does not know Python-side named templates, so a dict figure
+        must embed the fully-resolved template dict rather than the string.
+        """
+        tmpl = getattr(self, "_tmpl_white_cache", None)
+        if tmpl is None:
+            import plotly.io as pio
+            tmpl = pio.templates["plotly_white"].to_plotly_json()
+            self._tmpl_white_cache = tmpl
+        return tmpl
+
+    def get_figure(self, step_idx: int, show_base: bool = True, quantity: str = "density") -> dict:
+        """Return a static figure (plain dict) for a single simulation timestep.
+
+        Returns a plain dict rather than a go.Figure on purpose: under repeated
+        Dash playback callbacks, constructing graph objects (go.Figure/go.Scatter)
+        retains ~one figure's worth of BasePlotlyType objects per call and leaks
+        memory (see leakrun diagnosis). Dash accepts dict figures directly.
+        """
         q = quantity
         vmin, vmax = self.ranges[q]
         traces: List[Any] = []
@@ -2452,58 +2471,61 @@ class RolloutRenderer:
         if show_base:
             colors = self.base_frame_colors[q][step_idx]
             for (_rid, _cid, px, py, _fd), color in zip(self.base_cells, colors):
-                traces.append(go.Scatter(
-                    x=px, y=py,
-                    fill="toself",
-                    fillcolor=color,
-                    mode="lines",
-                    line=dict(color=self.NORMAL_LINE, width=0.5),
-                    showlegend=False,
-                    hoverinfo="skip",
-                ))
+                traces.append({
+                    "type": "scatter",
+                    "x": px, "y": py,
+                    "fill": "toself",
+                    "fillcolor": color,
+                    "mode": "lines",
+                    "line": {"color": self.NORMAL_LINE, "width": 0.5},
+                    "showlegend": False,
+                    "hoverinfo": "skip",
+                })
         else:
             colors = self.active_frame_colors[q][step_idx]
             geo = self.active_geo[step_idx]
             lcs = self.active_lcolor[step_idx]
             for i in range(self.max_active):
                 px, py = geo[i]
-                traces.append(go.Scatter(
-                    x=px, y=py,
-                    fill="toself",
-                    fillcolor=colors[i],
-                    mode="lines",
-                    line=dict(color=lcs[i], width=0.5),
-                    showlegend=False,
-                    hoverinfo="skip",
-                ))
+                traces.append({
+                    "type": "scatter",
+                    "x": px, "y": py,
+                    "fill": "toself",
+                    "fillcolor": colors[i],
+                    "mode": "lines",
+                    "line": {"color": lcs[i], "width": 0.5},
+                    "showlegend": False,
+                    "hoverinfo": "skip",
+                })
             for mask in self.mask_snapshots_per_step[step_idx].values():
                 traces.extend(mask.render(self._rotate))
 
-        traces.append(go.Scatter(
-            x=[None], y=[None],
-            mode="markers",
-            marker=dict(
-                colorscale="Viridis",
-                cmin=vmin, cmax=vmax,
-                color=[vmin],
-                showscale=True,
-                colorbar=dict(title=q, x=1.02, thickness=15),
-            ),
-            showlegend=False,
-            hoverinfo="skip",
-        ))
+        traces.append({
+            "type": "scatter",
+            "x": [None], "y": [None],
+            "mode": "markers",
+            "marker": {
+                "colorscale": "Viridis",
+                "cmin": vmin, "cmax": vmax,
+                "color": [vmin],
+                "showscale": True,
+                "colorbar": {"title": q, "x": 1.02, "thickness": 15},
+            },
+            "showlegend": False,
+            "hoverinfo": "skip",
+        })
 
-        return go.Figure(
-            data=traces,
-            layout=go.Layout(
-                title=f"t = {int(self.sim_times[step_idx])} s",
-                xaxis=dict(scaleanchor="y", showgrid=False),
-                yaxis=dict(showgrid=False),
-                template="plotly_white",
-                margin=dict(t=60),
-                uirevision="constant",
-            ),
-        )
+        return {
+            "data": traces,
+            "layout": {
+                "title": f"t = {int(self.sim_times[step_idx])} s",
+                "xaxis": {"scaleanchor": "y", "showgrid": False},
+                "yaxis": {"showgrid": False},
+                "template": self._white_template(),
+                "margin": {"t": 60},
+                "uirevision": "constant",
+            },
+        }
 
 
 class FixedScalarMask(ArbitraryMaskingCell):
