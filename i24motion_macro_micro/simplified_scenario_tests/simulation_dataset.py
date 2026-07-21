@@ -36,7 +36,7 @@ class SimplifiedSimulationData:
         time_step = road_config["time_step"]
 
         total_cells = int(road_length / cell_length)
-        total_time = int(time_length/ time_step)
+        total_time = int(time_length / time_step)
 
         network = simulation.Network.from_json(self.network_path)
         fd : simulation.TriangularFD = network.roads["1"].cells["road_1_cell_-1_step_0"].fd

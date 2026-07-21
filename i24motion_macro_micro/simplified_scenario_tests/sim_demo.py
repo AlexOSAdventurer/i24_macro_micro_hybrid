@@ -25,7 +25,7 @@ from __future__ import annotations
 import sys
 sys.path.append("..")
 from simulation import Simulation, RolloutRenderer, GroundTruthStore, TriangularFD
-from bridge_coupler import SimplifiedSimBridge, NewellModel
+from bridge_coupler import SimplifiedSimBridge, NewellModel, IDMModel, IIDMModel
 from dash import Dash, dcc, html, Input, Output, State, callback
 import plotly.graph_objects as go
 import json
@@ -236,14 +236,23 @@ def load_sim_demo():
     v_f = 49.73562026160161
     w = 5.697835695812354
     rho_j = 0.1304577157114563
+    still_gap = 1.0
+    jam_spacing = 1.0 / rho_j
+    vehicle_length = jam_spacing - still_gap
+    time_headway = 1.0 / (w * rho_j)
+    acceleration_exponent = 4.0
+    max_accel = 1.5
+    max_decel = 10.0
+    newell_model = NewellModel(v_f=v_f, jam_spacing=jam_spacing, time_gap=time_headway)
+    idm_model = IDMModel(v_f=v_f, vehicle_length=vehicle_length, still_gap=still_gap, time_headway=time_headway, acceleration_exponent=acceleration_exponent, max_accel=max_accel, max_decel=max_decel)
     bridge = SimplifiedSimBridge(
         sim=sim,
         road_id="1",
-        initial_middle_s=20000.0,
+        initial_middle_s=15000.0,
         margin_s=4000.0,
         max_middle_s=35000.0,
         fd=TriangularFD(v_f=v_f, w=w, rho_j=rho_j),
-        ftl_model=NewellModel(v_f=v_f, jam_spacing=1.0/rho_j, time_gap=1.0/(rho_j * w)),
+        ftl_model=idm_model,
         bridge_callback_name="bridge_step"
     )
 
@@ -251,7 +260,7 @@ def load_sim_demo():
 
 def run_demo_simplified():
     sim, bridge = load_sim_demo()
-    sim.run(1200.0)
+    sim.run(2400.0)
     run_app(sim, rotation_deg=0.0)
 
 if __name__ == "__main__":
