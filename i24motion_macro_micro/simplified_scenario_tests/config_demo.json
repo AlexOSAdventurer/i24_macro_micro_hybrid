@@ -3,6 +3,13 @@
     "time_length": 3600.0,
     "time_step": 1.0,
     "cell_length": 100.0,
+    "fd": {
+        "type": "triangular",
+        "v_f": 49.7,
+        "w": 5.7,
+        "rho_j": 0.13,
+        "lambda_lc": 0.1395
+    },
     "road_data": {
         "1": {
             "road_length": 40000.0,
@@ -15,6 +22,6 @@
         }
     },
     "storage_locations": {
-        "simulation_dataset": "simulation_dataset/"
+        "simulation_dataset": "simulation_dataset_demo/"
     }
 }

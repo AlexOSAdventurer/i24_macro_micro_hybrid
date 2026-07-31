@@ -1,0 +1,27 @@
+{
+    "time_origin": 0.0,
+    "time_length": 300.0,
+    "time_step": 0.0,
+    "cell_length": 0.0,
+    "fd": {
+        "type": "triangular",
+        "v_f": 49.7,
+        "w": 5.7,
+        "rho_j": 0.13,
+        "lambda_lc": 0.1395
+    },
+    "road_data": {
+        "1": {
+            "road_length": 40000.0,
+            "time_origin": 1669812350.0,
+            "time_length": 300.0,
+            "cell_length": 0.0,
+            "time_step": 0.0,
+            "lanes": 1,
+            "lane_width": 3.6575
+        }
+    },
+    "storage_locations": {
+        "simulation_dataset": "{storage_location}/"
+    }
+}

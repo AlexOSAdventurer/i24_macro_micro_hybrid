@@ -9,14 +9,55 @@ import pyarrow.parquet as pq
 import json
 import os
 
-class SimplifiedSimulationData:
-    def __init__(self, config_path="config.json", network_path="network.json", macro_path="macro.parquet"):
-        with open(config_path, "r") as f:
+def case_m_1(i, j, total_cells, total_time, fd):
+    position = float(i) / float(total_cells)
+    if position < 0.1:
+        return fd.rho_c, fd.velocity_from_density(fd.rho_c)
+    else:
+        return 0.05 * fd.rho_c, fd.velocity_from_density(0.05 * fd.rho_c)
+
+def case_m_2(i, j, total_cells, total_time, fd):
+    return 0.05 * fd.rho_c, fd.velocity_from_density(0.05 * fd.rho_c)
+
+def case_m_3(i, j, total_cells, total_time, fd):
+    position = float(i) / float(total_cells)
+    if position <= 0.2:
+        return 0.05 * fd.rho_c, fd.velocity_from_density(0.05 * fd.rho_c)
+    else:
+        return fd.rho_j, fd.velocity_from_density(fd.rho_j)
+
+def case_m_4(i, j, total_cells, total_time, fd):
+    position = float(i) / float(total_cells)
+    if position <= 0.2:
+        return fd.rho_j, fd.velocity_from_density(fd.rho_j)
+    else:
+        return 0.05 * fd.rho_c, fd.velocity_from_density(0.05 * fd.rho_c)
+
+macro_cases = {
+    "case_m_1": case_m_1,
+    "case_m_2": case_m_2,
+    "case_m_3": case_m_3,
+    "case_m_4": case_m_4
+}
+
+class SimplifiedSimulationDataVerification:
+    def __init__(self, config_folder="verification_config", config_template="config_template.json", name="verification1", density_and_velocity_function=None, config_path="config.json", network_path="network.json", macro_path="macro.parquet", time_step=1.0, cell_length=100.0):
+        self.config_folder = config_folder
+        with open(config_template, "r") as f:
             self.config = json.load(f)
-        self.simulation_path = self.config["storage_locations"]["simulation_dataset"]
+        self.name = name
+        self.simulation_path = os.path.join(config_folder, name)
+        self.config_path = os.path.join(config_folder, config_path)
         self.network_path = os.path.join(self.simulation_path, network_path)
         self.macro_final_path = os.path.join(self.simulation_path, macro_path)
+        self.density_and_velocity_function = density_and_velocity_function
         os.makedirs(self.simulation_path, exist_ok=True)
+        self.config["time_step"] = time_step
+        self.config["cell_length"] = cell_length
+        self.config["road_data"]["1"]["time_step"] = time_step
+        self.config["road_data"]["1"]["cell_length"] = cell_length
+        with open(self.config_path, "w+") as f:
+            json.dump(self.config, f, indent=4)
 
     def create_network_file(self):
         config = self.config["road_data"]["1"]
@@ -49,13 +90,7 @@ class SimplifiedSimulationData:
         velocity_list = []
         for i in range(total_cells):
             for j in range(total_time):
-                if ((float(i) / float(total_cells)) < 0.5): # Half way down the road or no?
-                    density = fd.rho_c / 2.0
-                    velocity = fd.velocity_from_density(density)
-                else:
-                    density = fd.rho_j
-                    velocity = 0.0
-
+                density, velocity = self.density_and_velocity_function(i, j, total_cells, total_time, fd)
                 time_list.append((j * time_step) + time_origin)
                 timelength_list.append(time_step)
                 road_id_list.append(road_str)
@@ -82,6 +117,19 @@ class SimplifiedSimulationData:
         pq.write_table(table, self.macro_final_path, compression="zstd", row_group_size=1000, sorting_columns=sorting_columns)
 
 if __name__ == "__main__":
-    sim_data = SimplifiedSimulationData(config_path="config_demo.json")
-    sim_data.create_network_file()
-    sim_data.generate_macro_data()
+    dx_sweep = [128.0 / (2.0 ** n) for n in range(5)]
+    dt_sweep = [1.0 / (2.0 ** n) for n in range(5)]
+    for case in macro_cases:
+        func = macro_cases[case]
+        for x, t in zip(dx_sweep, dt_sweep):
+            name = f"{case}_dx_{x}_dt_{t}"
+            sim_data = SimplifiedSimulationDataVerification(
+                name=name,
+                density_and_velocity_function=func,
+                config_path=f"{name}.json",
+                time_step=t,
+                cell_length=x
+            )
+            sim_data.create_network_file()
+            sim_data.generate_macro_data()
+            print(f"{name} done!")

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from functools import partial
 from typing import Dict, List
 import math
+import numpy
 
 from simulation import Simulation, I24MicroMask, TriangularFD
 
@@ -43,6 +44,11 @@ class MicroscopicFTLVehicleModel:
         raise NotImplementedError
 
 class NewellModel(MicroscopicFTLVehicleModel):
+    # The textbook Newell model that 1-for-1 matches LWR with a Triangular FD.
+    # Parameters:
+    # v_f: Free flow velocity in meters per second. Same as the LWR/Triangular v_f.
+    # jam_spacing: max density in vehicles per meter. Same as LWR/Triangular rho_j.
+    # time_gap: Time headway in seconds per vehicle. Derive it from LWR/Triangular via 1/(w * rho_j). 
     def __init__(self, v_f: float, jam_spacing: float, time_gap: float):
         self.v_f = v_f
         self.jam_spacing = jam_spacing
@@ -165,9 +171,131 @@ class IIDMModel(IDMModel):
 
         bounded_accel = max(-self.max_decel, min(accel, self.max_accel))
         return bounded_accel
+    
+class MicroscopicARZVehicleModel(MicroscopicFTLVehicleModel):
+    # Acceleration models need a finer time step to remain numerically stable 
+    # and prevent vehicle overlapping during rapid deceleration.
+    substeps = 3
+
+    def __init__(self, v_max: float, rho_max: float, gamma: float, tau: float, vehicle_length: float = 5.0):
+        """
+        Initializes the microscopic ARZ (Aw-Rascle-Zhang) follow-the-leader model.
+
+        Parameters:
+        -----------
+        v_max : float
+            Maximum free-flow velocity (m/s).
+        rho_max : float
+            Maximum traffic density (vehicles/meter). 1/rho_max represents the jam spacing.
+        gamma : float
+            Traffic pressure exponent (dimensionless parameter tuning driver anticipation).
+        tau : float
+            Relaxation time constant (seconds). Lower values mean faster adaptation to equilibrium.
+        vehicle_length : float
+            Physical length of the vehicle (meters) used to calculate clear headway spacing.
+        """
+        super().__init__()
+        self.v_max = v_max
+        self.rho_max = rho_max
+        self.gamma = gamma
+        self.tau = tau
+        self.vehicle_length = vehicle_length
+        
+        # Jam spacing (minimum distance between front bumpers of consecutive cars)
+        self.s_min = 1.0 / self.rho_max
+
+    def _calculate_local_density(self, current_s: float, leader_s: float) -> float:
+        """Calculates the micro-density experienced by the follower."""
+        # Headway distance between front bumpers
+        headway = leader_s - current_s
+        
+        # Guard against zero or negative spacing to prevent division by zero
+        if headway <= self.s_min:
+            return self.rho_max
+            
+        return 1.0 / headway
+
+    def _equilibrium_velocity(self, rho: float) -> float:
+        """Standard Greenshields-type or density-dependent equilibrium velocity function."""
+        if rho >= self.rho_max:
+            return 0.0
+        # Example using a standard power-law density decay matching ARZ pressure forms
+        return self.v_max * (1.0 - (rho / self.rho_max) ** self.gamma)
+
+    def generate_velocity(self, current_s: float, leader_s: float, current_v: float, leader_v: float, dt: float) -> float:
+        """Calculates the expected velocity after a small time step dt."""
+        accel = self.generate_acceleration(current_s, leader_s, current_v, leader_v, dt)
+        new_v = current_v + accel * dt
+        return max(0.0, min(self.v_max, new_v))  # Bound velocity between 0 and v_max
+
+    def generate_acceleration(self, current_s: float, leader_s: float, current_v: float, leader_v: float, dt: float) -> float:
+        """
+        Computes acceleration based on the microscopic ARZ formulation:
+        dv/dt = (V(rho) - v) / tau  +  (C * (leader_v - current_v)) / (leader_s - current_s)^2
+        """
+        if leader_s is None:
+            leader_s = math.inf
+            leader_v = self.v_max
+
+        rho = self._calculate_local_density(current_s, leader_s)
+        v_eq = self._equilibrium_velocity(rho)
+        
+        # 1. Relaxation Term: Tendency to adapt to the equilibrium velocity
+        relaxation = (v_eq - current_v) / self.tau
+        
+        # 2. Anticipation/Pressure Term: Reaction to the relative speed of the leader
+        headway = leader_s - current_s
+        if headway <= self.s_min:
+            # If closer than jam spacing, trigger max emergency braking
+            return -9.81 
+            
+        # Macroscopic pressure p(rho) derivative equivalent mapped to micro-spacing
+        # C proportional factor derived from the pressure function p(rho) = rho^gamma
+        c_factor = self.gamma * (rho / self.rho_max) ** self.gamma
+        anticipation = (c_factor * (leader_v - current_v)) / headway
+        
+        return relaxation + anticipation
+
+    def step(self, current_s: float, leader_s: float, current_v: float, leader_v: float, dt: float) -> tuple[float, float]:
+        """
+        Advances the vehicle by a macro time step `dt` using internal sub-stepping.
+        
+        Returns:
+        --------
+        tuple (new_velocity, distance_advanced)
+        """
+
+        if leader_s is None:
+            leader_s = math.inf
+            leader_v = self.v_max
+
+        sub_dt = dt / self.substeps
+        sim_s = current_s
+        sim_v = current_v
+        
+        # Linearly interpolate leader trajectory variables across the sub-steps assuming constant velocity
+        leader_sub_v = leader_v
+        sim_leader_s = leader_s
+
+        for _ in range(self.substeps):
+            # Compute current acceleration
+            accel = self.generate_acceleration(sim_s, sim_leader_s, sim_v, leader_sub_v, sub_dt)
+            
+            # Update micro state using Forward Euler integration
+            sim_v = sim_v + accel * sub_dt
+            sim_v = max(0.0, min(self.v_max, sim_v)) # Keep physical bounds
+            
+            sim_s = sim_s + sim_v * sub_dt
+            
+            # Advance the leader's proxy position forward for the next sub-step evaluation
+            sim_leader_s += leader_sub_v * sub_dt
+
+        distance_advanced = sim_s - current_s
+        return sim_v, distance_advanced
 
 class SimplifiedSimBridge:
     spawn_length = 4.0 #6.8725979813165115 + 4.418460070966603
+    min_spawn_distance = 1.0
     spawn_width = 2.0
     spawn_threshold = 4.5 # Meters
     vehicle_spawn_limit = 10.0 # 5 cars per tick allowed
@@ -182,14 +310,16 @@ class SimplifiedSimBridge:
         margin_s: float,
         fd: TriangularFD,
         ftl_model: MicroscopicFTLVehicleModel,
-        bridge_callback_name=None
+        bridge_callback_name=None,
+        spawn_density_function=None,
     ) -> None:
         self.sim = sim
         self.current_timestamp = sim.current_time
         self.ego_id = None
         self.road_id = road_id
         self.fd = fd
-        self.spawn_length = (1.0 / fd.rho_j) - 0.1
+        #self.spawn_length = (1.0 / fd.rho_j) - 0.1
+        #self.spawn_length = 4.0
         self.transition_region_size = 1.0 / fd.rho_c
         self.ftl_model = ftl_model
         self.vehicle_t_position = -self.spawn_width / 2.0
@@ -203,8 +333,9 @@ class SimplifiedSimBridge:
         self.flow_memory_front = 0.0
         self.vehicles: Dict[str, Vehicle] = {}
         self.anchor_speed = 0.0
-        self.masking_cell = None
+        self.masking_cell: I24MicroMask = None
         self.next_vehicle_id = 1
+        self.spawn_density_function = spawn_density_function
 
         self.bridge_callback_name = bridge_callback_name
         sim.register_step_callback(partial(SimplifiedSimBridge._step, self), bridge_callback_name)
@@ -237,7 +368,7 @@ class SimplifiedSimBridge:
             print(self.middle_s, self.anchor_speed, self.current_timestamp, self.sim.time_resolution, len(self.vehicles), float(len(self.vehicles)) / (2 * self.margin_s))
             #print(self.vehicles)
         else:
-            self.spawn_ego_vehicle()
+            self.spawn_initial_vehicles()
             self.initialized = True
 
         self.middle_s, self.anchor_speed = self.vehicles[self.ego_id].s, self.vehicles[self.ego_id].s_dt
@@ -257,6 +388,7 @@ class SimplifiedSimBridge:
             rear_flux_memory=self.flow_memory_rear,
             front_flux_memory=self.flow_memory_front
         )
+        self.masking_cell = new_mask
         new_mask.vehicles = self.collateVehicles()#{vehicle: self.vehicles[vehicle] for vehicle in self.vehicles}
         self.sim.masking_cells[self._mask_id(lane_id)] = new_mask
 
@@ -341,9 +473,41 @@ class SimplifiedSimBridge:
             return default_density # We currently don't bother connecting masks together.
         return mass / cell_length
     
-    def spawn_ego_vehicle(self):
-        self.ego_id = self.generate_next_vehicle_id()
-        self.vehicles[self.ego_id] = Vehicle(self.spawn_length, self.spawn_width, self.middle_s, self.vehicle_t_position, self.lane_id, self.fd.v_f)
+    def spawn_initial_vehicles(self, dx=0.01, spawn_ego_exact=True):
+        #self.vehicles[self.ego_id] = Vehicle(self.spawn_length, self.spawn_width, self.middle_s, self.vehicle_t_position, self.lane_id,)
+        # Spawn vehicles behind and in front of the ego vehicle and keep density consistent as we go
+        min_s = self.middle_s - self.margin_s
+        current_s = min_s
+        max_s = self.middle_s + self.margin_s
+        closest_to_center_vehicle_id: str = None
+        closest_to_center_vehicle: Vehicle = None
+        previous_vehicle: Vehicle = None
+        current_mass = 0
+        while (current_s < max_s):
+            density = self.spawn_density_function(current_s - min_s, 2.0 * self.margin_s)
+            estimated_velocity = self.fd.velocity_from_density(density)
+            spawn_here = False
+            if (spawn_ego_exact and (abs(current_s - self.middle_s) < dx)):
+                spawn_here = True
+            elif (current_mass >= 1.0) and ((previous_vehicle is None) or ((previous_vehicle.s + previous_vehicle.length) < current_s)):
+                if (spawn_ego_exact and (((current_s + self.spawn_length) < self.middle_s) or (current_s > (self.middle_s + self.spawn_length)))) or (not spawn_ego_exact):
+                    spawn_here = True
+
+            if spawn_here:
+                previous_vehicle = Vehicle(self.spawn_length, self.spawn_width, current_s, self.vehicle_t_position, self.lane_id, estimated_velocity)
+                self.vehicles[self.generate_next_vehicle_id()] = previous_vehicle
+                current_mass -= 1.0
+            
+            current_mass += (density * dx)
+            current_s += dx
+        for vehicle in self.vehicles:
+            vehicle_data = self.vehicles[vehicle]
+            if (closest_to_center_vehicle is None) or (abs(closest_to_center_vehicle.s - self.middle_s) > abs(vehicle_data.s - self.middle_s)):
+                closest_to_center_vehicle = vehicle_data
+                closest_to_center_vehicle_id = vehicle
+
+        self.ego_id = closest_to_center_vehicle_id
+        self.middle_s = closest_to_center_vehicle.s
 
     def get_immediate_leader_vehicle(self, vehicle: Vehicle):
         current_leader_key = None
@@ -394,18 +558,26 @@ class SimplifiedSimBridge:
         density = self.get_behind_lane_density(0.001) if (behind_or_in_front == "behind") else self.get_ahead_lane_density(0.001)
         #spawn_lengths = min(1.0 / density, self.transition_region_size - 1e-5)
         estimated_meters_per_vehicle = (s_max - s_min) / vehicle_count
-        spawn_lengths = min(estimated_meters_per_vehicle, self.transition_region_size - 1e-5)
+        spawn_lengths = max(min(estimated_meters_per_vehicle, self.transition_region_size - 1e-5), self.spawn_length + self.min_spawn_distance)
         spawn_distance = spawn_lengths - self.spawn_length
         vehicle_count = min(math.floor((s_max - s_min) / spawn_lengths), vehicle_count)
         if (behind_or_in_front == "behind"):
-            s_max = s_min + (spawn_lengths * vehicle_count)
-        else:
             s_min = s_max - (spawn_lengths * vehicle_count)
+        else:
+            s_max = s_min + (spawn_lengths * vehicle_count)
         if toprint:
             print("density: ", density)
             print("s_max, s_min: ", s_max, s_min)
             print("spawn_lengths: ", spawn_lengths)
             print("vehicle count: ", vehicle_count)
+            front_s = None
+            front_velocity = None
+            for vehicle_id in self.vehicles:
+                vehicle_data = self.vehicles[vehicle_id]
+                if (front_s is None) or (front_s < vehicle_data.s):
+                    front_s = vehicle_data.s + vehicle_data.length
+                    front_velocity = vehicle_data.s_dt
+            print("frontmost vehicle position and speed and length: ", front_s, front_velocity, self.spawn_length)
         for i in range(vehicle_count):
 #        for start_position in numpy.arange(s_min, s_max, spawn_lengths):
             start_position = s_min + (i * spawn_lengths)
@@ -428,7 +600,8 @@ class SimplifiedSimBridge:
         min_s, max_s = self.get_current_visible_window()
         if (rear_flux_memory > 0.0):
             # Perform a poisson draw to determine the number of vehicles to create
-            vehicle_count = min(math.floor(rear_flux_memory), self.vehicle_spawn_limit) # min(numpy.random.poisson(rear_flux_memory), self.vehicle_spawn_limit)
+            vehicle_count = min(math.floor(rear_flux_memory), self.vehicle_spawn_limit)
+            #vehicle_count = min(numpy.random.poisson(rear_flux_memory), self.vehicle_spawn_limit)
             if (vehicle_count > 0):
                 vehicle_count = self._create_vehicle_spawns_in_srange(vehicle_count, min_s, min_s + s_availability, "behind", False)
                 self.flow_memory_rear -= vehicle_count
@@ -438,7 +611,8 @@ class SimplifiedSimBridge:
         min_s, max_s = self.get_current_visible_window()
         if (front_flux_memory < 0.0):
             # Perform a poisson draw to determine the number of vehicles to create
-            vehicle_count = min(math.floor(-front_flux_memory), self.vehicle_spawn_limit) # min(numpy.random.poisson(-front_flux_memory), self.vehicle_spawn_limit)
+            vehicle_count = min(math.floor(-front_flux_memory), self.vehicle_spawn_limit)
+            #vehicle_count = min(numpy.random.poisson(-front_flux_memory), self.vehicle_spawn_limit)
             if (vehicle_count > 0):
                 vehicle_count = self._create_vehicle_spawns_in_srange(vehicle_count, max_s - s_availability, max_s, "front", False)
                 self.flow_memory_front += vehicle_count
@@ -539,9 +713,10 @@ class SimplifiedSimBridge:
 
     def advance_and_update_vehicles(self):
         #print(self.vehicles, "\n---------------")
-        self.spawn_and_despawn_vehicles()
         #print(self.vehicles, "\n---------------")
         self.move_vehicles()
+        self.spawn_and_despawn_vehicles()
+        #self.spawn_and_despawn_vehicles()
         #print(self.vehicles, "\n---------------")
 
     def destroy(self):

@@ -591,6 +591,60 @@ class I24WestAndEastNetwork(NetworkGenerator):
         eastbound_network.create_network(road_length, longitudinal_step, lane_count, lane_width)
         self.network = Network.merge_networks(westbound_network.network, eastbound_network.network, network_id)
 
+class SimplifiedOneLaneRoadNetwork(NetworkGenerator):
+    def __init__(self, fd, lambda_lc=0.05):
+        super().__init__()
+        self.network = None
+        self.fd = fd
+        self.lane_change_model = SpeedIncentiveLaneChange(lambda_lc=lambda_lc)
+
+    def create_network(self, road_length, longitudinal_step=50.0, lane_width=3.6576):
+        network_id = "simplified_one_lane_road_network"
+        road_id = "1"
+        offset_from_medium = lane_width
+        road_width = lane_width
+        starting_x = 0.0
+        starting_y = 0.0
+        ending_x = road_length
+        ending_y = 0.0
+
+        road_left_polyline = [
+            (starting_x, starting_y),
+            (ending_x, ending_y)
+        ]
+        road_right_polyline = [
+            (starting_x, starting_y - road_width),
+            (ending_x, ending_y - road_width)
+        ]
+
+        road_lane_data = {
+            -1: {
+                "width": lane_width,
+                "lateral_position": 0.0
+            }
+        }
+
+        longitudinal_steps = np.arange(0.0, road_length, longitudinal_step).tolist()
+        cells = {}
+        for i, step in enumerate(longitudinal_steps):
+            for lane in road_lane_data:
+                cell_id = f"road_{road_id}_cell_{lane}_step_{i}"
+                start_s = step
+                end_s = step + longitudinal_step
+                mass = 0
+                mask_mass = 0
+                inflow_connections = []
+                outflow_connections = []
+                if (i > 0):
+                    inflow_connections.append((road_id, f"road_{road_id}_cell_{lane}_step_{i - 1}"))
+                if (i < (len(longitudinal_steps) - 1)):
+                    outflow_connections.append((road_id, f"road_{road_id}_cell_{lane}_step_{i + 1}"))
+                cell = Cell(road_id=road_id, cell_id=cell_id, lane=lane, start_s=start_s, end_s=end_s, mass=mass, mask_mass=mask_mass, inflow_connections=inflow_connections, outflow_connections=outflow_connections, fd=self.fd, lane_change_model=self.lane_change_model)
+                cells[cell_id] = cell
+
+        road = Road(road_id=road_id, left_polyline=road_left_polyline, right_polyline=road_right_polyline, lane_data=road_lane_data, cells=cells)
+        self.network = Network(network_id=network_id, roads={road_id: road})
+
 # =========================
 # Ground-truth data
 # =========================
@@ -619,47 +673,51 @@ REQUIRED_GT_COLUMNS = {
 }
 
 class GroundTruthStore:
-    def __init__(self, micro_df: pd.DataFrame, macro_df: pd.DataFrame):
-        missing_micro = REQUIRED_GT_COLUMNS["micro"] - set(micro_df.columns)
-        if missing_micro:
-            raise ValueError(f"Ground-truth micro parquet missing columns: {sorted(missing_micro)}")
+    def __init__(self, micro_df: pd.DataFrame = None, macro_df: pd.DataFrame = None):
+        if micro_df is not None:
+            missing_micro = REQUIRED_GT_COLUMNS["micro"] - set(micro_df.columns)
+            if missing_micro:
+                raise ValueError(f"Ground-truth micro parquet missing columns: {sorted(missing_micro)}")
 
-        self.micro_df = micro_df.copy()
-        self.micro_df["id"] = self.micro_df["id"].astype(int)
-        self.micro_df["class"] = self.micro_df["class"].astype(int)
-        self.micro_df["time"] = self.micro_df["time"].astype(float)
-        self.micro_df["road_id"] = self.micro_df["road_id"].astype(str)
-        self.micro_df["s"] = self.micro_df["s"].astype(float)
-        self.micro_df["t"] = self.micro_df["t"].astype(float)
-        self.micro_df["length"] = self.micro_df["length"].astype(float)
-        self.micro_df["width"] = self.micro_df["width"].astype(float)
-        self.micro_df["height"] = self.micro_df["height"].astype(float)
+            self.micro_df = micro_df.copy()
+            self.micro_df["id"] = self.micro_df["id"].astype(int)
+            self.micro_df["class"] = self.micro_df["class"].astype(int)
+            self.micro_df["time"] = self.micro_df["time"].astype(float)
+            self.micro_df["road_id"] = self.micro_df["road_id"].astype(str)
+            self.micro_df["s"] = self.micro_df["s"].astype(float)
+            self.micro_df["t"] = self.micro_df["t"].astype(float)
+            self.micro_df["length"] = self.micro_df["length"].astype(float)
+            self.micro_df["width"] = self.micro_df["width"].astype(float)
+            self.micro_df["height"] = self.micro_df["height"].astype(float)
 
-        missing_macro = REQUIRED_GT_COLUMNS["macro"] - set(macro_df.columns)
-        if missing_macro:
-            raise ValueError(f"Ground-truth macro parquet missing columns: {sorted(missing_macro)}")
+        if macro_df is not None:
+            missing_macro = REQUIRED_GT_COLUMNS["macro"] - set(macro_df.columns)
+            if missing_macro:
+                raise ValueError(f"Ground-truth macro parquet missing columns: {sorted(missing_macro)}")
 
-        self.macro_df = macro_df.copy()
-        self.macro_df["time"] = self.macro_df["time"].astype(float)
-        self.macro_df["time_length"] = self.macro_df["time_length"].astype(float)
-        self.macro_df["road_id"] = self.macro_df["road_id"].astype(str)
-        self.macro_df["cell_id"] = self.macro_df["cell_id"].astype(str)
-        self.macro_df["density"] = self.macro_df["density"].astype(float)
-        self.macro_df["velocity"] = self.macro_df["velocity"].astype(float)
+            self.macro_df = macro_df.copy()
+            self.macro_df["time"] = self.macro_df["time"].astype(float)
+            self.macro_df["time_length"] = self.macro_df["time_length"].astype(float)
+            self.macro_df["road_id"] = self.macro_df["road_id"].astype(str)
+            self.macro_df["cell_id"] = self.macro_df["cell_id"].astype(str)
+            self.macro_df["density"] = self.macro_df["density"].astype(float)
+            self.macro_df["velocity"] = self.macro_df["velocity"].astype(float)
 
-        # Fast lookup: sorted time array + {time: {(road_id, cell_id): density}}
-        self._macro_density_lookup: Dict[float, Dict[Tuple[str, str], float]] = {
-            float(t): {
-                (str(r), str(c)): float(d)
-                for r, c, d in zip(grp["road_id"], grp["cell_id"], grp["density"])
+            # Fast lookup: sorted time array + {time: {(road_id, cell_id): density}}
+            self._macro_density_lookup: Dict[float, Dict[Tuple[str, str], float]] = {
+                float(t): {
+                    (str(r), str(c)): float(d)
+                    for r, c, d in zip(grp["road_id"], grp["cell_id"], grp["density"])
+                }
+                for t, grp in self.macro_df.groupby("time")
             }
-            for t, grp in self.macro_df.groupby("time")
-        }
-        self._macro_times: np.ndarray = np.sort(np.array(list(self._macro_density_lookup.keys())))
+            self._macro_times: np.ndarray = np.sort(np.array(list(self._macro_density_lookup.keys())))
 
     @staticmethod
-    def from_parquet(micro_parquet_path: str, macro_parquet_path: str) -> "GroundTruthStore":
-        return GroundTruthStore(pd.read_parquet(micro_parquet_path), pd.read_parquet(macro_parquet_path))
+    def from_parquet(micro_parquet_path: str = None, macro_parquet_path: str = None) -> "GroundTruthStore":
+        micro_df = pd.read_parquet(micro_parquet_path) if micro_parquet_path is not None else None
+        macro_df = pd.read_parquet(macro_parquet_path) if macro_parquet_path is not None else None
+        return GroundTruthStore(micro_df, macro_df)
 
     def macro_snapshot_at_time(self, time_value: float, tolerance: float = 1e-2) -> pd.DataFrame:
         unique_times = self.macro_df["time"].unique()
@@ -1492,6 +1550,8 @@ class Simulation:
 
         self.masking_cells: Dict[str, ArbitraryMaskingCell] = {}
         self._step_callbacks: Dict[str, Any] = {}
+        self._prestep_callbacks: Dict[str, Any] = {}
+        self._poststep_callbacks: Dict[str, Any] = {}
 
         self.network.validate()
 
@@ -1533,6 +1593,22 @@ class Simulation:
     def unregister_step_callback(self, key) -> None:
         if key in self._step_callbacks:
             del self._step_callbacks[key]
+
+    def register_prestep_callback(self, fn, key) -> None:
+        """Register a callable invoked at the start of each step as fn(sim_time, dt), before the step callbacks have been run."""
+        self._prestep_callbacks[key] = fn
+
+    def unregister_prestep_callback(self, key) -> None:
+        if key in self._prestep_callbacks:
+            del self._prestep_callbacks[key]
+
+    def register_poststep_callback(self, fn, key) -> None:
+        """Register a callable invoked at the start of each step as fn(sim_time, dt), before the step callbacks have been run."""
+        self._poststep_callbacks[key] = fn
+
+    def unregister_poststep_callback(self, key) -> None:
+        if key in self._poststep_callbacks:
+            del self._poststep_callbacks[key]
 
     def _snapshot(self) -> None:
         self.rollout_results.append(
@@ -1741,16 +1817,24 @@ class Simulation:
 
     def step(self) -> None:
         self._snapshot()
+        callbacks = [cb for cb in self._prestep_callbacks]
+        for cb in callbacks:
+            if cb in self._prestep_callbacks:
+                self._prestep_callbacks[cb](self.current_time, self.time_resolution)
         callbacks = [cb for cb in self._step_callbacks]
         for cb in callbacks:
             if cb in self._step_callbacks:
                 self._step_callbacks[cb](self.current_time, self.time_resolution)
-        self._update_masks()
+        callbacks = [cb for cb in self._poststep_callbacks]
+        for cb in callbacks:
+            if cb in self._poststep_callbacks:
+                self._poststep_callbacks[cb](self.current_time, self.time_resolution)
         self.active = self._build_active_network()
         self.rollout_results[-1].active_network = self.active.snapshot()
         if self.masking_cells:
             self.rollout_results[-1].mask_snapshots = dict(self.masking_cells)
         self._step_active_network(self.active)
+        self._update_masks()
         ConservativeRemapper.move_active_masks(self, self.active)
         """
         for ac in active.active_cells.values():
@@ -1765,15 +1849,21 @@ class Simulation:
         self.gt_store.apply_density_snapshot_to_network_boundaries(self.network, self.current_time)
         #print(self.current_time)
 
+    def initialize_callbacks(self):
+        self.active = self._build_active_network()
+        """
+        callbacks = [cb for cb in self._step_callbacks]
+        for cb in callbacks:
+            self._step_callbacks[cb](self.current_time, self.time_resolution)
+        self.active = self._build_active_network()
+        """
+
     def run(self, duration: float, initialize=True) -> None:
         if duration < 0.0:
             raise ValueError("duration must be non-negative.")
         num_steps = int(np.round(duration / self.time_resolution))
         if initialize:
-            callbacks = [cb for cb in self._step_callbacks]
-            for cb in callbacks:
-                self._step_callbacks[cb](self.current_time, self.time_resolution)
-            self.active = self._build_active_network()
+            self.initialize_callbacks()
         for _ in range(num_steps):
             self.step()
 
@@ -2617,7 +2707,7 @@ class I24MicroMask(ArbitraryMaskingCell):
                 vehicles.append(self.vehicles[new_vehicle_key])
         return vehicles
 
-    def rear_boundary_flux(self, rho_exterior: float, fd_exterior: "FundamentalDiagram", sim_time: float, dt: float) -> float:
+    def get_rear_density(self, fd_exterior: "FundamentalDiagram"):
         leaving_region = 1 / fd_exterior.rho_c
         rear_vehicle = self.get_rear_vehicle()
         if rear_vehicle is not None:
@@ -2634,24 +2724,26 @@ class I24MicroMask(ArbitraryMaskingCell):
             vehicle_leaving = False
             rho_interior = 0.0
             vehicle_velocity = 0
+        return rho_interior 
 
-        if isinstance(fd_exterior, GreenshieldsFD):            
-            p_star = None
-            # Rarefaction
-            if (rho_exterior > rho_interior):
-                p_s = fd_exterior.sonic_point(self.anchor_speed)
-                if (rho_exterior < p_s):
-                    p_star = rho_exterior
-                elif ((rho_interior <= p_s) and (p_s <= rho_exterior)):
-                    p_star = p_s
-                else:
-                    p_star = rho_interior
-            # Shock
+    def rear_boundary_flux(self, rho_exterior: float, fd_exterior: "FundamentalDiagram", sim_time: float, dt: float) -> float:
+        rho_interior = self.get_rear_density(fd_exterior)
+
+        demand = None
+        supply = None
+        if isinstance(fd_exterior, TriangularFD):
+            g_max = (fd_exterior.v_f - self.anchor_speed) * fd_exterior.rho_c
+            if rho_exterior > fd_exterior.rho_c:
+                demand = g_max
             else:
-                s = fd_exterior.shock_speed(rho_exterior, rho_interior)
-                p_star = rho_exterior if (s > self.anchor_speed) else rho_interior
+                demand = (fd_exterior.v_f - self.anchor_speed) * rho_exterior
+
+            if rho_interior > fd_exterior.rho_c:
+                supply = (fd_exterior.w * fd_exterior.rho_j) - ((fd_exterior.w + self.anchor_speed) * rho_interior)
+            else:
+                supply = g_max
             
-        elif isinstance(fd_exterior, TriangularFD):
+            """
             p_star = None
             #Rarefaction
             if (rho_exterior > rho_interior):
@@ -2668,15 +2760,16 @@ class I24MicroMask(ArbitraryMaskingCell):
                     p_star = rho_exterior
                 else:
                     p_star = rho_interior
+            """
 
-        net_flux = (fd_exterior._flow(p_star) - (self.anchor_speed * p_star))
-        rear_estimated_speed = fd_exterior._flow(p_star) / p_star
+        net_flux = min(demand, supply)
+        #net_flux = (fd_exterior._flow(p_star) - (self.anchor_speed * p_star))
 
         self.rear_flux_memory += net_flux
         return net_flux
         #return 0.0
 
-    def front_boundary_flux(self, rho_exterior: float, fd_exterior: "FundamentalDiagram", sim_time: float, dt: float) -> float:
+    def get_front_density(self, fd_exterior: "FundamentalDiagram"):
         front_vehicle = self.get_front_vehicle()
         leaving_region = 1 / fd_exterior.rho_c
         window_length = (self.margin_s * 2)
@@ -2693,24 +2786,26 @@ class I24MicroMask(ArbitraryMaskingCell):
             rho_interior = 0.0
             vehicle_velocity = 0.0
             vehicle_leaving = False
-    
-        if isinstance(fd_exterior, GreenshieldsFD):
-            p_star = None
-            # Rarefaction
-            if (rho_interior > rho_exterior):
-                p_s = fd_exterior.sonic_point(self.anchor_speed)
-                if (rho_interior < p_s):
-                    p_star = rho_interior
-                elif ((rho_exterior <= p_s) and (p_s <= rho_interior)):
-                    p_star = p_s
-                else:
-                    p_star = rho_exterior
-            # Shock
-            else:
-                s = fd_exterior.shock_speed(rho_interior, rho_exterior)
-                p_star = rho_interior if (s > self.anchor_speed) else rho_exterior
 
-        elif isinstance(fd_exterior, TriangularFD):
+        return rho_interior
+
+    def front_boundary_flux(self, rho_exterior: float, fd_exterior: "FundamentalDiagram", sim_time: float, dt: float) -> float:
+        rho_interior = self.get_front_density(fd_exterior)
+    
+        demand = None
+        supply = None
+        if isinstance(fd_exterior, TriangularFD):
+            g_max = (fd_exterior.v_f - self.anchor_speed) * fd_exterior.rho_c
+            if rho_interior > fd_exterior.rho_c:
+                demand = g_max
+            else:
+                demand = (fd_exterior.v_f - self.anchor_speed) * rho_interior
+
+            if rho_exterior > fd_exterior.rho_c:
+                supply = (fd_exterior.w * fd_exterior.rho_j) - ((fd_exterior.w + self.anchor_speed) * rho_exterior)
+            else:
+                supply = g_max
+            """
             p_star = None
             #Rarefaction
             if (rho_interior > rho_exterior):
@@ -2727,8 +2822,10 @@ class I24MicroMask(ArbitraryMaskingCell):
                     p_star = rho_interior
                 else:
                     p_star = rho_exterior
+            """
 
-        net_flux = (fd_exterior._flow(p_star) - (self.anchor_speed * p_star))
+        net_flux = min(demand, supply)
+        #net_flux = (fd_exterior._flow(p_star) - (self.anchor_speed * p_star))
         self.front_flux_memory += net_flux
         return net_flux
         #return 0.0

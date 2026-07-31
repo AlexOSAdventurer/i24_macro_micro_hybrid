@@ -18,10 +18,21 @@ if TYPE_CHECKING:
 
 
 class I24CarlaCoupler:
+    #{'min_spawn_length': 4.0171221724763075, 'min_spawn_distance': 4.4858339374315745, 'spawn_ttc': 0.798832163678192}
     #min_spawn_length = 8.368510445032973 + 5.114319171517062 # Meters
     #min_spawn_distance = 5.114319171517062 # Meters
-    min_spawn_length = 8.49003635626501 + 3.9448110506084197 # Meters
-    min_spawn_distance = 3.9448110506084197 # Meters
+
+    #min_spawn_length = 8.49003635626501 + 3.9448110506084197 # Meters
+    #min_spawn_distance = 3.9448110506084197 # Meters
+    #spawn_ttc = 3.0 # Seconds
+
+    #min_spawn_length = 4.0171221724763075 + 4.4858339374315745
+    #min_spawn_distance = 4.4858339374315745
+    #spawn_ttc = 0.798832163678192
+
+    min_spawn_length = 6.8725979813165115 + 4.418460070966603
+    min_spawn_distance = 4.418460070966603
+    spawn_ttc = 0.5504990436241721
     visible_time_max_difference = 0.1 # Seconds
     ghost_time_max_difference = 1.0 # Seconds
     desired_s_max_difference = 50.0 # Meters
@@ -29,7 +40,7 @@ class I24CarlaCoupler:
     spawn_region = 75.0 # Meters
     vehicle_spawn_limit = 5.0 # 5 cars per tick allowed
 
-    def __init__(self, motion_data: GroundTruthStore, dt: float, lanes: List[int], mapping, hero_road: str, desired_time: float, desired_s: float, visible_window: float, ghost_window: float, bev_video_path: str = "carla_camera_bev_view.mp4") -> None:
+    def __init__(self, motion_data: GroundTruthStore, dt: float, lanes: List[int], mapping, hero_road: str, desired_time: float, desired_s: float, visible_window: float, ghost_window: float, record_videos = True, bev_video_path: str = "carla_camera_bev_view.mp4") -> None:
         self.motion_data = motion_data
         self.lanes = lanes
         self.dt = float(dt)
@@ -50,7 +61,7 @@ class I24CarlaCoupler:
         self.loadHero(int(hero_road), desired_time, desired_s)
         self.loadVisible()
         self.loadGhosts()
-        self.carla_sim = I24MotionCarlaSimulationCoupled("localhost", 2000, self, self.mapping["road_data"], bev_video_path)
+        self.carla_sim = I24MotionCarlaSimulationCoupled("localhost", 2000, self, self.mapping["road_data"], bev_video_path, record_videos)
 
     def get_lane_dfs(self, timestamp_min, timestamp_max, s_min, s_max):
         df = self.motion_data.micro_df
@@ -160,7 +171,7 @@ class I24CarlaCoupler:
             if (rear_most_vehicle is None) or (vehicles[vehicle]["s"] < rear_most_vehicle["s"]):
                 rear_most_vehicle = vehicles[vehicle]
         if rear_most_vehicle is None:
-            return self.getBehindLaneVelocityMacro(lane_id, default_speed, min_cell_size)
+            return self.getBehindLaneVelocityMacro(lane_id, default_speed)
         return rear_most_vehicle["velocity"]
     
     def getAheadLaneDensity(self, lane_id, default_density):
@@ -499,13 +510,18 @@ class I24CarlaCoupler:
             # Spawn Rear Boundary Vehicles
             # Get rearmost s position
             rear_s = None
+            rear_velocity = None
             for vehicle_id in new_visible_states[lane]:
                 vehicle_data = new_visible_states[lane][vehicle_id]
                 if (rear_s is None) or (rear_s > vehicle_data["s"]):
                     rear_s = vehicle_data["s"]
+                    rear_velocity = vehicle_data["velocity"]
             if rear_s is None:
                 s_availability = (visible_window[3] - visible_window[2])
             else:
+                desired_macro_velocity = self.getBehindLaneVelocityMacro(lane, 0.0)
+                closing_rate = desired_macro_velocity - rear_velocity
+                rear_s = min(rear_s, rear_s - (closing_rate * self.spawn_ttc))
                 s_availability = rear_s - visible_window[2]
             s_availability = min(s_availability, self.spawn_region)
             # Mandate a certain distance threshold of the rearmost vehicle for spawning in new stuff
@@ -513,13 +529,18 @@ class I24CarlaCoupler:
                 new_visible_states = self._spawnVehiclesInRear(new_visible_states, lane, s_availability)
             # Spawn Front Boundary Vehicles
             front_s = None
+            front_velocity = None
             for vehicle_id in new_visible_states[lane]:
                 vehicle_data = new_visible_states[lane][vehicle_id]
                 if (front_s is None) or (front_s < vehicle_data["s"]):
                     front_s = vehicle_data["s"] + vehicle_data["length"]
+                    front_velocity = vehicle_data["velocity"]
             if front_s is None:
                 s_availability = (visible_window[3] - visible_window[2])
             else:
+                desired_macro_velocity = self.getAheadLaneVelocityMacro(lane, 0.0)
+                closing_rate = front_velocity - desired_macro_velocity
+                front_s = max(front_s, front_s + (closing_rate * self.spawn_ttc))
                 s_availability = visible_window[3] - front_s
             s_availability = min(s_availability, self.spawn_region)
             # Mandate a certain distance threshold of the frontmost vehicle for spawning in new stuff
@@ -565,7 +586,7 @@ class I24CarlaCoupler:
                         # No need to remove. Will be dealt with when we reload the ghost data.
 
     def updateVisibleVehiclesViaGhosts(self):
-        # For each ghost vehicle, we will estimate its projected future position with a simple change to s.
+        # For each ghost vehicle, we will estimate laneits projected future position with a simple change to s.
         # Then, we will see if they fall under the visible region. If so, attempt to admit them, as long as geometry permits it.
         # Check behind vehicles
         self.updateVisibleVehiclesWithGhostSelection(self.ghost_state["behind"])
