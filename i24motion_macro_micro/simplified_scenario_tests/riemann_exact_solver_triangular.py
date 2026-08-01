@@ -177,9 +177,9 @@ class Solver:
                         left_front_component = WaveFront(right_region.s, -self.fd.w)
                         intermediate_component = ConstantRegion(right_region.s, 0.0, self.fd.rho_c)
                         right_front_component = WaveFront(right_region.s, self.fd.v_f)
-                        components_to_insert((left_front_index, left_front_component))
-                        components_to_insert((intermediate_state_index, intermediate_component))
-                        components_to_insert((right_front_index, right_front_component))
+                        components_to_insert.append((left_front_index, left_front_component))
+                        components_to_insert.append((intermediate_state_index, intermediate_component))
+                        components_to_insert.append((right_front_index, right_front_component))
                     else:
                         raise Exception("Case is occurring that doesn't fit into any of these!")
         print("Inserting components ", components_to_insert)
