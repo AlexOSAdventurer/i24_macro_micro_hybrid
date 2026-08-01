@@ -1,5 +1,6 @@
 import sys
 sys.path.append("..")
+import simulation
 from simulation import TriangularFD
 class Component:
     def __init__(self, s: float, velocity: float):
@@ -47,7 +48,7 @@ class Solver:
             return None
         s_difference = right_component.s - left_component.s
         closing_rate = left_component.velocity - right_component.velocity
-        time_to_contact = s_difference / closing_rate if (closing_rate > eps) else None
+        time_to_contact = s_difference / closing_rate if (closing_rate > eps) else float('inf')
         return time_to_contact
 
     def get_no_constant_regions(self):
@@ -83,12 +84,14 @@ class Solver:
             self.resolve_breakpoints()
             self.resolve_contacts()
             dt -= ttc
+            self.t += ttc
             _, ttc = self.determine_next_breakpoint(dt)
         self.advance_fronts(dt)
+        self.t += dt
 
     # We assume there are no contacts in this temporal region
     def advance_fronts(self, dt, ignore_contacts=False):
-        contacts = self.get_no_constant_regions(dt)
+        contacts = self.get_no_constant_regions()
         for contact_index in contacts:
             constant_region_left_index = contact_index - 1
             constant_region_right_index = contact_index + 1
@@ -107,6 +110,7 @@ class Solver:
                     constant_region_right.region_length -= (contact.velocity * dt)
                 else:
                     raise Exception("Right region is not a constant region!")
+            contact.s += (contact.velocity * dt)
  
     # All contacts within eps distance will be resolved
     def resolve_contacts(self, eps=1e-4):
@@ -126,7 +130,9 @@ class Solver:
                     if (isinstance(left_front, WaveFront)):
                         fronts_to_delete.append(i)
                     if (isinstance(right_front, WaveFront)):
-                        fronts_to_delete.append(i)
+                        fronts_to_delete.append(k)
+                    fronts_to_delete.append(j) # We always delete their contained intermediate region
+        print("Deleting fronts ", fronts_to_delete)
         self.current_state = [c for i, c in enumerate(self.current_state) if i not in fronts_to_delete]
         # Second, we mark colliding constant regions and generate an appropriate wave front between them.
         # Moving Boundaries count as a constant region
@@ -176,6 +182,7 @@ class Solver:
                         components_to_insert((right_front_index, right_front_component))
                     else:
                         raise Exception("Case is occurring that doesn't fit into any of these!")
+        print("Inserting components ", components_to_insert)
         for (index, component) in components_to_insert:
             self.current_state.insert(index, component)
 
@@ -187,3 +194,17 @@ class Solver:
             breakpoint_callbacks = self.breakpoints[t]
             for callback in breakpoint_callbacks:
                 callback(self)
+
+def return_demo():
+    fd = simulation.TriangularFD(v_f=50.0, rho_j=0.13, w=6.0)
+    initial_states = []
+    initial_states.append(SilentBoundary(s=0.0))
+    initial_states.append(ConstantRegion(s=100.0, density=0.12, region_length=100.0))
+
+    initial_states = []
+    initial_states.append(SilentBoundary(s=0.0))
+    initial_states.append(ConstantRegion(s=0.0, density=0.10, region_length=100.0))
+    initial_states.append(ConstantRegion(s=100.0, density=0.12, region_length=100.0))
+    initial_states.append(SilentBoundary(s=200.0))
+    solver = Solver(initial_state=initial_states, fd=fd)
+    return solver
