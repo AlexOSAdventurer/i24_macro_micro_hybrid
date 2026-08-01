@@ -45,7 +45,7 @@ class Solver:
 
     def time_to_contact(self, left_component: Component, right_component: Component, eps=1e-4):
         if (isinstance(left_component, ConstantRegion) or isinstance(right_component, ConstantRegion)):
-            return None
+            return float('inf')
         s_difference = right_component.s - left_component.s
         closing_rate = left_component.velocity - right_component.velocity
         time_to_contact = s_difference / closing_rate if (closing_rate > eps) else float('inf')
