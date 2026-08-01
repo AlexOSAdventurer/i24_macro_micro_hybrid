@@ -1369,12 +1369,20 @@ class TriangularFD(FundamentalDiagram):
             return self.rho_j
     
     def shock_speed(self, rho_left: float, rho_right: float) -> float:
-        if ((rho_left <= rho_right) and (rho_right <= self.rho_c)):
+        both_free = (rho_left <= self.rho_c) and (rho_right <= self.rho_c)
+        both_cong = (rho_left >= self.rho_c) and (rho_right >= self.rho_c)
+
+        # Same-branch jumps are contacts at the branch speed, in EITHER direction.
+        if both_free:
             return self.v_f
-        elif ((self.rho_c <= rho_left) and (rho_left <= rho_right)):
+        if both_cong:
             return -self.w
-        else:
-            return ((self.w * (self.rho_j - rho_right)) - (self.v_f * rho_left)) / ((rho_right - rho_left) + 1e-12)
+
+        # Straddling rho_c. Up-jump (free left, congested right) is a single shock.
+        if rho_left < rho_right:
+            # rho_left free, rho_right congested -> admissible shock.
+            return (self._flow(rho_left) - self._flow(rho_right)) / (rho_left - rho_right)
+
 
 @dataclass
 class GreenshieldsFD(FundamentalDiagram):
