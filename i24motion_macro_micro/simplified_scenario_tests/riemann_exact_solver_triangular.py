@@ -2,6 +2,8 @@ import sys
 sys.path.append("..")
 import simulation
 from simulation import TriangularFD
+from functools import partial
+
 class Component:
     def __init__(self, s: float, velocity: float):
         self.s = s
@@ -18,10 +20,10 @@ class SilentBoundary(Component):
         super().__init__(s, 0.0)
 
 class MovingBoundary(Component):
-    def __init__(self, s: float, velocity: float, density: float, boundary_init_function: callable):
-        super().__init__(s, velocity)
-        self.density = density
-        self.boundary_init_function = boundary_init_function
+    def __init__(self, s: float, boundary_init_function: callable):
+        super().__init__(s, 0.0)
+        self.density = 0.0
+        self.boundary_init_function = partial(boundary_init_function, self)
 
 class WaveFront(Component):
     def __init__(self, s: float, velocity: float):
@@ -68,24 +70,27 @@ class Solver:
             right_component = self.current_state[right_component_index]
             current_ttc = self.time_to_contact(left_component, right_component)
             if (current_ttc <= (dt - eps)):
-                results.append(((left_component_index, right_component_index), current_ttc))
+                results.append(current_ttc)
+        breakpoint_times = [t for t in sorted(list(self.breakpoints.keys())) if (t > self.t) and ((t - self.t - dt - eps) <= 0.0)]
+        for breakpoint in breakpoint_times:
+            results.append(breakpoint - self.t)
         return results
         
     def determine_next_breakpoint(self, dt):
-        contacts = sorted(self.get_contacts_in_time_region(dt), key=lambda e: e[1])
+        contacts = sorted(self.get_contacts_in_time_region(dt))
         if (len(contacts) == 0):
-            return (None, float('inf'))
+            return float('inf')
         return contacts[0]
     
     def advance(self, dt=0.001):
-        _, ttc = self.determine_next_breakpoint(dt)
+        ttc = self.determine_next_breakpoint(dt)
         while (ttc <= dt):
             self.advance_fronts(ttc)
+            self.t += ttc
             self.resolve_breakpoints()
             self.resolve_contacts()
             dt -= ttc
-            self.t += ttc
-            _, ttc = self.determine_next_breakpoint(dt)
+            ttc = self.determine_next_breakpoint(dt)
         self.advance_fronts(dt)
         self.t += dt
 
@@ -96,8 +101,10 @@ class Solver:
             constant_region_left_index = contact_index - 1
             constant_region_right_index = contact_index + 1
             contact = self.current_state[contact_index]
+            print("Contact ", contact)
             if (constant_region_left_index >= 0):
                 constant_region_left = self.current_state[constant_region_left_index]
+                print("Constant_region_left ", constant_region_left)
                 if (isinstance(constant_region_left, ConstantRegion)):
                     constant_region_left.region_length += (contact.velocity * dt)
                 else:
@@ -105,15 +112,17 @@ class Solver:
 
             if (constant_region_right_index < len(self.current_state)):
                 constant_region_right = self.current_state[constant_region_right_index]
+                print("Constant_region_right ", constant_region_right)
                 if (isinstance(constant_region_right, ConstantRegion)):
                     constant_region_right.s += (contact.velocity * dt)
                     constant_region_right.region_length -= (contact.velocity * dt)
                 else:
                     raise Exception("Right region is not a constant region!")
             contact.s += (contact.velocity * dt)
+            print("-------")
  
     # All contacts within eps distance will be resolved
-    def resolve_contacts(self, eps=1e-4):
+    def resolve_contacts(self, eps=1e-8):
         # First, we mark colliding wave fronts and solve them by deleting them and their contained intermediate region.
         # If one of the fronts is actually a boundary (Silent or Moving), we won't delete the boundary.
         fronts_to_delete = []
@@ -150,50 +159,80 @@ class Solver:
                 contacting = (abs(left_region.s - right_region.s) < eps)
             elif right_moving_boundary_left_constant_region:
                 contacting = (abs(left_region.s + left_region.region_length - right_region.s) < eps)
-            if contacting:
+            must_resolve = contacting and (abs(left_region.density - right_region.density) > eps)
+            if must_resolve:
                 if (two_constant_regions or left_moving_boundary_right_constant_region or right_moving_boundary_left_constant_region):
                     left_density = left_region.density
                     right_density = right_region.density
 
-                    # Contact discontinuity? We insert a corresponding wave front here to their characteristic speed
-                    if ((left_density < self.fd.rho_c) and (right_density < self.fd.rho_c)) or ((left_density >= self.fd.rho_c) and (right_density >= self.fd.rho_c)):
-                        placement_index = i + 1 + len(components_to_insert)
+                    contact_discontinuity = ((left_density <= self.fd.rho_c) and (right_density <= self.fd.rho_c)) or ((left_density >= self.fd.rho_c) and (right_density >= self.fd.rho_c))
+                    shock = (left_density < self.fd.rho_c) and (right_density > self.fd.rho_c)
+                    # Contact discontinuity or shock? We insert a corresponding wave front here to their characteristic speed
+                    if contact_discontinuity or shock:
                         velocity = self.fd.shock_speed(left_density, right_density)
-                        new_component = WaveFront(right_region.s, velocity)
-                        components_to_insert.append((placement_index, new_component))
-
-                    # Shock discontinuty? We insert a corresponding wave front here that moves backwards
-                    elif (left_density < self.fd.rho_c) and (right_density > self.fd.rho_c):
-                        placement_index = i + 1 + len(components_to_insert)
-                        velocity = self.fd.shock_speed(left_density, right_density)
-                        new_component = WaveFront(right_region.s, velocity)
-                        components_to_insert.append((placement_index, new_component))
+                        moving_boundary_should_replace_wave = False
+                        if (isinstance(left_region, MovingBoundary)):
+                            moving_boundary_should_replace_wave = (velocity <= left_region.velocity)
+                        elif (isinstance(right_region, MovingBoundary)):
+                            moving_boundary_should_replace_wave = (velocity >= right_region.velocity)
+                        print("Contact discontinuity or shock: ", left_density, right_density)
+                        if not moving_boundary_should_replace_wave:
+                            if (isinstance(left_region, MovingBoundary)):
+                                rear_placement_index = i + 1 + len(components_to_insert)
+                                new_region = ConstantRegion(s=right_region.s, region_length=0.0, density=left_density)
+                                components_to_insert.append((rear_placement_index, new_region))
+                            front_placement_index = i + 1 + len(components_to_insert)
+                            
+                            new_front = WaveFront(right_region.s, velocity)
+                            components_to_insert.append((front_placement_index, new_front))
+                            if (isinstance(right_region, MovingBoundary)):
+                                rear_placement_index = i + 1 + len(components_to_insert)
+                                new_region = ConstantRegion(s=right_region.s, region_length=0.0, density=right_density)
+                                components_to_insert.append((rear_placement_index, new_region))
 
                     # Rarefaction shock? We insert a two wave fronts here, one that moves backwards, one that moves forwards, and an intermediate p_c state between
                     elif (left_density > self.fd.rho_c) and (right_density < self.fd.rho_c):
-                        left_front_index = i + 1 + len(components_to_insert)
-                        intermediate_state_index = i + 2 + len(components_to_insert)
-                        right_front_index = i + 3 + len(components_to_insert)
-                        left_front_component = WaveFront(right_region.s, -self.fd.w)
+                        if (not isinstance(left_region, MovingBoundary)):
+                            left_front_index = i + 1 + len(components_to_insert)
+                            left_front_component = WaveFront(right_region.s, -self.fd.w)
+                            components_to_insert.append((left_front_index, left_front_component))
+
+                        intermediate_state_index = i + 1 + len(components_to_insert)
                         intermediate_component = ConstantRegion(right_region.s, 0.0, self.fd.rho_c)
-                        right_front_component = WaveFront(right_region.s, self.fd.v_f)
-                        components_to_insert.append((left_front_index, left_front_component))
                         components_to_insert.append((intermediate_state_index, intermediate_component))
-                        components_to_insert.append((right_front_index, right_front_component))
+
+                        if (not isinstance(right_region, MovingBoundary)):
+                            right_front_index = i + 1 + len(components_to_insert)
+                            right_front_component = WaveFront(right_region.s, self.fd.v_f)
+                            components_to_insert.append((right_front_index, right_front_component))
                     else:
+                        print(left_region, right_region, left_density, right_density)
                         raise Exception("Case is occurring that doesn't fit into any of these!")
         print("Inserting components ", components_to_insert)
         for (index, component) in components_to_insert:
             self.current_state.insert(index, component)
 
     # All breakpoints within eps will be resolved
-    def resolve_breakpoints(self, eps=1e-4):
+    def resolve_breakpoints(self, eps=1e-8):
         breakpoint_times = sorted(list(self.breakpoints.keys()))
         valid_breakpoint_times = [t for t in breakpoint_times if abs(t - self.t) < eps]
         for t in valid_breakpoint_times:
             breakpoint_callbacks = self.breakpoints[t]
             for callback in breakpoint_callbacks:
                 callback(self)
+
+    def get_constant_region_mass(self):
+        mass = 0.0
+        for entry in self.current_state:
+            if isinstance(entry, ConstantRegion):
+                mass += (entry.region_length * entry.density)
+        return mass
+
+    def get_current_net_flux(self):
+        constant_region_and_boundaries = [entry for entry in self.current_state if isinstance(entry, (ConstantRegion, MovingBoundary))]
+        first_region = constant_region_and_boundaries[0]
+        last_region = constant_region_and_boundaries[-1]
+        return self.fd._flow(first_region.density) - self.fd._flow(last_region.density)
 
 def return_demo():
     fd = simulation.TriangularFD(v_f=50.0, rho_j=0.13, w=6.0)
@@ -204,7 +243,13 @@ def return_demo():
     initial_states = []
     initial_states.append(SilentBoundary(s=0.0))
     initial_states.append(ConstantRegion(s=0.0, density=0.10, region_length=100.0))
-    initial_states.append(ConstantRegion(s=100.0, density=0.12, region_length=100.0))
-    initial_states.append(SilentBoundary(s=200.0))
+    initial_states.append(ConstantRegion(s=100.0, density=fd.rho_j, region_length=100.0))
+    def boundary_init_function(boundary: MovingBoundary, solver: Solver):
+        boundary.velocity = fd.v_f
+        boundary.density = fd.rho_j
+        def breakpoint(solver):
+            boundary.density = 0.05 * fd.rho_c
+        solver.register_breakpoint(breakpoint, 10.0)
+    initial_states.append(MovingBoundary(s=200.0, boundary_init_function=boundary_init_function))
     solver = Solver(initial_state=initial_states, fd=fd)
     return solver
