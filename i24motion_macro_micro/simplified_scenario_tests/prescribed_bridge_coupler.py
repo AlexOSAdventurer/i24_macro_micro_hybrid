@@ -27,9 +27,10 @@ def boundary_case_1(bridge: PrescribedSimBridge):
         s=bridge.middle_s,
         t=bridge.vehicle_t_position,
         lane=bridge.lane_id,
-        s_dt=0
+        s_dt=bridge.anchor_speed
     )
     bridge.ego_id = "1"
+    bridge.add_boundary_vehicles(density_rear=bridge.fd.rho_j)
 
 def boundary_case_2(bridge: PrescribedSimBridge):
     bridge.anchor_speed = bridge.fd.v_f
@@ -40,9 +41,10 @@ def boundary_case_2(bridge: PrescribedSimBridge):
         s=bridge.middle_s,
         t=bridge.vehicle_t_position,
         lane=bridge.lane_id,
-        s_dt=bridge.fd.velocity_from_density(bridge.fd.rho_c * 0.05)
+        s_dt=bridge.anchor_speed
     )
     bridge.ego_id = "1"
+    bridge.add_boundary_vehicles(density_rear=bridge.fd.rho_c * 0.05)
 
 def boundary_case_3(bridge: PrescribedSimBridge):
     w = bridge.fd.w
@@ -56,9 +58,10 @@ def boundary_case_3(bridge: PrescribedSimBridge):
         s=bridge.middle_s,
         t=bridge.vehicle_t_position,
         lane=bridge.lane_id,
-        s_dt=bridge.fd.velocity_from_density(bridge.fd.rho_c * 2.0)
+        s_dt=bridge.anchor_speed
     )
     bridge.ego_id = "1"
+    bridge.add_boundary_vehicles(density_rear=bridge.fd.rho_c * 2.0)
 
 def boundary_case_4(bridge: PrescribedSimBridge):
     w = bridge.fd.w
@@ -72,9 +75,10 @@ def boundary_case_4(bridge: PrescribedSimBridge):
         s=bridge.middle_s,
         t=bridge.vehicle_t_position,
         lane=bridge.lane_id,
-        s_dt=bridge.fd.velocity_from_density(bridge.fd.rho_c * 0.05)
+        s_dt=bridge.anchor_speed
     )
     bridge.ego_id = "1"
+    bridge.add_boundary_vehicles(density_rear=bridge.fd.rho_c * 0.05)
 
 def boundary_case_5(bridge: PrescribedSimBridge):
     bridge.anchor_speed = 0.0 if ((bridge.current_timestamp - bridge.time_origin) <= 10) else bridge.fd.v_f
@@ -85,9 +89,10 @@ def boundary_case_5(bridge: PrescribedSimBridge):
         s=bridge.middle_s,
         t=bridge.vehicle_t_position,
         lane=bridge.lane_id,
-        s_dt=bridge.fd.velocity_from_density(bridge.fd.rho_j)
+        s_dt=bridge.anchor_speed
     )
     bridge.ego_id = "1"
+    bridge.add_boundary_vehicles(density_rear=bridge.fd.rho_j)
 
 def boundary_case_6(bridge: PrescribedSimBridge):
     bridge.anchor_speed = bridge.fd.v_f
@@ -98,9 +103,11 @@ def boundary_case_6(bridge: PrescribedSimBridge):
         s=bridge.middle_s,
         t=bridge.vehicle_t_position,
         lane=bridge.lane_id,
-        s_dt=(bridge.fd.velocity_from_density(bridge.fd.rho_j) if ((bridge.current_timestamp - bridge.time_origin) <= 10) else bridge.fd.velocity_from_density(bridge.fd.rho_c * 0.05))
+        s_dt=bridge.anchor_speed
     )
     bridge.ego_id = "1"
+    bridge.add_boundary_vehicles(density_rear=(bridge.fd.rho_j if (bridge.current_timestamp - bridge.time_origin) <= 10.0 else (bridge.fd.rho_c * 0.05)))
+
 
 def boundary_case_7(bridge: PrescribedSimBridge):
     bridge.anchor_speed = bridge.fd.v_f if ((bridge.current_timestamp - bridge.time_origin) <= 10) else 0.0
@@ -111,9 +118,10 @@ def boundary_case_7(bridge: PrescribedSimBridge):
         s=bridge.middle_s,
         t=bridge.vehicle_t_position,
         lane=bridge.lane_id,
-        s_dt=bridge.fd.velocity_from_density(bridge.fd.rho_c * 0.05)
+        s_dt=bridge.anchor_speed
     )
     bridge.ego_id = "1"
+    bridge.add_boundary_vehicles(density_rear=bridge.fd.rho_c * 0.05)
 
 def boundary_case_8(bridge: PrescribedSimBridge):
     bridge.anchor_speed = 0.0
@@ -124,9 +132,11 @@ def boundary_case_8(bridge: PrescribedSimBridge):
         s=bridge.middle_s,
         t=bridge.vehicle_t_position,
         lane=bridge.lane_id,
-        s_dt=(bridge.fd.velocity_from_density(bridge.fd.rho_c * 0.05) if ((bridge.current_timestamp - bridge.time_origin) <= 10) else bridge.fd.velocity_from_density(bridge.fd.rho_j))
+        s_dt=bridge.anchor_speed
     )
     bridge.ego_id = "1"
+    bridge.add_boundary_vehicles(density_rear=(bridge.fd.rho_c * 0.05 if (bridge.current_timestamp - bridge.time_origin) <= 10.0 else bridge.fd.rho_j))
+    
 
 class PrescribedSimBridge:
     spawn_length = 4.0 #6.8725979813165115 + 4.418460070966603
@@ -145,6 +155,7 @@ class PrescribedSimBridge:
         fd: TriangularFD,
         config_file_name,
         boundary_function=None,
+        spawn_density_function=None,
         bridge_callback_name=None
     ) -> None:
         with open(config_file_name, "r") as f:
@@ -172,9 +183,11 @@ class PrescribedSimBridge:
         self.anchor_speed = 0.0
         self.masking_cell: I24MicroMask = None
         self.boundary_function = boundary_function
+        self.spawn_density_function = spawn_density_function
 
         self.bridge_callback_name = bridge_callback_name
         sim.register_step_callback(partial(PrescribedSimBridge._step, self), bridge_callback_name)
+        sim.register_poststep_callback(partial(PrescribedSimBridge._poststep, self), bridge_callback_name)
 
     def get_current_visible_window(self):
         return self.vehicles[self.ego_id].s - self.margin_s, self.vehicles[self.ego_id].s + self.margin_s
@@ -190,23 +203,13 @@ class PrescribedSimBridge:
         lane_id = self.lane_id
         if not self.running:
             return
-        if self.initialized:
-            lane_cell = self.sim.masking_cells[self._mask_id(lane_id)]
-            self.flow_memory_rear = lane_cell.rear_flux_memory
-            self.flow_memory_front = lane_cell.front_flux_memory
-            self.current_timestamp += self.sim.time_resolution
-            self.boundary_function(self)
-            self.advance_vehicles_and_boundaries()
-            print(self.middle_s, self.anchor_speed, self.current_timestamp, self.sim.time_resolution, len(self.vehicles), float(len(self.vehicles)) / (2 * self.margin_s))
-        else:
-            self.boundary_function(self)
-            self.initialized = True
+        self.boundary_function(self)
+        self.initialized = True
 
         if self.middle_s >= self.max_middle_s:
             print("bridge memories: ", self.flow_memory_front, self.flow_memory_rear)
             self.destroy()
             return
-                    
         new_mask = I24MicroMask(
             mask_id=self._mask_id(lane_id),
             network=self.sim.network,
@@ -219,11 +222,41 @@ class PrescribedSimBridge:
             front_flux_memory=self.flow_memory_front
         )
         self.masking_cell = new_mask
-        new_mask.vehicles = self.collateVehicles()#{vehicle: self.vehicles[vehicle] for vehicle in self.vehicles}
+        new_mask.vehicles = self.collate_vehicles()#{vehicle: self.vehicles[vehicle] for vehicle in self.vehicles}
         self.sim.masking_cells[self._mask_id(lane_id)] = new_mask
-    
+
+    def _poststep(self, sim_time: float, dt: float):
+        lane_id = self.lane_id
+        lane_cell = self.sim.masking_cells[self._mask_id(lane_id)]
+        # Do vehicle processing logic here
+        self.advance_vehicles_and_boundaries()
+        self.current_timestamp += self.sim.time_resolution
+        print(self.middle_s, self.anchor_speed, self.current_timestamp, self.sim.time_resolution, len(self.vehicles), float(len(self.vehicles)) / (2 * self.margin_s))
+        self.flow_memory_rear = lane_cell.rear_flux_memory
+        self.flow_memory_front = lane_cell.front_flux_memory
+
+    def add_boundary_vehicles(self, density_rear: float):
+        # Rear Vehicle
+        self.vehicles["2"] = Vehicle(
+            length=self.spawn_length,
+            width=self.spawn_width,
+            s=(self.middle_s - self.margin_s + self.spawn_length),
+            t=self.vehicle_t_position,
+            lane=self.lane_id,
+            s_dt=self.fd.velocity_from_density(density_rear)
+        )
+        # Front Vehicle
+        self.vehicles["3"] = Vehicle(
+            length=self.spawn_length,
+            width=self.spawn_width,
+            s=(self.middle_s + self.margin_s - self.spawn_length),
+            t=self.vehicle_t_position,
+            lane=self.lane_id,
+            s_dt=self.get_ahead_lane_velocity_macro(self.fd.v_f) if self.initialized else self.spawn_density_function(2.0 * self.margin_s, 2.0 * self.margin_s)
+        )
+        
     # This is meant for the upper level fluid simulator. Thus we have to convert road ids to strings and restructure it to play nice with that code.
-    def collateVehicles(self):
+    def collate_vehicles(self):
         result = {}
         min_s, max_s = self.get_current_visible_window()
         for vehicle in self.vehicles:
@@ -276,3 +309,4 @@ class PrescribedSimBridge:
                 cell.mass += cell.mask_mass
                 cell.mask_mass = 0
             self.sim.unregister_step_callback(self.bridge_callback_name)
+            self.sim.unregister_poststep_callback(self.bridge_callback_name)

@@ -361,16 +361,13 @@ class SimplifiedSimBridge:
         if not self.running:
             return
         if self.initialized:
-            lane_cell = self.sim.masking_cells[self._mask_id(lane_id)]
-            # Do vehicle processing logic here
-            self.advance_and_update_vehicles()
-            self.current_timestamp += self.sim.time_resolution
-            print(self.middle_s, self.anchor_speed, self.current_timestamp, self.sim.time_resolution, len(self.vehicles), float(len(self.vehicles)) / (2 * self.margin_s))
-            #print(self.vehicles)
+            self.inject_vehicles_from_macro()
+            self.remove_vehicles_from_macro()
         else:
             self.spawn_initial_vehicles()
+            print(self.vehicles)
+            print(self.ego_id)
             self.initialized = True
-
         self.middle_s, self.anchor_speed = self.vehicles[self.ego_id].s, self.vehicles[self.ego_id].s_dt
         if self.middle_s >= self.max_middle_s:
             print("bridge memories: ", self.flow_memory_front, self.flow_memory_rear)
@@ -389,18 +386,21 @@ class SimplifiedSimBridge:
             front_flux_memory=self.flow_memory_front
         )
         self.masking_cell = new_mask
-        new_mask.vehicles = self.collateVehicles()#{vehicle: self.vehicles[vehicle] for vehicle in self.vehicles}
+        new_mask.vehicles = self.collate_vehicles()#{vehicle: self.vehicles[vehicle] for vehicle in self.vehicles}
         self.sim.masking_cells[self._mask_id(lane_id)] = new_mask
 
     def _poststep(self, sim_time: float, dt: float):
         lane_id = self.lane_id
         lane_cell = self.sim.masking_cells[self._mask_id(lane_id)]
+        # Do vehicle processing logic here
+        self.advance_and_update_vehicles()
+        self.current_timestamp += self.sim.time_resolution
+        print(self.middle_s, self.anchor_speed, self.current_timestamp, self.sim.time_resolution, len(self.vehicles), float(len(self.vehicles)) / (2 * self.margin_s))
         self.flow_memory_rear = lane_cell.rear_flux_memory
         self.flow_memory_front = lane_cell.front_flux_memory
-        self.spawn_and_despawn_vehicles()
     
     # This is meant for the upper level fluid simulator. Thus we have to convert road ids to strings and restructure it to play nice with that code.
-    def collateVehicles(self):
+    def collate_vehicles(self):
         result = {}
         min_s, max_s = self.get_current_visible_window()
         for vehicle in self.vehicles:
@@ -479,7 +479,7 @@ class SimplifiedSimBridge:
             return default_density # We currently don't bother connecting masks together.
         return mass / cell_length
     
-    def spawn_initial_vehicles(self, dx=0.01, spawn_ego_exact=True):
+    def spawn_initial_vehicles(self, dx=0.01, eps=1e-8, spawn_ego_exact=True):
         #self.vehicles[self.ego_id] = Vehicle(self.spawn_length, self.spawn_width, self.middle_s, self.vehicle_t_position, self.lane_id,)
         # Spawn vehicles behind and in front of the ego vehicle and keep density consistent as we go
         min_s = self.middle_s - self.margin_s
@@ -493,8 +493,9 @@ class SimplifiedSimBridge:
             density = self.spawn_density_function(current_s - min_s, 2.0 * self.margin_s)
             estimated_velocity = self.fd.velocity_from_density(density)
             spawn_here = False
-            if (spawn_ego_exact and (abs(current_s - self.middle_s) < dx)):
+            if (spawn_ego_exact and (abs(current_s - self.middle_s) < (dx - eps))):
                 spawn_here = True
+                spawn_ego_exact = False
             elif (current_mass >= 1.0) and ((previous_vehicle is None) or ((previous_vehicle.s + previous_vehicle.length) < current_s)):
                 if (spawn_ego_exact and (((current_s + self.spawn_length) < self.middle_s) or (current_s > (self.middle_s + self.spawn_length)))) or (not spawn_ego_exact):
                     spawn_here = True

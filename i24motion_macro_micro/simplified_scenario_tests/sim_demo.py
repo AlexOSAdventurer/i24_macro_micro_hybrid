@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import sys
 sys.path.append("..")
+import sim_verification
 from simulation import Simulation, RolloutRenderer, GroundTruthStore, TriangularFD
 from bridge_coupler import SimplifiedSimBridge, NewellModel, IDMModel, IIDMModel, MicroscopicARZVehicleModel
 from dash import Dash, dcc, html, Input, Output, State, callback
@@ -298,5 +299,16 @@ def run_demo_simplified():
     sim.run(config["time_length"])
     run_app(sim, rotation_deg=0.0, port=8052)
 
+def run_demo_verification(macro_name_full: str, macro_name_short: str, micro_case: str):
+    config_main_folder = "verification_config/"
+    config_case_folder = config_main_folder + macro_name_full
+    config_file_path = config_main_folder + f"{macro_name_full}.json"
+    config_selection = sim_verification.verification_config["macro_cases"][macro_name_short]["micro_cases"][micro_case]
+    config = sim_verification.load_sim_verification_config(config_file_path)
+    sim, bridge, logger = sim_verification.load_sim_verification(config_file_path, config, config_selection, "test_macro.csv", "test_mask.csv")
+    sim.run(config["time_length"])
+    run_app(sim, rotation_deg=0.0, port=8052)
+
 if __name__ == "__main__":
-    run_demo_simplified()
+    #run_demo_simplified()
+    run_demo_verification("case_m_4_dx_8.0_dt_0.0625", "m_4", "idm_case")

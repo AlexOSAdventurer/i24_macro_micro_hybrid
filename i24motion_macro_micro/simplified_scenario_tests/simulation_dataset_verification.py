@@ -233,7 +233,7 @@ def micro_mass_check(sim_data: SimplifiedSimulationDataVerification, solver: rie
 
 def micro_case_b_1(sim_data: SimplifiedSimulationDataVerification) -> list[riemann_exact_solver_triangular.Component]:
     road_length = sim_data.config["road_data"]["1"]["road_length"]
-    boundary_start_s = road_length * 0.2
+    boundary_start_s = (road_length * 0.2) - (micro_length / 2.0)
     boundary_end_s = boundary_start_s + micro_length
     fd = sim_data.fd
     def boundary_init_function(boundary: riemann_exact_solver_triangular.MovingBoundary, solver: riemann_exact_solver_triangular.Solver):
@@ -246,7 +246,7 @@ def micro_case_b_1(sim_data: SimplifiedSimulationDataVerification) -> list[riema
 
 def micro_case_b_2(sim_data: SimplifiedSimulationDataVerification) -> list[riemann_exact_solver_triangular.Component]:
     road_length = sim_data.config["road_data"]["1"]["road_length"]
-    boundary_start_s = road_length * 0.2
+    boundary_start_s = (road_length * 0.2) - (micro_length / 2.0)
     boundary_end_s = boundary_start_s + micro_length
     fd = sim_data.fd
     def boundary_init_function(boundary: riemann_exact_solver_triangular.MovingBoundary, solver: riemann_exact_solver_triangular.Solver):
@@ -259,7 +259,7 @@ def micro_case_b_2(sim_data: SimplifiedSimulationDataVerification) -> list[riema
 
 def micro_case_b_3(sim_data: SimplifiedSimulationDataVerification) -> list[riemann_exact_solver_triangular.Component]:
     road_length = sim_data.config["road_data"]["1"]["road_length"]
-    boundary_start_s = road_length * 0.2
+    boundary_start_s = (road_length * 0.2) - (micro_length / 2.0)
     boundary_end_s = boundary_start_s + micro_length
     fd = sim_data.fd
     def boundary_init_function(boundary: riemann_exact_solver_triangular.MovingBoundary, solver: riemann_exact_solver_triangular.Solver):
@@ -272,7 +272,7 @@ def micro_case_b_3(sim_data: SimplifiedSimulationDataVerification) -> list[riema
 
 def micro_case_b_4(sim_data: SimplifiedSimulationDataVerification) -> list[riemann_exact_solver_triangular.Component]:
     road_length = sim_data.config["road_data"]["1"]["road_length"]
-    boundary_start_s = road_length * 0.2
+    boundary_start_s = (road_length * 0.2) - (micro_length / 2.0)
     boundary_end_s = boundary_start_s + micro_length
     fd = sim_data.fd
     def boundary_init_function(boundary: riemann_exact_solver_triangular.MovingBoundary, solver: riemann_exact_solver_triangular.Solver):
@@ -285,7 +285,7 @@ def micro_case_b_4(sim_data: SimplifiedSimulationDataVerification) -> list[riema
 
 def micro_case_b_5(sim_data: SimplifiedSimulationDataVerification) -> list[riemann_exact_solver_triangular.Component]:
     road_length = sim_data.config["road_data"]["1"]["road_length"]
-    boundary_start_s = road_length * 0.2
+    boundary_start_s = (road_length * 0.2) - (micro_length / 2.0)
     boundary_end_s = boundary_start_s + micro_length
     fd = sim_data.fd
     front_boundary = riemann_exact_solver_triangular.SilentBoundary(s=boundary_end_s, velocity=None, delete_on_boundary_collision=True)
@@ -303,7 +303,7 @@ def micro_case_b_5(sim_data: SimplifiedSimulationDataVerification) -> list[riema
 
 def micro_case_b_6(sim_data: SimplifiedSimulationDataVerification) -> list[riemann_exact_solver_triangular.Component]:
     road_length = sim_data.config["road_data"]["1"]["road_length"]
-    boundary_start_s = road_length * 0.2
+    boundary_start_s = (road_length * 0.2) - (micro_length / 2.0)
     boundary_end_s = boundary_start_s + micro_length
     fd = sim_data.fd
     front_boundary = riemann_exact_solver_triangular.SilentBoundary(s=boundary_end_s, velocity=None, delete_on_boundary_collision=True)
@@ -320,7 +320,7 @@ def micro_case_b_6(sim_data: SimplifiedSimulationDataVerification) -> list[riema
 
 def micro_case_b_7(sim_data: SimplifiedSimulationDataVerification) -> list[riemann_exact_solver_triangular.Component]:
     road_length = sim_data.config["road_data"]["1"]["road_length"]
-    boundary_start_s = road_length * 0.2
+    boundary_start_s = (road_length * 0.2) - (micro_length / 2.0)
     boundary_end_s = boundary_start_s + micro_length
     fd = sim_data.fd
     front_boundary = riemann_exact_solver_triangular.SilentBoundary(s=boundary_end_s, velocity=None, delete_on_boundary_collision=True)
@@ -338,7 +338,7 @@ def micro_case_b_7(sim_data: SimplifiedSimulationDataVerification) -> list[riema
 
 def micro_case_b_8(sim_data: SimplifiedSimulationDataVerification) -> list[riemann_exact_solver_triangular.Component]:
     road_length = sim_data.config["road_data"]["1"]["road_length"]
-    boundary_start_s = road_length * 0.2
+    boundary_start_s = (road_length * 0.2) - (micro_length / 2.0)
     boundary_end_s = boundary_start_s + micro_length
     fd = sim_data.fd
     front_boundary = riemann_exact_solver_triangular.SilentBoundary(s=boundary_end_s, velocity=None, delete_on_boundary_collision=True)

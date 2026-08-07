@@ -15,6 +15,14 @@ def spawn_density_function_linear_interpolation(start_density, end_density, s, m
     start_frac = 1.0 - end_frac
     return (start_density * start_frac) + (end_density * end_frac)
 
+# We assume the mask is placed exactly on top of the discontinuity
+# as in, the middle of the boundary is exactly at the discontinuity
+def spawn_density_function_discontinuity(start_density, end_density, s, max_s):
+    end_frac = s / max_s
+    if (end_frac >= 0.5):
+        return end_density
+    return start_density
+
 def lwr_triangular_fd():
     fd = TriangularFD(
         v_f=49.7,
@@ -27,7 +35,7 @@ def micro_case_b_1(sim: Simulation, config_file_name: str):
     with open(config_file_name, "r") as f:
         config = json.load(f)
     road_length = config["road_data"]["1"]["road_length"]
-    micro_middle_position = (0.2 * road_length) + (micro_length / 2.0)
+    micro_middle_position = (0.2 * road_length)# + (micro_length / 2.0)
     micro_max_position = road_length - (micro_length / 2.0)
     return PrescribedSimBridge(sim=sim, 
                               road_id="1",
@@ -36,13 +44,14 @@ def micro_case_b_1(sim: Simulation, config_file_name: str):
                               margin_s=(micro_length / 2.0),
                               fd=lwr_triangular_fd(),
                               config_file_name=config_file_name,
-                              boundary_function=boundary_case_1)
+                              boundary_function=boundary_case_1,
+                              spawn_density_function=partial(spawn_density_function_discontinuity, get_rear_density(sim, micro_middle_position - micro_length), get_front_density(sim, micro_middle_position + micro_length)))
 
 def micro_case_b_2(sim: Simulation, config_file_name: str):
     with open(config_file_name, "r") as f:
         config = json.load(f)
     road_length = config["road_data"]["1"]["road_length"]
-    micro_middle_position = (0.2 * road_length) + (micro_length / 2.0)
+    micro_middle_position = (0.2 * road_length)# + (micro_length / 2.0)
     micro_max_position = road_length - (micro_length / 2.0)
     return PrescribedSimBridge(sim=sim, 
                               road_id="1",
@@ -51,13 +60,14 @@ def micro_case_b_2(sim: Simulation, config_file_name: str):
                               margin_s=(micro_length / 2.0),
                               fd=lwr_triangular_fd(),
                               config_file_name=config_file_name,
-                              boundary_function=boundary_case_2)
+                              boundary_function=boundary_case_2,
+                              spawn_density_function=partial(spawn_density_function_discontinuity, get_rear_density(sim, micro_middle_position - micro_length), get_front_density(sim, micro_middle_position + micro_length)))
 
-def micro_case_b_3(sim: Simulation, config_file_name: str, gt: GroundTruthStore):
+def micro_case_b_3(sim: Simulation, config_file_name: str):
     with open(config_file_name, "r") as f:
         config = json.load(f)
     road_length = config["road_data"]["1"]["road_length"]
-    micro_middle_position = (0.2 * road_length) + (micro_length / 2.0)
+    micro_middle_position = (0.2 * road_length)# + (micro_length / 2.0)
     micro_max_position = road_length - (micro_length / 2.0)
     return PrescribedSimBridge(sim=sim, 
                               road_id="1",
@@ -66,13 +76,14 @@ def micro_case_b_3(sim: Simulation, config_file_name: str, gt: GroundTruthStore)
                               margin_s=(micro_length / 2.0),
                               fd=lwr_triangular_fd(),
                               config_file_name=config_file_name,
-                              boundary_function=boundary_case_3)
+                              boundary_function=boundary_case_3,
+                              spawn_density_function=partial(spawn_density_function_discontinuity, get_rear_density(sim, micro_middle_position - micro_length), get_front_density(sim, micro_middle_position + micro_length)))
 
 def micro_case_b_4(sim: Simulation, config_file_name: str):
     with open(config_file_name, "r") as f:
         config = json.load(f)
     road_length = config["road_data"]["1"]["road_length"]
-    micro_middle_position = (0.2 * road_length) + (micro_length / 2.0)
+    micro_middle_position = (0.2 * road_length)# + (micro_length / 2.0)
     micro_max_position = road_length - (micro_length / 2.0)
     return PrescribedSimBridge(sim=sim, 
                               road_id="1",
@@ -81,13 +92,14 @@ def micro_case_b_4(sim: Simulation, config_file_name: str):
                               margin_s=(micro_length / 2.0),
                               fd=lwr_triangular_fd(),
                               config_file_name=config_file_name,
-                              boundary_function=boundary_case_4)
+                              boundary_function=boundary_case_4,
+                              spawn_density_function=partial(spawn_density_function_discontinuity, get_rear_density(sim, micro_middle_position - micro_length), get_front_density(sim, micro_middle_position + micro_length)))
 
 def micro_case_b_5(sim: Simulation, config_file_name: str,):
     with open(config_file_name, "r") as f:
         config = json.load(f)
     road_length = config["road_data"]["1"]["road_length"]
-    micro_middle_position = (0.2 * road_length) + (micro_length / 2.0)
+    micro_middle_position = (0.2 * road_length)# + (micro_length / 2.0)
     micro_max_position = road_length - (micro_length / 2.0)
     return PrescribedSimBridge(sim=sim, 
                               road_id="1",
@@ -96,13 +108,14 @@ def micro_case_b_5(sim: Simulation, config_file_name: str,):
                               margin_s=(micro_length / 2.0),
                               fd=lwr_triangular_fd(),
                               config_file_name=config_file_name,
-                              boundary_function=boundary_case_5)
+                              boundary_function=boundary_case_5,
+                              spawn_density_function=partial(spawn_density_function_discontinuity, get_rear_density(sim, micro_middle_position - micro_length), get_front_density(sim, micro_middle_position + micro_length)))
 
 def micro_case_b_6(sim: Simulation, config_file_name: str):
     with open(config_file_name, "r") as f:
         config = json.load(f)
     road_length = config["road_data"]["1"]["road_length"]
-    micro_middle_position = (0.2 * road_length) + (micro_length / 2.0)
+    micro_middle_position = (0.2 * road_length)# + (micro_length / 2.0)
     micro_max_position = road_length - (micro_length / 2.0)
     return PrescribedSimBridge(sim=sim, 
                               road_id="1",
@@ -111,13 +124,14 @@ def micro_case_b_6(sim: Simulation, config_file_name: str):
                               margin_s=(micro_length / 2.0),
                               fd=lwr_triangular_fd(),
                               config_file_name=config_file_name,
-                              boundary_function=boundary_case_6)
+                              boundary_function=boundary_case_6,
+                              spawn_density_function=partial(spawn_density_function_discontinuity, get_rear_density(sim, micro_middle_position - micro_length), get_front_density(sim, micro_middle_position + micro_length)))
 
 def micro_case_b_7(sim: Simulation, config_file_name: str):
     with open(config_file_name, "r") as f:
         config = json.load(f)
     road_length = config["road_data"]["1"]["road_length"]
-    micro_middle_position = (0.2 * road_length) + (micro_length / 2.0)
+    micro_middle_position = (0.2 * road_length)# + (micro_length / 2.0)
     micro_max_position = road_length - (micro_length / 2.0)
     return PrescribedSimBridge(sim=sim, 
                               road_id="1",
@@ -126,13 +140,14 @@ def micro_case_b_7(sim: Simulation, config_file_name: str):
                               margin_s=(micro_length / 2.0),
                               fd=lwr_triangular_fd(),
                               config_file_name=config_file_name,
-                              boundary_function=boundary_case_7)
+                              boundary_function=boundary_case_7,
+                              spawn_density_function=partial(spawn_density_function_discontinuity, get_rear_density(sim, micro_middle_position - micro_length), get_front_density(sim, micro_middle_position + micro_length)))
 
 def micro_case_b_8(sim: Simulation, config_file_name: str):
     with open(config_file_name, "r") as f:
         config = json.load(f)
     road_length = config["road_data"]["1"]["road_length"]
-    micro_middle_position = (0.2 * road_length) + (micro_length / 2.0)
+    micro_middle_position = (0.2 * road_length)# + (micro_length / 2.0)
     micro_max_position = road_length - (micro_length / 2.0)
     return PrescribedSimBridge(sim=sim, 
                               road_id="1",
@@ -141,7 +156,8 @@ def micro_case_b_8(sim: Simulation, config_file_name: str):
                               margin_s=(micro_length / 2.0),
                               fd=lwr_triangular_fd(),
                               config_file_name=config_file_name,
-                              boundary_function=boundary_case_8)
+                              boundary_function=boundary_case_8,
+                              spawn_density_function=partial(spawn_density_function_discontinuity, get_rear_density(sim, micro_middle_position - micro_length), get_front_density(sim, micro_middle_position + micro_length)))
 
 def get_rear_density(sim: Simulation, rear_boundary_s: float):
     sim_road_1 = sim.network.roads["1"]
@@ -157,7 +173,7 @@ def newell_case(sim: Simulation, config_file_name: str):
     with open(config_file_name, "r") as f:
         config = json.load(f)
     road_length = config["road_data"]["1"]["road_length"]
-    micro_middle_position = (0.2 * road_length) + (micro_length / 2.0)
+    micro_middle_position = (0.2 * road_length)# + (micro_length / 2.0)
     micro_max_position = road_length - (micro_length / 2.0)
     v_f = 49.7
     w = 5.7
@@ -175,7 +191,7 @@ def newell_case(sim: Simulation, config_file_name: str):
                               margin_s=(micro_length / 2.0),
                               fd=fd,
                               ftl_model=newell_model,
-                              spawn_density_function=partial(spawn_density_function_linear_interpolation, get_rear_density(sim, micro_middle_position - micro_length), get_front_density(sim, micro_middle_position + micro_length)))
+                              spawn_density_function=partial(spawn_density_function_discontinuity, get_rear_density(sim, micro_middle_position - micro_length), get_front_density(sim, micro_middle_position + micro_length)))
     bridge.spawn_length = vehicle_length
     bridge.min_spawn_distance = still_gap
     return bridge
@@ -184,7 +200,7 @@ def idm_case(sim: Simulation, config_file_name: str):
     with open(config_file_name, "r") as f:
         config = json.load(f)
     road_length = config["road_data"]["1"]["road_length"]
-    micro_middle_position = (0.2 * road_length) + (micro_length / 2.0)
+    micro_middle_position = (0.2 * road_length)# + (micro_length / 2.0)
     micro_max_position = road_length - (micro_length / 2.0)
     v_f = 49.7
     w = 5.7
@@ -205,7 +221,7 @@ def idm_case(sim: Simulation, config_file_name: str):
                               margin_s=(micro_length / 2.0),
                               fd=fd,
                               ftl_model=idm_model,
-                              spawn_density_function=partial(spawn_density_function_linear_interpolation, get_rear_density(sim, micro_middle_position - micro_length), get_front_density(sim, micro_middle_position + micro_length)))
+                              spawn_density_function=partial(spawn_density_function_discontinuity, get_rear_density(sim, micro_middle_position - micro_length), get_front_density(sim, micro_middle_position + micro_length)))
     bridge.spawn_length = vehicle_length
     bridge.min_spawn_distance = still_gap
     return bridge
@@ -214,7 +230,7 @@ def arz_case(sim: Simulation, config_file_name: str):
     with open(config_file_name, "r") as f:
         config = json.load(f)
     road_length = config["road_data"]["1"]["road_length"]
-    micro_middle_position = (0.2 * road_length) + (micro_length / 2.0)
+    micro_middle_position = (0.2 * road_length)# + (micro_length / 2.0)
     micro_max_position = road_length - (micro_length / 2.0)
     v_f = 49.7
     w = 5.7
@@ -233,7 +249,7 @@ def arz_case(sim: Simulation, config_file_name: str):
                               margin_s=(micro_length / 2.0),
                               fd=fd,
                               ftl_model=arz_model,
-                              spawn_density_function=partial(spawn_density_function_linear_interpolation, get_rear_density(sim, micro_middle_position - micro_length), get_front_density(sim, micro_middle_position + micro_length)))
+                              spawn_density_function=partial(spawn_density_function_discontinuity, get_rear_density(sim, micro_middle_position - micro_length), get_front_density(sim, micro_middle_position + micro_length)))
     bridge.spawn_length = vehicle_length
     bridge.min_spawn_distance = still_gap
     return bridge

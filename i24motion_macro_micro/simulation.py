@@ -1890,10 +1890,12 @@ class Simulation:
 
     def initialize_callbacks(self):
         self.active = self._build_active_network()
+        """
         callbacks = [cb for cb in self._step_callbacks]
         for cb in callbacks:
             self._step_callbacks[cb](self.current_time, self.time_resolution)
         self.active = self._build_active_network()
+        """
 
     def run(self, duration: float, initialize=True) -> None:
         if duration < 0.0:
