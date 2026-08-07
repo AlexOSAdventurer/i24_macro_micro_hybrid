@@ -44,6 +44,7 @@ class MicroscopicFTLVehicleModel:
         raise NotImplementedError
 
 class NewellModel(MicroscopicFTLVehicleModel):
+    substeps = 50
     # The textbook Newell model that 1-for-1 matches LWR with a Triangular FD.
     # Parameters:
     # v_f: Free flow velocity in meters per second. Same as the LWR/Triangular v_f.
@@ -76,7 +77,7 @@ class NewellModel(MicroscopicFTLVehicleModel):
 class IDMModel(MicroscopicFTLVehicleModel):
     # IDM is only provably collision-free in continuous time. Integrated with a coarse
     # macro dt (e.g. 1 s) it overshoots and cars overlap, so sub-step the ODE.
-    substeps = 3
+    substeps = 10
 
     def __init__(self, v_f: float, vehicle_length: float, still_gap: float, time_headway: float, acceleration_exponent: float, max_accel: float, max_decel: float):
         self.v_f = v_f
@@ -175,7 +176,7 @@ class IIDMModel(IDMModel):
 class MicroscopicARZVehicleModel(MicroscopicFTLVehicleModel):
     # Acceleration models need a finer time step to remain numerically stable 
     # and prevent vehicle overlapping during rapid deceleration.
-    substeps = 3
+    substeps = 10
 
     def __init__(self, v_max: float, rho_max: float, gamma: float, tau: float, vehicle_length: float = 5.0):
         """
@@ -339,6 +340,7 @@ class SimplifiedSimBridge:
 
         self.bridge_callback_name = bridge_callback_name
         sim.register_step_callback(partial(SimplifiedSimBridge._step, self), bridge_callback_name)
+        sim.register_poststep_callback(partial(SimplifiedSimBridge._poststep, self), bridge_callback_name)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -360,8 +362,6 @@ class SimplifiedSimBridge:
             return
         if self.initialized:
             lane_cell = self.sim.masking_cells[self._mask_id(lane_id)]
-            self.flow_memory_rear = lane_cell.rear_flux_memory
-            self.flow_memory_front = lane_cell.front_flux_memory
             # Do vehicle processing logic here
             self.advance_and_update_vehicles()
             self.current_timestamp += self.sim.time_resolution
@@ -392,6 +392,12 @@ class SimplifiedSimBridge:
         new_mask.vehicles = self.collateVehicles()#{vehicle: self.vehicles[vehicle] for vehicle in self.vehicles}
         self.sim.masking_cells[self._mask_id(lane_id)] = new_mask
 
+    def _poststep(self, sim_time: float, dt: float):
+        lane_id = self.lane_id
+        lane_cell = self.sim.masking_cells[self._mask_id(lane_id)]
+        self.flow_memory_rear = lane_cell.rear_flux_memory
+        self.flow_memory_front = lane_cell.front_flux_memory
+        self.spawn_and_despawn_vehicles()
     
     # This is meant for the upper level fluid simulator. Thus we have to convert road ids to strings and restructure it to play nice with that code.
     def collateVehicles(self):
@@ -715,7 +721,6 @@ class SimplifiedSimBridge:
         #print(self.vehicles, "\n---------------")
         #print(self.vehicles, "\n---------------")
         self.move_vehicles()
-        self.spawn_and_despawn_vehicles()
         #self.spawn_and_despawn_vehicles()
         #print(self.vehicles, "\n---------------")
 
@@ -728,3 +733,4 @@ class SimplifiedSimBridge:
                 cell.mass += cell.mask_mass
                 cell.mask_mass = 0
             self.sim.unregister_step_callback(self.bridge_callback_name)
+            self.sim.unregister_poststep_callback(self.bridge_callback_name)

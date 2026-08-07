@@ -4,11 +4,14 @@ import simulation
 from simulation import TriangularFD, Network, Road
 from functools import partial
 import pandas as pd
+import copy
 
 class Component:
-    def __init__(self, s: float, velocity: float):
-        self.s = s
-        self.velocity = velocity
+    def __init__(self, s: float|None, velocity: float|None):
+        if (s is not None):
+            self.s = s
+        if (velocity is not None):
+            self.velocity = velocity
 
 class ConstantRegion(Component):
     def __init__(self, s: float, region_length: float, density: float):
@@ -18,7 +21,7 @@ class ConstantRegion(Component):
 
 class Mask(Component):
     def __init__(self, rear: Component, front: Component):
-        super().__init(0.0, 0.0)
+        super().__init__(None, None)
         self.rear = rear
         self.front = front
 
@@ -36,14 +39,16 @@ class Mask(Component):
         return self.front.s - self.s
 
 class SilentBoundary(Component):
-    def __init__(self, s: float, velocity: float = 0.0):
-        super().__init__(s, 0.0)
+    def __init__(self, s: float, velocity: float = 0.0, delete_on_boundary_collision=False):
+        super().__init__(s, velocity)
+        self.delete_on_boundary_collision = delete_on_boundary_collision
 
 class MovingBoundary(Component):
-    def __init__(self, s: float, boundary_init_function: callable):
+    def __init__(self, s: float, boundary_init_function: callable, delete_on_boundary_collision=False):
         super().__init__(s, 0.0)
         self.density = 0.0
         self.boundary_init_function = partial(boundary_init_function, self)
+        self.delete_on_boundary_collision = delete_on_boundary_collision
 
 class WaveFront(Component):
     def __init__(self, s: float, velocity: float):
@@ -76,7 +81,7 @@ class Solver:
     def get_no_constant_regions(self):
         result = []
         for i in range(len(self.current_state)):
-            if (not isinstance(self.current_state[i], ConstantRegion)):
+            if (not isinstance(self.current_state[i], (ConstantRegion, Mask))):
                 result.append(i)
         return result
 
@@ -94,6 +99,7 @@ class Solver:
         breakpoint_times = [t for t in sorted(list(self.breakpoints.keys())) if (t > self.t) and ((t - self.t - dt - eps) <= 0.0)]
         for breakpoint in breakpoint_times:
             results.append(breakpoint - self.t)
+        results = sorted(results)
         return results
         
     def determine_next_breakpoint(self, dt):
@@ -102,17 +108,24 @@ class Solver:
             return float('inf')
         return contacts[0]
     
-    def advance(self, dt: float = 0.001):
+    def advance(self, dt: float = 0.001, advance_hook: callable = None):
         ttc = self.determine_next_breakpoint(dt)
+        
         while (ttc <= dt):
+            previous_mass = self.get_constant_region_mass()
+            previous_state = copy.deepcopy(self.current_state)
             self.advance_fronts(ttc)
             self.t += ttc
             self.resolve_breakpoints()
             self.resolve_contacts()
             dt -= ttc
+            advance_hook(self, previous_state, ttc, previous_mass)
             ttc = self.determine_next_breakpoint(dt)
+        previous_mass = self.get_constant_region_mass()
+        previous_state = copy.deepcopy(self.current_state)
         self.advance_fronts(dt)
         self.t += dt
+        advance_hook(self, previous_state, dt, previous_mass)
 
     # We assume there are no contacts in this temporal region
     def advance_fronts(self, dt, ignore_contacts=False):
@@ -127,8 +140,11 @@ class Solver:
                 #print("Constant_region_left ", constant_region_left)
                 if (isinstance(constant_region_left, ConstantRegion)):
                     constant_region_left.region_length += (contact.velocity * dt)
+                elif (isinstance(constant_region_left, Mask)):
+                    pass
                 else:
-                    raise Exception("Left region is not a constant region!")
+                    self.print_info()
+                    raise Exception("Left region is not a constant region or mask! " + str(constant_region_left))
 
             if (constant_region_right_index < len(self.current_state)):
                 constant_region_right = self.current_state[constant_region_right_index]
@@ -136,41 +152,78 @@ class Solver:
                 if (isinstance(constant_region_right, ConstantRegion)):
                     constant_region_right.s += (contact.velocity * dt)
                     constant_region_right.region_length -= (contact.velocity * dt)
+                elif (isinstance(constant_region_right, Mask)):
+                    pass
                 else:
-                    raise Exception("Right region is not a constant region!")
+                    self.print_info()
+                    raise Exception("Right region is not a constant region or mask! " + str(constant_region_right))
             contact.s += (contact.velocity * dt)
             #print("-------")
+
+    def print_info(self):
+        for i, c in enumerate(self.current_state):
+            if (isinstance(c, SilentBoundary)):
+                print("Silent Boundary ", i, c.s, c.velocity)
+            elif (isinstance(c, MovingBoundary)):
+                print("Moving Boundary ", i, c.s, c.velocity, c.density)
+            elif (isinstance(c, (ConstantRegion))):
+                print("Constant region ", i, c.s, c.region_length, c.density)
+            elif (isinstance(c, (WaveFront))):
+                print("Wave ", i, c.s, c.velocity)
+            elif (isinstance(c, Mask)):
+                print("Mask ", i, c.rear, c.front, c.s, c.region_length, c.velocity)
+        print()
  
     # All contacts within eps distance will be resolved
     def resolve_contacts(self, eps: float = 1e-8):
         # First, any constant regions that straddle a silent or moving boundary need to be split, with the split at the boundary.
         # This should only happen at the very beginning of simulation run.
-        regions_to_add = []
-        boundaries = [(i, b) for i, b in enumerate(self.current_state) if isinstance(b, (SilentBoundary, MovingBoundary))]
-        for i in range(len(self.current_state)):
-            component = self.current_state[i]
-            if (isinstance(component, ConstantRegion)):
-                for (j, b) in boundaries:
-                    if (component.s < b.s) and ((component.s + component.region_length) > b.s):
-                        original_length = component.region_length
-                        component.region_length = (b.s - component.s)
-                        new_component = ConstantRegion(s=b.s, region_length=original_length - component.region_length, density=component.density)
-                        new_component_index = j + 1 + len(regions_to_add)
-                        regions_to_add.append((new_component_index, new_component))
+        split_done = True
+        print("1")
+        self.print_info()
+        while (split_done):
+            split_done = False
+            regions_to_add = []
+            boundaries = [(i, b) for i, b in enumerate(self.current_state) if isinstance(b, (SilentBoundary, MovingBoundary))]
+            for i in range(len(self.current_state)):
+                component = self.current_state[i]
+                if (isinstance(component, ConstantRegion)):
+                    for (j, b) in boundaries:
+                        if (component.s < (b.s - eps)) and ((component.s + component.region_length) > (b.s + eps)):
+                            print(component, b)
+                            print(component.s, component.region_length, b.s, b.velocity)
+                            #self.print_info()
+                            original_length = component.region_length
+                            component.region_length = (b.s - component.s)
+                            new_component = ConstantRegion(s=b.s, region_length=original_length - component.region_length, density=component.density)
+                            new_component_index = j + 1 + len(regions_to_add)
+                            regions_to_add.append((new_component_index, new_component))
+                            split_done = True
 
-        for (index, component) in regions_to_add:
-            self.current_state.insert(index, component)
+            for (index, component) in regions_to_add:
+                self.current_state.insert(index, component)
+        print("2")
+        self.print_info()
 
-        # Second, remove all components lying within a mask.
+        # Second, remove all constant regions lying within a mask.
         # This should only happen at the very beginning of simulation run.
         components_to_delete = []
         masks = [m for m in self.current_state if isinstance(m, Mask)]
         for i in range(len(self.current_state)):
             component = self.current_state[i]
+            if (not isinstance(component, ConstantRegion)):
+                continue
             for mask in masks:
-                if ((component.s >= mask.s) and (component.s <= (mask.s + mask.region_length)) and (component != mask.rear) and (component != mask.front)):
-                    components_to_delete.append(i)
+                if ((component.s >= mask.s) and (component.s <= (mask.s + mask.region_length)) and ((component.s + component.region_length) <= (mask.s + mask.region_length)) and (component != mask.rear) and (component != mask.front) and (component != mask)):
+                    component_start = max(mask.s, component.s)
+                    component_end = min(mask.s + mask.region_length, component.s + component.region_length)
+                    overlap = component_end - component_start
+                    if (overlap > eps):
+                        components_to_delete.append(i)
         self.current_state = [c for i, c in enumerate(self.current_state) if i not in components_to_delete]
+
+        print("3")
+        self.print_info()
 
         # Third, we mark identical constant regions and resolve them by replacing them with a single larger region.
         currently_building_larger_region = False
@@ -178,16 +231,7 @@ class Solver:
         current_end_i = 0
         regions_to_delete = []
         regions_to_add = []
-        """
-        print("Resolving contacts")
-        for i, c in enumerate(self.current_state):
-            if (isinstance(c, (SilentBoundary, MovingBoundary))):
-                print("Boundary ", i, c.s, c.velocity)
-            elif (isinstance(c, (ConstantRegion))):
-                print("Constant region ", i, c.s, c.region_length, c.density)
-            elif (isinstance(c, (WaveFront))):
-                print("Wave ", i, c.s, c.velocity)
-        """
+        
         for i in range(len(self.current_state)):
             component = self.current_state[i]
             merge_list = []
@@ -201,6 +245,8 @@ class Solver:
                         merge_list = [i for i in range(current_start_i, current_end_i + 1)]
                         current_start_i = i
                         current_end_i = i
+                    else:
+                        currently_building_larger_region = False
                 else:
                     currently_building_larger_region = True
                     current_start_i = i
@@ -226,19 +272,13 @@ class Solver:
             self.current_state.insert(index, component)
 
         self.current_state = [c for i, c in enumerate(self.current_state) if i not in regions_to_delete]
-        """
-        for i, c in enumerate(self.current_state):
-            if (isinstance(c, (SilentBoundary, MovingBoundary))):
-                print("Boundary ", i, c.s, c.velocity)
-            elif (isinstance(c, (ConstantRegion))):
-                print("Constant region ", i, c.s, c.region_length, c.density)
-            elif (isinstance(c, (WaveFront))):
-                print("Wave ", i, c.s, c.velocity)
-        """
+        print("4")
+        self.print_info()
         
         # Fourth, we mark colliding wave fronts and solve them by deleting them and their contained intermediate region.
-        # If one of the fronts is actually a boundary (Silent or Moving), we won't delete the boundary.
+        # If one of the fronts is actually a boundary (Silent or Moving), we won't delete the boundary if desired.
         fronts_to_delete = []
+        masks = [(i, m) for i, m in enumerate(self.current_state) if isinstance(m, Mask)]
         for i in range(len(self.current_state) - 2):
             j = i + 1
             k = i + 2
@@ -251,11 +291,30 @@ class Solver:
                 if (distance < eps) and (closing_rate > eps):
                     if (isinstance(left_front, WaveFront)):
                         fronts_to_delete.append(i)
+                    elif (isinstance(left_front, (MovingBoundary, SilentBoundary)) and isinstance(right_front, (MovingBoundary, SilentBoundary)) and left_front.delete_on_boundary_collision):
+                        fronts_to_delete.append(i)
                     if (isinstance(right_front, WaveFront)):
                         fronts_to_delete.append(k)
+                    elif (isinstance(left_front, (MovingBoundary, SilentBoundary)) and isinstance(right_front, (MovingBoundary, SilentBoundary)) and right_front.delete_on_boundary_collision):
+                        fronts_to_delete.append(k)
                     fronts_to_delete.append(j) # We always delete their contained intermediate region
-        #print("Deleting fronts ", fronts_to_delete)
+
+                    # Remap masks - we select the boundary that is not to be deleted. Any collisions we do should always have one boundary that remains.
+                    # If not, we throw an exception.
+                    preserved_fronts = [f_i for f_i in [i, j, k] if f_i not in fronts_to_delete]
+                    assert((len(preserved_fronts) == 0) or ((len(preserved_fronts) == 1) and (isinstance(self.current_state[preserved_fronts[0]], (MovingBoundary, SilentBoundary))))), "Either no preserved fronts needed, or only one remaining boundary!"
+                    if (len(preserved_fronts) == 1):
+                        for (m_i, m) in masks:
+                            replacement_boundary = self.current_state[preserved_fronts[0]]
+                            if (self.current_state.index(m.rear) in fronts_to_delete):
+                                m.rear = replacement_boundary
+                            if (self.current_state.index(m.front) in fronts_to_delete):
+                                m.front = replacement_boundary
+                        
+        print("Deleting fronts ", fronts_to_delete)
         self.current_state = [c for i, c in enumerate(self.current_state) if i not in fronts_to_delete]
+        print("5")
+        self.print_info()
         # Fifth, we mark colliding constant regions and generate an appropriate wave front between them.
         # Moving Boundaries count as a constant region
         components_to_insert = []
@@ -324,6 +383,8 @@ class Solver:
         #print("Inserting components ", components_to_insert)
         for (index, component) in components_to_insert:
             self.current_state.insert(index, component)
+        print("6")
+        self.print_info()
 
     # All breakpoints within eps will be resolved
     def resolve_breakpoints(self, eps: float = 1e-8):
@@ -389,13 +450,17 @@ def return_demo():
     initial_states = []
     initial_states.append(SilentBoundary(s=0.0))
     initial_states.append(ConstantRegion(s=0.0, density=0.10, region_length=100.0))
-    initial_states.append(ConstantRegion(s=100.0, density=fd.rho_j, region_length=100.0))
+    initial_states.append(ConstantRegion(s=100.0, density=fd.rho_j, region_length=50.0))
+    initial_states.append(ConstantRegion(s=150.0, region_length=350.0, density=0.10))
     def boundary_init_function(boundary: MovingBoundary, solver: Solver):
         boundary.velocity = fd.v_f
         boundary.density = fd.rho_j
         def breakpoint(solver):
             boundary.density = 0.05 * fd.rho_c
         solver.register_breakpoint(breakpoint, 10.0)
-    initial_states.append(MovingBoundary(s=200.0, boundary_init_function=boundary_init_function))
+    initial_states.append(MovingBoundary(s=200.0, boundary_init_function=boundary_init_function, delete_on_boundary_collision=True))
+    initial_states.append(SilentBoundary(s=400.0, velocity=fd.v_f, delete_on_boundary_collision=True))
+    initial_states.append(SilentBoundary(s=500.0, velocity=0.0))
+    initial_states.append(Mask(initial_states[-3], initial_states[-2]))
     solver = Solver(initial_state=initial_states, fd=fd)
     return solver

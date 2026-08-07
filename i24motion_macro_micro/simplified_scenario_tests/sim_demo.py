@@ -59,10 +59,10 @@ def run_app(
         {"label": "Show Masks",   "value": True}
     ]
 
-    # Build road/lane options from ts_data keys
+    # Build road/lane options (time-space data is built lazily on selection)
     road_lane_options = [
         {"label": f"Road {rid} · Lane {lane}", "value": f"{rid}:{lane}"}
-        for rid, lane, version in sorted(renderer.ts_data.keys()) if version == "sim"
+        for rid, lane in sorted(renderer.ts_road_lanes)
     ]
     default_road_lane = road_lane_options[0]["value"] if road_lane_options else ""
     default_rid, default_lane = default_road_lane.split(":") if default_road_lane else ("", 0)
@@ -226,15 +226,12 @@ def spawn_density_function_linear_interpolation(start_density, end_density, s, m
     start_frac = 1.0 - end_frac
     return (start_density * start_frac) + (end_density * end_frac)
 
-def load_sim_demo():
-    with open("config_demo.json", "r") as f:
-        config = json.load(f)
-
+def load_sim_demo(config):
     sim = Simulation.from_json(
         json_path=os.path.join(config["storage_locations"]["simulation_dataset"], "network.json"),
         time_resolution=config["time_step"],
         origin_time=config["time_origin"],
-        min_cell_length=100.0
+        min_cell_length=config["cell_length"]
     )
 
     gt = GroundTruthStore.from_parquet(None, os.path.join(config["storage_locations"]["simulation_dataset"], "macro.parquet"))
@@ -278,10 +275,10 @@ def load_sim_demo():
         sim=sim,
         road_id="1",
         initial_middle_s=15000.0,
-        margin_s=4000.0,
+        margin_s=250.0,
         max_middle_s=35000.0,
         fd=fd,
-        ftl_model=idm_model,
+        ftl_model=newell_model,
         bridge_callback_name="bridge_step",
         spawn_density_function=partial(spawn_density_function_linear_interpolation, fd.rho_c / 2.0, fd.rho_c / 2.0)
     )
@@ -290,9 +287,15 @@ def load_sim_demo():
 
     return sim, bridge
 
+def get_config():
+    with open("config_demo.json", "r") as f:
+        config = json.load(f)
+    return config
+
 def run_demo_simplified():
-    sim, bridge = load_sim_demo()
-    sim.run(2400.0)
+    config = get_config()
+    sim, bridge = load_sim_demo(config)
+    sim.run(config["time_length"])
     run_app(sim, rotation_deg=0.0, port=8052)
 
 if __name__ == "__main__":

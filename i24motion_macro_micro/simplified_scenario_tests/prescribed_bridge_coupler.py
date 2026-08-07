@@ -29,6 +29,7 @@ def boundary_case_1(bridge: PrescribedSimBridge):
         lane=bridge.lane_id,
         s_dt=0
     )
+    bridge.ego_id = "1"
 
 def boundary_case_2(bridge: PrescribedSimBridge):
     bridge.anchor_speed = bridge.fd.v_f
@@ -41,6 +42,7 @@ def boundary_case_2(bridge: PrescribedSimBridge):
         lane=bridge.lane_id,
         s_dt=bridge.fd.velocity_from_density(bridge.fd.rho_c * 0.05)
     )
+    bridge.ego_id = "1"
 
 def boundary_case_3(bridge: PrescribedSimBridge):
     w = bridge.fd.w
@@ -56,6 +58,7 @@ def boundary_case_3(bridge: PrescribedSimBridge):
         lane=bridge.lane_id,
         s_dt=bridge.fd.velocity_from_density(bridge.fd.rho_c * 2.0)
     )
+    bridge.ego_id = "1"
 
 def boundary_case_4(bridge: PrescribedSimBridge):
     w = bridge.fd.w
@@ -71,6 +74,7 @@ def boundary_case_4(bridge: PrescribedSimBridge):
         lane=bridge.lane_id,
         s_dt=bridge.fd.velocity_from_density(bridge.fd.rho_c * 0.05)
     )
+    bridge.ego_id = "1"
 
 def boundary_case_5(bridge: PrescribedSimBridge):
     bridge.anchor_speed = 0.0 if ((bridge.current_timestamp - bridge.time_origin) <= 10) else bridge.fd.v_f
@@ -83,6 +87,7 @@ def boundary_case_5(bridge: PrescribedSimBridge):
         lane=bridge.lane_id,
         s_dt=bridge.fd.velocity_from_density(bridge.fd.rho_j)
     )
+    bridge.ego_id = "1"
 
 def boundary_case_6(bridge: PrescribedSimBridge):
     bridge.anchor_speed = bridge.fd.v_f
@@ -95,6 +100,7 @@ def boundary_case_6(bridge: PrescribedSimBridge):
         lane=bridge.lane_id,
         s_dt=(bridge.fd.velocity_from_density(bridge.fd.rho_j) if ((bridge.current_timestamp - bridge.time_origin) <= 10) else bridge.fd.velocity_from_density(bridge.fd.rho_c * 0.05))
     )
+    bridge.ego_id = "1"
 
 def boundary_case_7(bridge: PrescribedSimBridge):
     bridge.anchor_speed = bridge.fd.v_f if ((bridge.current_timestamp - bridge.time_origin) <= 10) else 0.0
@@ -107,6 +113,7 @@ def boundary_case_7(bridge: PrescribedSimBridge):
         lane=bridge.lane_id,
         s_dt=bridge.fd.velocity_from_density(bridge.fd.rho_c * 0.05)
     )
+    bridge.ego_id = "1"
 
 def boundary_case_8(bridge: PrescribedSimBridge):
     bridge.anchor_speed = 0.0
@@ -119,6 +126,7 @@ def boundary_case_8(bridge: PrescribedSimBridge):
         lane=bridge.lane_id,
         s_dt=(bridge.fd.velocity_from_density(bridge.fd.rho_c * 0.05) if ((bridge.current_timestamp - bridge.time_origin) <= 10) else bridge.fd.velocity_from_density(bridge.fd.rho_j))
     )
+    bridge.ego_id = "1"
 
 class PrescribedSimBridge:
     spawn_length = 4.0 #6.8725979813165115 + 4.418460070966603

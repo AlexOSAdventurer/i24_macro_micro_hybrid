@@ -1,8 +1,8 @@
 {
-    "time_origin": 1669812350.0,
-    "time_length": 3600.0,
-    "time_step": 1.0,
-    "cell_length": 100.0,
+    "time_origin": 0.0,
+    "time_length": 300.0,
+    "time_step": 0.1,
+    "cell_length": 10.0,
     "fd": {
         "type": "triangular",
         "v_f": 49.7,
@@ -13,10 +13,10 @@
     "road_data": {
         "1": {
             "road_length": 40000.0,
-            "time_origin": 1669812350.0,
-            "time_length": 3600.0,
-            "cell_length": 100.0,
-            "time_step": 1.0,
+            "time_origin": 0.0,
+            "time_length": 300.0,
+            "cell_length": 10.0,
+            "time_step": 0.1,
             "lanes": 1,
             "lane_width": 3.6575
         }

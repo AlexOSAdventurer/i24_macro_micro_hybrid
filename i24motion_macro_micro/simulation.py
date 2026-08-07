@@ -94,8 +94,18 @@ class Road:
             cell.validate()
 
     def cells_for_lane(self, lane: int) -> List[Cell]:
-        out = [c for c in self.cells.values() if c.lane == lane]
-        out.sort(key=lambda c: (c.start_s, c.end_s, c.cell_id))
+        # Base-cell membership and extents are static after construction, so the
+        # sorted per-lane list only needs computing once. Callers treat the result
+        # as read-only. (If cells are ever mutated, drop `_lane_cells_cache`.)
+        cache = getattr(self, "_lane_cells_cache", None)
+        if cache is None:
+            cache = {}
+            self._lane_cells_cache = cache
+        out = cache.get(lane)
+        if out is None:
+            out = [c for c in self.cells.values() if c.lane == lane]
+            out.sort(key=lambda c: (c.start_s, c.end_s, c.cell_id))
+            cache[lane] = out
         return out
 
 
@@ -630,7 +640,7 @@ class SimplifiedOneLaneRoadNetwork(NetworkGenerator):
             for lane in road_lane_data:
                 cell_id = f"road_{road_id}_cell_{lane}_step_{i}"
                 start_s = step
-                end_s = step + longitudinal_step
+                end_s = min(step + longitudinal_step, road_length)
                 mass = 0
                 mask_mass = 0
                 inflow_connections = []
@@ -994,6 +1004,8 @@ class ActiveMeshBuilder:
 
                 points = sorted(cut_points)
                 raw_intervals: List[Dict[str, Any]] = []
+                ncells = len(lane_cells)
+                ci = 0  # monotonic pointer into (sorted) lane_cells
 
                 for i in range(len(points) - 1):
                     a = points[i]
@@ -1013,14 +1025,16 @@ class ActiveMeshBuilder:
 
                     mask_id = owners[0] if owners else None
 
-                    overlaps: List[Tuple[Connection, float, float]] = []
-                    for c in lane_cells:
-                        s0 = max(a, c.start_s)
-                        s1 = min(b, c.end_s)
-                        if s1 > s0:
-                            overlaps.append(((c.road_id, c.cell_id), float(s0), float(s1)))
-
-                    if len(overlaps) == 0:
+                    # Every base-cell boundary is a cut point, so [a, b] lies wholly
+                    # within a single base cell (or a gap between cells). Walk the
+                    # monotonic pointer to that cell instead of scanning all cells.
+                    while ci < ncells and lane_cells[ci].end_s <= a + 1e-9:
+                        ci += 1
+                    if ci >= ncells:
+                        continue
+                    base_cell = lane_cells[ci]
+                    if base_cell.start_s > a + 1e-9 or base_cell.end_s < b - 1e-9:
+                        # interval falls in a gap between base cells
                         continue
 
                     raw_intervals.append(
@@ -1031,26 +1045,28 @@ class ActiveMeshBuilder:
                             "end_s": b,
                             "kind": "mask" if mask_id is not None else "normal",
                             "mask_id": mask_id,
-                            "base_segments": overlaps,
+                            "base_segments": [((base_cell.road_id, base_cell.cell_id), a, b)],
                         }
                     )
 
                 merged = self._merge_same_mask_intervals(raw_intervals)
                 merged = self._merge_small_intervals(merged)
 
+                lane_active_cells: List[ActiveCell] = []
                 for idx, item in enumerate(merged):
                     active_cell_id = f"{road_id}|lane{lane}|{idx}"
                     cell_fd = None
                     cell_lane_change_model = None
                     if item["kind"] == "normal" and item["base_segments"]:
-                        cell_fd = self.network.get_cell(*item["base_segments"][0][0]).fd
-                        cell_lane_change_model = self.network.get_cell(*item["base_segments"][0][0]).lane_change_model
+                        base_cell = self.network.get_cell(*item["base_segments"][0][0])
+                        cell_fd = base_cell.fd
+                        cell_lane_change_model = base_cell.lane_change_model
                     elif item["kind"] == "normal":
                         print(f"Substituting {item}'s behavior model!")
                         print("---------------------------")
                         cell_fd = GreenshieldsFD(v_f=26.9, rho_j=0.065)
                         cell_lane_change_model = SpeedIncentiveLaneChange(lambda_lc=0.195)
-                    active.active_cells[active_cell_id] = ActiveCell(
+                    ac = ActiveCell(
                         active_cell_id=active_cell_id,
                         road_id=road_id,
                         lane=lane,
@@ -1063,8 +1079,21 @@ class ActiveMeshBuilder:
                         fd=cell_fd,
                         lane_change_model=cell_lane_change_model
                     )
+                    active.active_cells[active_cell_id] = ac
+                    lane_active_cells.append(ac)
 
-        self._build_neighbors(active)
+                # Link neighbours inline: cells are already emitted in start_s order
+                # within this lane, so no regrouping/sorting is needed.
+                for i, cell in enumerate(lane_active_cells):
+                    if i > 0:
+                        prev = lane_active_cells[i - 1]
+                        if not (prev.kind == "mask" and cell.kind == "mask"):
+                            cell.inflow_neighbors.append(prev.active_cell_id)
+                    if i + 1 < len(lane_active_cells):
+                        nxt = lane_active_cells[i + 1]
+                        if not (cell.kind == "mask" and nxt.kind == "mask"):
+                            cell.outflow_neighbors.append(nxt.active_cell_id)
+
         return active
 
     def _merge_same_mask_intervals(self, intervals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1093,7 +1122,10 @@ class ActiveMeshBuilder:
             out: List[Dict[str, Any]] = []
             i = 0
             while i < len(intervals):
-                cur = copy.deepcopy(intervals[i])
+                # Shallow-copy the dict and its base_segments list; the segment
+                # tuples inside are immutable, so no deep copy is needed.
+                cur = dict(intervals[i])
+                cur["base_segments"] = list(cur["base_segments"])
                 cur_len = float(cur["end_s"] - cur["start_s"])
 
                 if cur_len >= self.min_cell_length or len(intervals) == 1:
@@ -1124,7 +1156,9 @@ class ActiveMeshBuilder:
                     changed = True
                     i += 1
                 elif chosen == "right":
-                    right = copy.deepcopy(intervals[i + 1])
+                    # base_segments is rebuilt as a fresh list below, so a shallow
+                    # dict copy is safe (the original list is never mutated).
+                    right = dict(intervals[i + 1])
                     right["start_s"] = cur["start_s"]
                     right["base_segments"] = list(cur["base_segments"]) + list(right["base_segments"])
                     out.append(right)
@@ -1137,23 +1171,6 @@ class ActiveMeshBuilder:
             intervals = out
         #print(intervals)
         return intervals
-
-    def _build_neighbors(self, active: ActiveNetwork) -> None:
-        by_lane: Dict[Tuple[str, int], List[ActiveCell]] = {}
-        for ac in active.active_cells.values():
-            by_lane.setdefault((ac.road_id, ac.lane), []).append(ac)
-
-        for _, lane_cells in by_lane.items():
-            lane_cells.sort(key=lambda c: (c.start_s, c.end_s))
-            for i, cell in enumerate(lane_cells):
-                if i > 0:
-                    prev = lane_cells[i - 1]
-                    if not (prev.kind == "mask" and cell.kind == "mask"):
-                        cell.inflow_neighbors.append(prev.active_cell_id)
-                if i + 1 < len(lane_cells):
-                    nxt = lane_cells[i + 1]
-                    if not (cell.kind == "mask" and nxt.kind == "mask"):
-                        cell.outflow_neighbors.append(nxt.active_cell_id)
 
 
 class ConservativeRemapper:
@@ -1550,6 +1567,10 @@ class Simulation:
         self.origin_time = float(origin_time)
         self.current_time = float(origin_time)
         self.rollout_results: List[RolloutStep] = []
+        # When False, step() skips recording per-step rollout snapshots (base
+        # network clone + active/mask snapshots). Set this for headless runs that
+        # don't feed the viewer — it removes a full 5000-cell deep-copy per step.
+        self.record_rollout = True
 
         self.inflow_boundary_map = inflow_boundary_map or {}
         self.outflow_boundary_map = outflow_boundary_map or {}
@@ -1717,6 +1738,14 @@ class Simulation:
                     per_in_supply = supply_map[v] if not preds else supply_map[v] / float(len(preds))
                     edge_flow[(u, v)] = min(per_out_demand, per_in_supply)
 
+        # Index edges by their target and source cell once, so the capping loops
+        # below are O(edges) instead of rescanning all of edge_flow per cell.
+        incoming_by_v: Dict[str, List[Tuple[str, str]]] = {}
+        outgoing_by_u: Dict[str, List[Tuple[str, str]]] = {}
+        for e in edge_flow:
+            incoming_by_v.setdefault(e[1], []).append(e)
+            outgoing_by_u.setdefault(e[0], []).append(e)
+
         # Cap inflow to normal cells.
         # Mask boundary fluxes are fixed (Riemann solver output) and are not scaled —
         # only normal-normal edges are subject to capping. The fixed mask flux is
@@ -1725,11 +1754,11 @@ class Simulation:
             v_cell = active.active_cells[v]
             if v_cell.kind == "mask":
                 continue
-            all_incoming = [e for e in edge_flow if e[1] == v]
+            all_incoming = incoming_by_v.get(v, ())
             normal_incoming = [e for e in all_incoming if active.active_cells[e[0]].kind == "normal"]
             if not normal_incoming:
                 continue
-            mask_inflow = sum(edge_flow[e] for e in all_incoming if e not in normal_incoming)
+            mask_inflow = sum(edge_flow[e] for e in all_incoming if active.active_cells[e[0]].kind != "normal")
             normal_total_in = sum(edge_flow[e] for e in normal_incoming)
             remaining_supply = supply_map[v] - mask_inflow
             if normal_total_in > remaining_supply and normal_total_in > 1e-12:
@@ -1742,11 +1771,11 @@ class Simulation:
             u_cell = active.active_cells[u]
             if u_cell.kind == "mask":
                 continue
-            all_outgoing = [e for e in edge_flow if e[0] == u]
+            all_outgoing = outgoing_by_u.get(u, ())
             normal_outgoing = [e for e in all_outgoing if active.active_cells[e[1]].kind == "normal"]
             if not normal_outgoing:
                 continue
-            mask_outflow = sum(edge_flow[e] for e in all_outgoing if e not in normal_outgoing)
+            mask_outflow = sum(edge_flow[e] for e in all_outgoing if active.active_cells[e[1]].kind != "normal")
             normal_total_out = sum(edge_flow[e] for e in normal_outgoing)
             remaining_demand = demand_map[u] - mask_outflow
             if normal_total_out > remaining_demand and normal_total_out > 1e-12:
@@ -1824,7 +1853,8 @@ class Simulation:
                 ac.mass = float(new_masses[i] + lateral_mass)
 
     def step(self) -> None:
-        self._snapshot()
+        if self.record_rollout:
+            self._snapshot()
         callbacks = [cb for cb in self._prestep_callbacks]
         for cb in callbacks:
             if cb in self._prestep_callbacks:
@@ -1833,14 +1863,11 @@ class Simulation:
         for cb in callbacks:
             if cb in self._step_callbacks:
                 self._step_callbacks[cb](self.current_time, self.time_resolution)
-        callbacks = [cb for cb in self._poststep_callbacks]
-        for cb in callbacks:
-            if cb in self._poststep_callbacks:
-                self._poststep_callbacks[cb](self.current_time, self.time_resolution)
         self.active = self._build_active_network()
-        self.rollout_results[-1].active_network = self.active.snapshot()
-        if self.masking_cells:
-            self.rollout_results[-1].mask_snapshots = dict(self.masking_cells)
+        if self.record_rollout:
+            self.rollout_results[-1].active_network = self.active.snapshot()
+            if self.masking_cells:
+                self.rollout_results[-1].mask_snapshots = dict(self.masking_cells)
         self._step_active_network(self.active)
         self._update_masks()
         ConservativeRemapper.move_active_masks(self, self.active)
@@ -1855,16 +1882,18 @@ class Simulation:
         ConservativeRemapper.active_to_base(self.network, self.active)
         self.current_time += self.time_resolution
         self.gt_store.apply_density_snapshot_to_network_boundaries(self.network, self.current_time)
+        callbacks = [cb for cb in self._poststep_callbacks]
+        for cb in callbacks:
+            if cb in self._poststep_callbacks:
+                self._poststep_callbacks[cb](self.current_time, self.time_resolution)
         #print(self.current_time)
 
     def initialize_callbacks(self):
         self.active = self._build_active_network()
-        """
         callbacks = [cb for cb in self._step_callbacks]
         for cb in callbacks:
             self._step_callbacks[cb](self.current_time, self.time_resolution)
         self.active = self._build_active_network()
-        """
 
     def run(self, duration: float, initialize=True) -> None:
         if duration < 0.0:
@@ -2316,39 +2345,73 @@ class RolloutRenderer:
                 return fd.velocity_from_density(density) * density
             return density
 
-        # Global per-quantity value ranges (used for consistent colorbar across all frames)
-        self.ranges: Dict[str, Tuple[float, float]] = {}
-        for q in self.QUANTITIES:
-            vals: List[float] = []
-            for rs in sim.rollout_results:
-                for road in rs.network.roads.values():
-                    for cell in road.cells.values():
-                        vals.append(_q_value(cell.density, cell.fd, q))
-                if rs.active_network:
-                    for ac in rs.active_network.active_cells.values():
-                        if ac.kind == "normal" and ac.fd is not None:
-                            vals.append(_q_value(ac.density, ac.fd, q))
-            self.ranges[q] = (float(min(vals)) if vals else 0.0, float(max(vals)) if vals else 1.0)
+        # --- Precomputed per-road arc-length tables (static geometry) ---------
+        # Network._cell_polygon otherwise rebuilds the polyline arrays + arc
+        # lengths on every one of ~(frames * cells) calls; build them once.
+        self._road_geom: Dict[str, Any] = {}
+        for road in sim.network.roads.values():
+            lp = np.asarray(road.left_polyline, dtype=float)
+            rp = np.asarray(road.right_polyline, dtype=float)
+            seg = np.linalg.norm(np.diff(lp, axis=0), axis=1)
+            cum = np.concatenate([[0.0], np.cumsum(seg)])
+            self._road_geom[road.road_id] = (lp, rp, seg, cum, road.lane_data)
 
-        # Base cell geometry — fixed for all frames
-        ref_network = sim.rollout_results[0].network
-        self.base_cells: List[Tuple[str, str, List[float], List[float], Optional[FundamentalDiagram]]] = []
-        for road in ref_network.roads.values():
-            for cell in road.cells.values():
-                px, py = _rotate(*Network._cell_polygon(road, cell.start_s, cell.end_s, cell.lane))
-                self.base_cells.append((road.road_id, cell.cell_id, px, py, cell.fd))
+        def _polygon(road_id: str, s0: float, s1: float, lane: int) -> Tuple[List[float], List[float]]:
+            lp, rp, seg, cum, lane_data = self._road_geom[road_id]
+            info = lane_data[lane]
+            lat = float(info["lateral_position"])
+            width = float(info["width"])
+            nseg = len(seg)
 
-        active_per_step: List[List[ActiveCell]] = [
-            list(rs.active_network.active_cells.values()) if rs.active_network else []
-            for rs in sim.rollout_results
-        ]
-        self.max_active: int = max((len(a) for a in active_per_step), default=0)
-        self.N_frames: int = len(sim.rollout_results)
-        min_sim_time = min([rs.sim_time for rs in sim.rollout_results])
-        self.sim_times: List[float] = [rs.sim_time - min_sim_time for rs in sim.rollout_results]
-        self.mask_snapshots_per_step: List[Dict[str, Any]] = [
-            rs.mask_snapshots or {} for rs in sim.rollout_results
-        ]
+            def _pt(s: float):
+                idx = int(np.clip(np.searchsorted(cum, s) - 1, 0, nseg - 1))
+                t = (s - cum[idx]) / max(seg[idx], 1e-8)
+                l = lp[idx] + t * (lp[idx + 1] - lp[idx])
+                r = rp[idx] + t * (rp[idx + 1] - rp[idx])
+                d = (r - l) / max(float(np.linalg.norm(r - l)), 1e-8)
+                return l + (-lat) * d, l + (-(lat - width)) * d
+
+            p1, p2 = _pt(s0)
+            p3, p4 = _pt(s1)
+            return _rotate(
+                [p1[0], p2[0], p4[0], p3[0], p1[0]],
+                [p1[1], p2[1], p4[1], p3[1], p1[1]],
+            )
+        self._polygon = _polygon
+
+        # --- Vectorised quantity transform (matches scalar _q_value exactly) ---
+        def _q_transform(rho: np.ndarray, fd: Optional[FundamentalDiagram], q: str) -> np.ndarray:
+            rho = np.asarray(rho, dtype=float)
+            if q == "density":
+                return rho
+            if fd is None:
+                return np.zeros_like(rho)
+            guard = np.where(rho > 1e-12, rho, 1.0)
+            if isinstance(fd, TriangularFD):
+                flow_raw = np.where(rho > fd.rho_c, fd.w * (fd.rho_j - rho), fd.v_f * rho)
+            elif isinstance(fd, GreenshieldsFD):
+                rc = np.clip(rho, 0.0, fd.rho_j)
+                flow_raw = fd.v_f * rc * (1.0 - rc / fd.rho_j)
+            else:  # generic fallback (rare)
+                flow_raw = np.vectorize(lambda x: fd._flow(x))(rho)
+            vel = np.where(rho > 1e-12, flow_raw / guard, fd.v_f)
+            if q == "velocity":
+                return vel
+            return vel * rho  # flow == velocity_from_density * density
+        self._q_transform = _q_transform
+        self._q_value_scalar = _q_value
+
+        def _q_matrix(density: np.ndarray, fds: List[Any], q: str) -> np.ndarray:
+            density = np.asarray(density, dtype=float)
+            if q == "density" or density.size == 0:
+                return density
+            out = np.zeros_like(density)
+            groups: Dict[int, Tuple[Any, List[int]]] = {}
+            for j, fd in enumerate(fds):
+                groups.setdefault(id(fd), (fd, []))[1].append(j)
+            for _fdid, (fd, cols) in groups.items():
+                out[:, cols] = _q_transform(density[:, cols], fd, q)
+            return out
 
         def _color_matrix(vals: np.ndarray, vmin: float, vmax: float) -> List[List[str]]:
             t = np.clip((vals - vmin) / max(vmax - vmin, 1e-12), 0.0, 1.0)
@@ -2359,131 +2422,168 @@ class RolloutRenderer:
             nf, nc = vals.shape
             return [[f"#{packed[i, j]:06x}" for j in range(nc)] for i in range(nf)]
 
-        # Base colors: (N_frames, N_base) per quantity
-        base_rho = np.array([
-            [rs.network.get_cell(rid, cid).density for rid, cid, _px, _py, _fd in self.base_cells]
+        # --- Base cell geometry (fixed for all frames) ------------------------
+        ref_network = sim.rollout_results[0].network
+        self.base_cells: List[Tuple[str, str, List[float], List[float], Optional[FundamentalDiagram]]] = []
+        base_keys: List[Tuple[str, str]] = []
+        base_fds: List[Any] = []
+        for road in ref_network.roads.values():
+            for cell in road.cells.values():
+                px, py = self._polygon(road.road_id, cell.start_s, cell.end_s, cell.lane)
+                self.base_cells.append((road.road_id, cell.cell_id, px, py, cell.fd))
+                base_keys.append((road.road_id, cell.cell_id))
+                base_fds.append(cell.fd)
+
+        active_per_step: List[List[ActiveCell]] = [
+            list(rs.active_network.active_cells.values()) if rs.active_network else []
             for rs in sim.rollout_results
-        ])
-        self.base_frame_colors: Dict[str, List[List[str]]] = {}
+        ]
+        self._active_per_step = active_per_step
+        self.max_active: int = max((len(a) for a in active_per_step), default=0)
+        self.N_frames: int = len(sim.rollout_results)
+        min_sim_time = min([rs.sim_time for rs in sim.rollout_results])
+        self.sim_times: List[float] = [rs.sim_time - min_sim_time for rs in sim.rollout_results]
+        self.mask_snapshots_per_step: List[Dict[str, Any]] = [
+            rs.mask_snapshots or {} for rs in sim.rollout_results
+        ]
+
+        # --- Base density matrices -> ranges + colors + time-space (one pass) -
+        # Gather raw mass + mask_mass once (dataclass fields, cheaper than the
+        # .density/.density_viz properties) and derive both matrices vectorised.
+        # The time-space diagram then slices columns out of _base_density_viz
+        # instead of re-reading every frame snapshot.
+        self._base_col: Dict[Tuple[str, str], int] = {key: j for j, key in enumerate(base_keys)}
+        if base_keys:
+            base_lengths = np.array([
+                ref_network.roads[rid].cells[cid].length for (rid, cid) in base_keys
+            ])
+            base_lengths = np.where(base_lengths > 0.0, base_lengths, 1.0)
+            mass = np.empty((self.N_frames, len(base_keys)))
+            mask_mass = np.empty((self.N_frames, len(base_keys)))
+            for f, rs in enumerate(sim.rollout_results):
+                cells_by_road = {rid: road.cells for rid, road in rs.network.roads.items()}
+                mass[f] = [cells_by_road[rid][cid].mass for (rid, cid) in base_keys]
+                mask_mass[f] = [cells_by_road[rid][cid].mask_mass for (rid, cid) in base_keys]
+            base_rho = mass / base_lengths
+            self._base_density_viz = (mass + mask_mass) / base_lengths
+        else:
+            base_rho = np.zeros((self.N_frames, 0))
+            self._base_density_viz = np.zeros((self.N_frames, 0))
+
+        # Global per-quantity value ranges for a consistent colorbar. Computed
+        # from the base mesh; normal active cells are conservatively remapped
+        # from it, so their value range coincides.
+        self.ranges: Dict[str, Tuple[float, float]] = {}
         for q in self.QUANTITIES:
-            vmin, vmax = self.ranges[q]
-            if q == "density":
-                vals_arr = base_rho
-            else:
-                vals_arr = np.zeros_like(base_rho)
-                for j, (_rid, _cid, _px, _py, fd) in enumerate(self.base_cells):
-                    vals_arr[:, j] = [_q_value(rho, fd, q) for rho in base_rho[:, j]]
-            self.base_frame_colors[q] = _color_matrix(vals_arr, vmin, vmax)
+            vals = _q_matrix(base_rho, base_fds, q)
+            self.ranges[q] = (float(vals.min()) if vals.size else 0.0,
+                              float(vals.max()) if vals.size else 1.0)
 
-        # Active cell geometry and colors per step
-        self.active_geo: List[List[Tuple[List, List]]] = []
-        self.active_lcolor: List[List[str]] = []
-        self.active_frame_colors: Dict[str, List[List[str]]] = {q: [] for q in self.QUANTITIES}
+        # Base fill-colors are built lazily per frame in get_figure (see
+        # _base_frame_colors) so launch does not pay 3 * N_frames * N_cells hex
+        # conversions up front.
+        self._base_rho = base_rho
+        self._base_fds = base_fds
+        self._q_matrix = _q_matrix
+        self._color_matrix = _color_matrix
+        self._base_color_cache: Dict[Tuple[int, str], List[str]] = {}
 
-        for step_active in active_per_step:
-            step_geo: List[Tuple[List, List]] = []
-            step_lc: List[str] = []
-            step_density: List[float] = []
-            step_fd: List[Optional[FundamentalDiagram]] = []
-            step_is_mask: List[bool] = []
+        # Active-view geometry and colors are built lazily per frame in
+        # get_figure (see _active_frame) and cached. The active view is off by
+        # default, so this per-frame work is usually never triggered at all.
+        self._active_geo_cache: Dict[int, Any] = {}
+        self._active_color_cache: Dict[Tuple[int, str], List[str]] = {}
 
-            for i in range(self.max_active):
-                if i < len(step_active):
-                    ac = step_active[i]
-                    road = sim.network.roads[ac.road_id]
-                    step_geo.append(_rotate(*Network._cell_polygon(road, ac.start_s, ac.end_s, ac.lane)))
-                    step_lc.append(self.MASK_LINE if ac.kind == "mask" else self.NORMAL_LINE)
-                    step_density.append(ac.density)
-                    step_fd.append(ac.fd)
-                    step_is_mask.append(ac.kind == "mask")
-                else:
-                    step_geo.append(([], []))
-                    step_lc.append(self.NORMAL_LINE)
-                    step_density.append(0.0)
-                    step_fd.append(None)
-                    step_is_mask.append(False)
-
-            self.active_geo.append(step_geo)
-            self.active_lcolor.append(step_lc)
-
-            for q in self.QUANTITIES:
-                vmin, vmax = self.ranges[q]
-                step_colors: List[str] = []
-                for i in range(self.max_active):
-                    if step_is_mask[i]:
-                        step_colors.append(self.MASK_FILL)
-                    elif step_fd[i] is not None:
-                        t = float(np.clip((_q_value(step_density[i], step_fd[i], q) - vmin) / max(vmax - vmin, 1e-12), 0.0, 1.0))
-                        r, g, b, _ = CMAP(t)
-                        step_colors.append(f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}")
-                    else:
-                        step_colors.append("#000000")
-                self.active_frame_colors[q].append(step_colors)
-
-        # Time-space data: (road_id, lane) → per-quantity (N_frames, N_cells) arrays
+        # Time-space data: (road_id, lane, version) → per-quantity arrays.
+        # Built lazily per lane in get_ts_figure (only the viewed lane is paid
+        # for) — see _ensure_ts_lane / _macro_pivots.
         self.ts_data: Dict[Tuple[str, int, str], Dict[str, Any]] = {}
-        ref_net = sim.rollout_results[0].network
-        macro_density_lookup: Dict[float, Dict[Tuple[str, str], float]] = {
-            float(t): {
-                (str(r), str(c)): (float(d), float(v))
-                for r, c, d, v in zip(grp["road_id"], grp["cell_id"], grp["density"], grp["velocity"])
-            }
-            for t, grp in sim.gt_store.macro_df.groupby("time")
-        }
-        macro_times: np.ndarray = np.sort(np.array(list(macro_density_lookup.keys())))
-        for road in ref_net.roads.values():
-            for lane in sorted(road.lane_data):
-                cells = road.cells_for_lane(lane)
-                if not cells:
-                    continue
-                cell_ids = [c.cell_id for c in cells]
-                s_mids = [(c.start_s + c.end_s) / 2.0 for c in cells]
-                fds = [c.fd for c in cells]
-                rho_ts = np.array([
-                    [rs.network.get_cell(road.road_id, cid).density_viz for cid in cell_ids]
-                    for rs in sim.rollout_results
-                ])  # (N_frames, N_cells)
-                for version in ["sim", "empirical"]:
-                    entry: Dict[str, Any] = {"s_mids": s_mids}
-                    mask_extents: List[List[Optional[Tuple[float, float]]]] = [[]]
-                    if (version == "sim"):
-                        entry["density"] = rho_ts
-                        for q in ("flow", "velocity"):
-                            vals = np.zeros_like(rho_ts)
-                            for j, fd in enumerate(fds):
-                                vals[:, j] = [_q_value(rho, fd, q) for rho in rho_ts[:, j]]
-                            entry[q] = vals
+        self._ref_net = sim.rollout_results[0].network
+        self._rollout_results = sim.rollout_results
+        self._gt_store = sim.gt_store
+        self._macro_pivot_cache: Optional[Tuple[np.ndarray, Any, Any]] = None
+        # (road_id, lane) pairs that have cells — for populating UI selectors
+        # without forcing the (lazy) time-space data to be built.
+        self.ts_road_lanes: List[Tuple[str, int]] = [
+            (road.road_id, lane)
+            for road in self._ref_net.roads.values()
+            for lane in sorted(road.lane_data)
+            if road.cells_for_lane(lane)
+        ]
 
-                        # Mask extents per timestep: (start_s, end_s) or None
-                        for snapshots in self.mask_snapshots_per_step:
-                            extent: Optional[Tuple[float, float]] = None
-                            for mask in snapshots.values():
-                                for seg in mask.segments:
-                                    if seg.road_id == road.road_id and seg.lane == lane:
-                                        lo, hi = float(seg.start_s), float(seg.end_s)
-                                        extent = (lo, hi) if extent is None else (min(extent[0], lo), max(extent[1], hi))
-                            if (extent == None) and (len(mask_extents[-1]) > 0) and (mask_extents[-1][-1] is not None):
-                                mask_extents.append([])
-                            elif (extent is not None) and (len(mask_extents[-1]) > 0) and (mask_extents[-1][-1] is None):
-                                mask_extents.append([])
-                            mask_extents[-1].append(extent)
-                    elif (version == "empirical"):
-                        vals_density = np.zeros((len(macro_times), len(cell_ids)))
-                        vals_velocity = np.zeros_like(vals_density)
-                        print(vals_density.shape, len(macro_times), len(cell_ids))
-                        for i, t in enumerate(macro_times):
-                            for j, cid in enumerate(cell_ids):
-                                vals_density[i, j] = macro_density_lookup[t][(road.road_id, cid)][0]
-                                vals_velocity[i, j] = macro_density_lookup[t][(road.road_id, cid)][1]
-                        vals_flow = vals_density * vals_velocity
-                        entry["density"] = vals_density
-                        entry["velocity"] = vals_velocity
-                        entry["flow"] = vals_flow
-                    entry["mask_extents"] = mask_extents
-                    self.ts_data[(road.road_id, lane, version)] = entry
+    def _macro_pivots(self):
+        """Lazily pivot the empirical macro data into (times, density, velocity)
+        DataFrames indexed by time with (road_id, cell_id) columns. Cached."""
+        if self._macro_pivot_cache is None:
+            df = self._gt_store.macro_df.copy()
+            df["road_id"] = df["road_id"].astype(str)
+            df["cell_id"] = df["cell_id"].astype(str)
+            # (time, road_id, cell_id) is a unique complete grid, so plain pivot
+            # (no aggregation) is correct and faster than pivot_table.
+            piv = df.pivot(index="time", columns=["road_id", "cell_id"], values=["density", "velocity"]).sort_index()
+            dp = piv["density"]
+            vp = piv["velocity"]
+            times = dp.index.to_numpy().astype(float)
+            self._macro_pivot_cache = (times, dp, vp)
+        return self._macro_pivot_cache
+
+    def _ensure_ts_lane(self, road_id: str, lane: int) -> None:
+        """Build (and cache) the sim + empirical time-space entries for one lane."""
+        if (road_id, lane, "sim") in self.ts_data:
+            return
+        if road_id not in self._ref_net.roads:
+            return
+        road = self._ref_net.roads[road_id]
+        if lane not in road.lane_data:
+            return
+        cells = road.cells_for_lane(lane)
+        if not cells:
+            return
+        cell_ids = [c.cell_id for c in cells]
+        s_mids = [(c.start_s + c.end_s) / 2.0 for c in cells]
+        fds = [c.fd for c in cells]
+
+        # density_viz for this lane is a column slice of the matrix gathered
+        # once at construction (no per-frame snapshot re-reads).
+        cols = [self._base_col[(road_id, cid)] for cid in cell_ids]
+        rho_ts = self._base_density_viz[:, cols]  # (N_frames, N_cells)
+        sim_entry: Dict[str, Any] = {"s_mids": s_mids, "density": rho_ts}
+        for q in ("flow", "velocity"):
+            sim_entry[q] = self._q_matrix(rho_ts, fds, q)
+
+        # Mask extents per timestep: (start_s, end_s) or None
+        mask_extents: List[List[Optional[Tuple[float, float]]]] = [[]]
+        for snapshots in self.mask_snapshots_per_step:
+            extent: Optional[Tuple[float, float]] = None
+            for mask in snapshots.values():
+                for seg in mask.segments:
+                    if seg.road_id == road_id and seg.lane == lane:
+                        lo, hi = float(seg.start_s), float(seg.end_s)
+                        extent = (lo, hi) if extent is None else (min(extent[0], lo), max(extent[1], hi))
+            if (extent is None) and (len(mask_extents[-1]) > 0) and (mask_extents[-1][-1] is not None):
+                mask_extents.append([])
+            elif (extent is not None) and (len(mask_extents[-1]) > 0) and (mask_extents[-1][-1] is None):
+                mask_extents.append([])
+            mask_extents[-1].append(extent)
+        sim_entry["mask_extents"] = mask_extents
+        self.ts_data[(road_id, lane, "sim")] = sim_entry
+
+        # Empirical (ground-truth macro) heatmap, vectorised via pivot.
+        _times, dp, vp = self._macro_pivots()
+        cols = [(road_id, cid) for cid in cell_ids]
+        vals_density = dp.reindex(columns=cols).to_numpy()
+        vals_velocity = vp.reindex(columns=cols).to_numpy()
+        self.ts_data[(road_id, lane, "empirical")] = {
+            "s_mids": s_mids,
+            "density": vals_density,
+            "velocity": vals_velocity,
+            "flow": vals_density * vals_velocity,
+            "mask_extents": [[]],
+        }
 
     def get_ts_figure(self, road_id: str, lane: int, quantity: str = "density", version: str = "sim", render_masks: bool = True) -> go.Figure:
         """Return a time-space heatmap (viridis pcolormesh style) for one road+lane."""
+        self._ensure_ts_lane(road_id, lane)
         key = (road_id, lane, version)
         if key not in self.ts_data:
             return go.Figure()
@@ -2554,6 +2654,69 @@ class RolloutRenderer:
             self._tmpl_white_cache = tmpl
         return tmpl
 
+    def _base_frame_colors(self, step_idx: int, q: str) -> List[str]:
+        """Lazily build one frame's base fill-colors for quantity q. Cached."""
+        key = (step_idx, q)
+        cached = self._base_color_cache.get(key)
+        if cached is not None:
+            return cached
+        row = self._base_rho[step_idx:step_idx + 1]
+        vmin, vmax = self.ranges[q]
+        colors = self._color_matrix(self._q_matrix(row, self._base_fds, q), vmin, vmax)[0]
+        self._base_color_cache[key] = colors
+        return colors
+
+    def _active_frame_geo(self, step_idx: int):
+        """Lazily build (geometry, line-colors, density, fd, is_mask) for one
+        frame's active cells, padded to max_active. Cached per frame."""
+        cached = self._active_geo_cache.get(step_idx)
+        if cached is not None:
+            return cached
+        step_active = self._active_per_step[step_idx]
+        geo: List[Tuple[List, List]] = []
+        lc: List[str] = []
+        dens: List[float] = []
+        fds: List[Optional[FundamentalDiagram]] = []
+        is_mask: List[bool] = []
+        for i in range(self.max_active):
+            if i < len(step_active):
+                ac = step_active[i]
+                geo.append(self._polygon(ac.road_id, ac.start_s, ac.end_s, ac.lane))
+                lc.append(self.MASK_LINE if ac.kind == "mask" else self.NORMAL_LINE)
+                dens.append(ac.density)
+                fds.append(ac.fd)
+                is_mask.append(ac.kind == "mask")
+            else:
+                geo.append(([], []))
+                lc.append(self.NORMAL_LINE)
+                dens.append(0.0)
+                fds.append(None)
+                is_mask.append(False)
+        cached = (geo, lc, dens, fds, is_mask)
+        self._active_geo_cache[step_idx] = cached
+        return cached
+
+    def _active_frame_colors(self, step_idx: int, q: str) -> List[str]:
+        """Lazily build one frame's active fill-colors for quantity q. Cached."""
+        key = (step_idx, q)
+        cached = self._active_color_cache.get(key)
+        if cached is not None:
+            return cached
+        _geo, _lc, dens, fds, is_mask = self._active_frame_geo(step_idx)
+        vmin, vmax = self.ranges[q]
+        colors: List[str] = []
+        for i in range(self.max_active):
+            if is_mask[i]:
+                colors.append(self.MASK_FILL)
+            elif fds[i] is not None:
+                t = float(np.clip((self._q_value_scalar(dens[i], fds[i], q) - vmin) / max(vmax - vmin, 1e-12), 0.0, 1.0))
+                r, g, b, _ = self._cmap(t)
+                colors.append(f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}")
+            else:
+                colors.append("#000000")
+        self._active_color_cache[key] = colors
+        return colors
+
     def get_figure(self, step_idx: int, show_base: bool = True, quantity: str = "density") -> dict:
         """Return a static figure (plain dict) for a single simulation timestep.
 
@@ -2567,7 +2730,7 @@ class RolloutRenderer:
         traces: List[Any] = []
 
         if show_base:
-            colors = self.base_frame_colors[q][step_idx]
+            colors = self._base_frame_colors(step_idx, q)
             for (_rid, _cid, px, py, _fd), color in zip(self.base_cells, colors):
                 traces.append({
                     "type": "scatter",
@@ -2580,9 +2743,8 @@ class RolloutRenderer:
                     "hoverinfo": "skip",
                 })
         else:
-            colors = self.active_frame_colors[q][step_idx]
-            geo = self.active_geo[step_idx]
-            lcs = self.active_lcolor[step_idx]
+            geo, lcs, _dens, _fds, _is_mask = self._active_frame_geo(step_idx)
+            colors = self._active_frame_colors(step_idx, q)
             for i in range(self.max_active):
                 px, py = geo[i]
                 traces.append({
@@ -2773,7 +2935,7 @@ class I24MicroMask(ArbitraryMaskingCell):
         net_flux = min(demand, supply)
         #net_flux = (fd_exterior._flow(p_star) - (self.anchor_speed * p_star))
 
-        self.rear_flux_memory += net_flux
+        self.rear_flux_memory += (net_flux * dt)
         return net_flux
         #return 0.0
 
@@ -2834,7 +2996,7 @@ class I24MicroMask(ArbitraryMaskingCell):
 
         net_flux = min(demand, supply)
         #net_flux = (fd_exterior._flow(p_star) - (self.anchor_speed * p_star))
-        self.front_flux_memory += net_flux
+        self.front_flux_memory += (net_flux * dt)
         return net_flux
         #return 0.0
 

@@ -13,7 +13,7 @@
     "road_data": {
         "1": {
             "road_length": 40000.0,
-            "time_origin": 1669812350.0,
+            "time_origin": 0.0,
             "time_length": 300.0,
             "cell_length": 0.0,
             "time_step": 0.0,
