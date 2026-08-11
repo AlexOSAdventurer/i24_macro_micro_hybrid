@@ -24,7 +24,14 @@ class Cell:
     end_s: float
     mass: float
     mask_mass: float
-    
+
+    # Length over which `mass` was last spread by active_to_base, i.e. the unmasked
+    # portion of this cell at write time. base_to_active must divide `mass` by THIS
+    # length, not by the unmasked length of the newly rebuilt mesh: for a moving mask
+    # the two differ every step, and dividing by the new one compresses the whole
+    # cell's mass into the shrinking sliver. None means "never masked, use length".
+    macro_length: Optional[float] = None
+
     inflow_connections: List[Connection] = field(default_factory=list)
     outflow_connections: List[Connection] = field(default_factory=list)
     fd: Optional[FundamentalDiagram] = None
@@ -1181,13 +1188,6 @@ class ConservativeRemapper:
         # length (= sum of overlaps with normal active cells), not the full base
         # length. Otherwise mass on partially-masked base cells decays each cycle
         # because mass intended for the masked portion is silently dropped.
-        macro_length_per_base: Dict[Connection, float] = {}
-        for ac in active.active_cells.values():
-            if ac.kind == "mask":
-                continue
-            for (base_key, s0, s1) in ac.base_segments:
-                macro_length_per_base[base_key] = macro_length_per_base.get(base_key, 0.0) + (s1 - s0)
-
         for ac in active.active_cells.values():
             total_mass = 0.0
             if ac.kind == "mask":
@@ -1196,7 +1196,13 @@ class ConservativeRemapper:
                 for (base_key, s0, s1) in ac.base_segments:
                     base_cell = network.get_cell(*base_key)
                     overlap_len = s1 - s0
-                    macro_len = macro_length_per_base.get(base_key, base_cell.length)
+                    # Divide by the length `mass` was written over, NOT by this mesh's
+                    # unmasked length. They differ whenever the mask moved since the
+                    # last active_to_base, and using the new one inflates the seam
+                    # cells by full_length/unmasked_length every step.
+                    macro_len = base_cell.macro_length
+                    if macro_len is None:
+                        macro_len = base_cell.length
                     macro_density = (base_cell.mass / macro_len) if macro_len > 1e-12 else 0.0
                     total_mass += macro_density * overlap_len
 
@@ -1244,6 +1250,9 @@ class ConservativeRemapper:
             cell = network.get_cell(*base_key)
             covered_L = base_covered_lengths[base_key]
             cell.mass = 0.0 if covered_L <= 1e-12 else mass
+            # Remember the length this mass was spread over so base_to_active can
+            # recover the density even after the mask has moved.
+            cell.macro_length = covered_L if covered_L > 1e-12 else None
 
         for base_key, mass in base_mask_mass_updates.items():
             cell = network.get_cell(*base_key)
@@ -2830,7 +2839,9 @@ class I24MicroMask(ArbitraryMaskingCell):
         margin_s: float,
         anchor_speed: float,
         rear_flux_memory: float,
-        front_flux_memory: float
+        front_flux_memory: float,
+        rear_flux_total: float = 0.0,
+        front_flux_total: float = 0.0
     ):
         super().__init__(
             mask_id=mask_id,
@@ -2845,6 +2856,12 @@ class I24MicroMask(ArbitraryMaskingCell):
         self.anchor_speed = anchor_speed
         self.rear_flux_memory = rear_flux_memory
         self.front_flux_memory = front_flux_memory
+        # Pure cumulative integral of the coupling flux. Unlike *_flux_memory, which is a
+        # running balance that spawn/despawn also debit and credit, these are only ever
+        # written by the boundary flux functions -- so they are the true continuum mass
+        # exchanged, and can be reconciled against the discrete vehicle count.
+        self.rear_flux_total = rear_flux_total
+        self.front_flux_total = front_flux_total
 
     @property
     def mass(self):
@@ -2879,6 +2896,21 @@ class I24MicroMask(ArbitraryMaskingCell):
                 vehicles.append(self.vehicles[new_vehicle_key])
         return vehicles
 
+    @staticmethod
+    def _boundary_density(vehicle, fd_exterior: "FundamentalDiagram", vehicle_velocity: float):
+        """Interior density seen by a boundary Riemann solve.
+
+        A boundary vehicle may carry an explicit `rho` (prescribed boundary
+        conditions, as in PrescribedSimBridge). Prefer it: inferring density from
+        speed is impossible on the free-flow branch of a triangular FD, where
+        density_from_velocity collapses every v in [.., v_f] onto rho_c and the
+        boundary therefore always demands capacity.
+        """
+        prescribed = getattr(vehicle, "rho", None)
+        if prescribed is not None:
+            return float(prescribed)
+        return fd_exterior.density_from_velocity(vehicle_velocity)
+
     def get_rear_density(self, fd_exterior: "FundamentalDiagram"):
         leaving_region = 1 / fd_exterior.rho_c
         rear_vehicle = self.get_rear_vehicle()
@@ -2888,7 +2920,7 @@ class I24MicroMask(ArbitraryMaskingCell):
             vehicle_velocity = rear_vehicle.s_dt
 
             if vehicle_leaving:
-                rho_interior = fd_exterior.density_from_velocity(vehicle_velocity)
+                rho_interior = self._boundary_density(rear_vehicle, fd_exterior, vehicle_velocity)
             else:
                 rho_interior = 0.0
         else:
@@ -2938,6 +2970,7 @@ class I24MicroMask(ArbitraryMaskingCell):
         #net_flux = (fd_exterior._flow(p_star) - (self.anchor_speed * p_star))
 
         self.rear_flux_memory += (net_flux * dt)
+        self.rear_flux_total += (net_flux * dt)
         return net_flux
         #return 0.0
 
@@ -2950,7 +2983,7 @@ class I24MicroMask(ArbitraryMaskingCell):
             vehicle_leaving = (interior_s < leaving_region)
             vehicle_velocity = front_vehicle.s_dt
             if vehicle_leaving:
-                rho_interior = fd_exterior.density_from_velocity(vehicle_velocity)
+                rho_interior = self._boundary_density(front_vehicle, fd_exterior, vehicle_velocity)
             else:
                 rho_interior = 1.0 / interior_s
         else:
@@ -2999,6 +3032,7 @@ class I24MicroMask(ArbitraryMaskingCell):
         net_flux = min(demand, supply)
         #net_flux = (fd_exterior._flow(p_star) - (self.anchor_speed * p_star))
         self.front_flux_memory += (net_flux * dt)
+        self.front_flux_total += (net_flux * dt)
         return net_flux
         #return 0.0
 

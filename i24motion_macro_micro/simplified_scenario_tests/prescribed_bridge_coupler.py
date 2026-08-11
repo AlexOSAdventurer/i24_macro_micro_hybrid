@@ -17,6 +17,9 @@ class Vehicle:
     t: float # Lateral position. Decreases as one moves to the right.
     lane: int = 0 # Lane index (same convention as Network lanes)
     s_dt: float = 0 # Vehicle velocity (absolute, not relative to anchor)
+    rho: float | None = None # Prescribed boundary density, if this is a boundary vehicle.
+                             # Carried explicitly because it cannot be recovered from s_dt
+                             # on the free-flow branch (every v_f maps back to rho_c).
 
 def boundary_case_1(bridge: PrescribedSimBridge):
     bridge.anchor_speed = 0.0
@@ -179,6 +182,9 @@ class PrescribedSimBridge:
         self.initialized = False
         self.flow_memory_rear = 0.0
         self.flow_memory_front = 0.0
+        # Pure cumulative flux, never debited by spawn/despawn. See I24MicroMask.
+        self.flow_total_rear = 0.0
+        self.flow_total_front = 0.0
         self.vehicles: Dict[str, Vehicle] = {}
         self.anchor_speed = 0.0
         self.masking_cell: I24MicroMask = None
@@ -219,7 +225,9 @@ class PrescribedSimBridge:
             margin_s=self.margin_s,
             anchor_speed=self.anchor_speed,
             rear_flux_memory=self.flow_memory_rear,
-            front_flux_memory=self.flow_memory_front
+            front_flux_memory=self.flow_memory_front,
+            rear_flux_total=self.flow_total_rear,
+            front_flux_total=self.flow_total_front
         )
         self.masking_cell = new_mask
         new_mask.vehicles = self.collate_vehicles()#{vehicle: self.vehicles[vehicle] for vehicle in self.vehicles}
@@ -234,25 +242,44 @@ class PrescribedSimBridge:
         print(self.middle_s, self.anchor_speed, self.current_timestamp, self.sim.time_resolution, len(self.vehicles), float(len(self.vehicles)) / (2 * self.margin_s))
         self.flow_memory_rear = lane_cell.rear_flux_memory
         self.flow_memory_front = lane_cell.front_flux_memory
+        self.flow_total_rear = lane_cell.rear_flux_total
+        self.flow_total_front = lane_cell.front_flux_total
 
     def add_boundary_vehicles(self, density_rear: float):
-        # Rear Vehicle
+        # Rear Vehicle - carries the case's prescribed rear boundary density.
         self.vehicles["2"] = Vehicle(
             length=self.spawn_length,
             width=self.spawn_width,
             s=(self.middle_s - self.margin_s + self.spawn_length),
             t=self.vehicle_t_position,
             lane=self.lane_id,
-            s_dt=self.fd.velocity_from_density(density_rear)
+            s_dt=self.fd.velocity_from_density(density_rear),
+            rho=density_rear
         )
-        # Front Vehicle
+        # Front Vehicle - every b-case pairs its MovingBoundary rear with a SilentBoundary
+        # front, i.e. a front that emits exactly the downstream equilibrium flux and so
+        # leaves the downstream state untouched. micro_mass_check spells this out: it
+        # evaluates both the front demand and the front supply at the downstream density.
+        # That requires rho_interior == rho_exterior at the front, which is why the
+        # density is carried explicitly rather than recovered from the vehicle's speed.
+        #
+        # It is taken from the case's prescribed downstream state rather than read back
+        # off the adjacent macro cell. Reading the cell makes the front neutrally stable:
+        # it re-injects whatever that cell currently holds, so the seam transient created
+        # when the mask is first inserted is locked in forever instead of washing out, and
+        # the b-cases stop converging. A SilentBoundary in the exact solver does not
+        # observe the solution either - it is boundary *data*. Note the front is still not
+        # blind to the macro state: the supply term in front_boundary_flux uses the real
+        # exterior density, so genuine downstream congestion still throttles the front.
+        density_front = self.spawn_density_function(2.0 * self.margin_s, 2.0 * self.margin_s)
         self.vehicles["3"] = Vehicle(
             length=self.spawn_length,
             width=self.spawn_width,
             s=(self.middle_s + self.margin_s - self.spawn_length),
             t=self.vehicle_t_position,
             lane=self.lane_id,
-            s_dt=self.get_ahead_lane_velocity_macro(self.fd.v_f) if self.initialized else self.spawn_density_function(2.0 * self.margin_s, 2.0 * self.margin_s)
+            s_dt=self.fd.velocity_from_density(density_front),
+            rho=density_front
         )
         
     # This is meant for the upper level fluid simulator. Thus we have to convert road ids to strings and restructure it to play nice with that code.
@@ -261,7 +288,7 @@ class PrescribedSimBridge:
         min_s, max_s = self.get_current_visible_window()
         for vehicle in self.vehicles:
             vehicle_data = self.vehicles[vehicle]
-            result[str(vehicle)] = Vehicle(length=vehicle_data.length, width=vehicle_data.width, s=vehicle_data.s - min_s, t=vehicle_data.t, lane=vehicle_data.lane, s_dt=vehicle_data.s_dt)
+            result[str(vehicle)] = Vehicle(length=vehicle_data.length, width=vehicle_data.width, s=vehicle_data.s - min_s, t=vehicle_data.t, lane=vehicle_data.lane, s_dt=vehicle_data.s_dt, rho=vehicle_data.rho)
         return result
 
     def update_vehicles(self, vehicles: Dict[str, Vehicle]):

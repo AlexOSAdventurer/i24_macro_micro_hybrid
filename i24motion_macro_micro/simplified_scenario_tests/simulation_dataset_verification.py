@@ -58,23 +58,42 @@ class SimplifiedSimulationDataVerification:
         network = simulation.Network.from_json(self.network_path)
         fd : simulation.TriangularFD = network.roads["1"].cells["road_1_cell_-1_step_0"].fd
 
-        time_list = np.empty((total_cells * total_time), dtype=float)
-        timelength_list = np.empty((total_cells * total_time), dtype=float)
-        road_id_list = np.empty((total_cells * total_time), dtype=np.dtypes.StringDType())
-        cell_id_list = np.empty((total_cells * total_time), dtype=np.dtypes.StringDType())
-        density_list = np.empty((total_cells * total_time), dtype=float)
-        velocity_list = np.empty((total_cells * total_time), dtype=float)
+        # This parquet is consumed in exactly two places:
+        #   * GroundTruthStore.apply_density_snapshot_to_network, once, at t = time_origin
+        #     (from Simulation.initialize_from_ground_truth) -- writes EVERY cell, so the
+        #     initial snapshot must be complete;
+        #   * GroundTruthStore.apply_density_snapshot_to_network_boundaries, every step,
+        #     which only ever writes cells with no inflow or no outflow connections, i.e.
+        #     the first and last cell of the road.
+        # Interior cells at t > time_origin are therefore loaded, indexed and iterated
+        # once per step but never read. Emitting them costs 96M rows / ~22 GB of resident
+        # GroundTruthStore at dx=4 in order to serve two boundary values, so they are
+        # skipped. Boundary rows are still written at every timestep, so _nearest_time
+        # continues to resolve every step exactly.
+        boundary_cells = {0, total_cells - 1}
+        total_rows = total_cells + (len(boundary_cells) * (total_time - 1))
+
+        time_list = np.empty(total_rows, dtype=float)
+        timelength_list = np.empty(total_rows, dtype=float)
+        road_id_list = np.empty(total_rows, dtype=np.dtypes.StringDType())
+        cell_id_list = np.empty(total_rows, dtype=np.dtypes.StringDType())
+        density_list = np.empty(total_rows, dtype=float)
+        velocity_list = np.empty(total_rows, dtype=float)
         cell_id_base_reference = [f"road_1_cell_{lane_str}_step_{i}" for i in range(total_cells)]
+        new_index = 0
         for i in range(total_cells):
             for j in range(total_time):
+                if (j != 0) and (i not in boundary_cells):
+                    continue
                 density, velocity = self.density_and_velocity_function(i, j, total_cells, total_time, fd)
-                new_index = (i * total_time) + j
                 time_list[new_index] = (j * time_step) + time_origin
                 timelength_list[new_index] = time_step
                 road_id_list[new_index] = road_str
                 cell_id_list[new_index] = cell_id_base_reference[i]
                 density_list[new_index] = density
                 velocity_list[new_index] = velocity
+                new_index += 1
+        assert new_index == total_rows, f"Expected {total_rows} rows, wrote {new_index}"
 
         final_dataframe = pd.DataFrame({
             "time": time_list,
@@ -106,14 +125,14 @@ def case_m_2(i, j, total_cells, total_time, fd):
 
 def case_m_3(i, j, total_cells, total_time, fd):
     position = float(i) / float(total_cells)
-    if position <= 0.2:
+    if position < 0.2:
         return 0.05 * fd.rho_c, fd.velocity_from_density(0.05 * fd.rho_c)
     else:
         return fd.rho_j, fd.velocity_from_density(fd.rho_j)
 
 def case_m_4(i, j, total_cells, total_time, fd):
     position = float(i) / float(total_cells)
-    if position <= 0.2:
+    if position < 0.2:
         return fd.rho_j, fd.velocity_from_density(fd.rho_j)
     else:
         return 0.05 * fd.rho_c, fd.velocity_from_density(0.05 * fd.rho_c)
@@ -425,8 +444,10 @@ micro_cases = {
 }
 
 if __name__ == "__main__":
-    dx_sweep = [128.0 / (2.0 ** n) for n in range(5)]
-    dt_sweep = [1.0 / (2.0 ** n) for n in range(5)]
+    dx_sweep = [128.0 / (2.0 ** n) for n in range(6)]
+    dt_sweep = [1.0 / (2.0 ** n) for n in range(6)]
+    #dx_sweep = [4.0]
+    #dt_sweep = [0.03125]
     for macro_case in macro_cases:
         func = macro_cases[macro_case]
         for x, t in zip(dx_sweep, dt_sweep):

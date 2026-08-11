@@ -332,6 +332,9 @@ class SimplifiedSimBridge:
         self.initialized = False
         self.flow_memory_rear = 0.0
         self.flow_memory_front = 0.0
+        # Pure cumulative flux, never debited by spawn/despawn. See I24MicroMask.
+        self.flow_total_rear = 0.0
+        self.flow_total_front = 0.0
         self.vehicles: Dict[str, Vehicle] = {}
         self.anchor_speed = 0.0
         self.masking_cell: I24MicroMask = None
@@ -383,7 +386,9 @@ class SimplifiedSimBridge:
             margin_s=self.margin_s,
             anchor_speed=self.anchor_speed,
             rear_flux_memory=self.flow_memory_rear,
-            front_flux_memory=self.flow_memory_front
+            front_flux_memory=self.flow_memory_front,
+            rear_flux_total=self.flow_total_rear,
+            front_flux_total=self.flow_total_front
         )
         self.masking_cell = new_mask
         new_mask.vehicles = self.collate_vehicles()#{vehicle: self.vehicles[vehicle] for vehicle in self.vehicles}
@@ -398,6 +403,8 @@ class SimplifiedSimBridge:
         print(self.middle_s, self.anchor_speed, self.current_timestamp, self.sim.time_resolution, len(self.vehicles), float(len(self.vehicles)) / (2 * self.margin_s))
         self.flow_memory_rear = lane_cell.rear_flux_memory
         self.flow_memory_front = lane_cell.front_flux_memory
+        self.flow_total_rear = lane_cell.rear_flux_total
+        self.flow_total_front = lane_cell.front_flux_total
     
     # This is meant for the upper level fluid simulator. Thus we have to convert road ids to strings and restructure it to play nice with that code.
     def collate_vehicles(self):
