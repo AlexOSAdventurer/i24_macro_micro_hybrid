@@ -18,8 +18,8 @@ def run_calibration(trial):
     #  {'v_f': 36.84345956738889, 'rho_j': 0.11911626274100441, 'lambda_lc': 0.07329849477541688, 'w': 5.5232290087351155}
     v_f = trial.suggest_float("v_f", 30.0, 50.0)
     rho_j = trial.suggest_float("rho_j", 0.07, 0.15)
-    lambda_lc = trial.suggest_float("lambda_lc", 0.05, 0.2)
-    w = trial.suggest_float("w", 5.0, 8.0)
+    lambda_lc = trial.suggest_float("lambda_lc", 0.01, 0.2)
+    w = trial.suggest_float("w", 4.5, 8.0)
     sim_data = I24SimulationData()
     sim_data.network_generator = I24WestAndEastNetwork(TriangularFD(v_f, w, rho_j), lambda_lc)
     sim_data.network_generator.create_network(sim_data.config["road_data"]["2"]["road_length"], sim_data.config["road_data"]["2"]["cell_length"], sim_data.config["road_data"]["2"]["lanes"], lane_width=sim_data.config["road_data"]["2"]["lane_width"])
@@ -44,10 +44,10 @@ def run_calibration(trial):
         initial_middle_s=350.0,
         margin_s=50.0,
         max_middle_s=1450,
-        update_micro_callback=replayer.step,
+        micro_coupler=replayer,
         bridge_callback_name="bridge_step"
     )
-    bridge_time_window = 1080.0
+    bridge_time_window = 3600.0
     current_bridge_iteration = 1.0
 
     rear_flux_entry = []
@@ -81,7 +81,7 @@ def run_calibration(trial):
                 initial_middle_s=350.0,
                 margin_s=150.0,
                 max_middle_s=1450,
-                update_micro_callback=replayer.step,
+                micro_coupler=replayer,
                 bridge_callback_name="bridge_step"
             )
             #bridge._step(sim.current_time, sim.time_resolution)
@@ -97,6 +97,7 @@ def run_calibration(trial):
     jam_threshold = 15.0
     metric = 0.0
     for lane in lanes:
+        renderer._ensure_ts_lane("2", lane)
         sim_velocity_data = renderer.ts_data[("2", lane, "sim")]["velocity"]
         empirical_velocity_data = renderer.ts_data[("2", lane, "empirical")]["velocity"][1:]
         sim_in_jam = (sim_velocity_data < jam_threshold).astype(int).reshape(-1)

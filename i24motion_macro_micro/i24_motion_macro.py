@@ -254,27 +254,77 @@ class I24MotionMacro:
             return pickle.load(file)
     
     @staticmethod
-    def density(vehicles, longitudinal_cell_size):
-        return (float(len(vehicles.keys())) / float(longitudinal_cell_size))
-    
-    @staticmethod
-    def velocity(vehicles, max_velocity, min_velocity):
-        velocity_list = []
+    def edieTotals(vehicles, time_delta, sample_delta=None):
+        """Edie's total time spent (veh*s) and total distance travelled (veh*m) in one box.
+
+        `vehicles` maps vehicle id -> that vehicle's samples inside the box, ordered by
+        time. Two things matter for the totals to be unbiased:
+
+        - Each sample stands for one sampling period of presence, so a vehicle's time
+          in the box is its sample span PLUS one period. Taking the bare span drops up
+          to a period per vehicle (~4% of a 1 s box at 25 Hz), and a vehicle caught by
+          a single sample would come out at zero.
+        - Distance is measured along `s`, the coordinate the box is cut in, from first
+          to last sample rather than as a path length. Endpoint displacement is what
+          the old estimator used and it does not accumulate per-sample position noise.
+
+        Together these give q = TTD/(L*T) = rho*v exactly, which counting vehicle ids
+        did not: `len(vehicles)/L` weights every vehicle as if it occupied the cell for
+        the whole window, over-estimating density by roughly (L + v*T)/L -- about 35%
+        at 34.5 m/s on a 100 m x 1 s box, and worst exactly where speeds are highest.
+        """
+        total_time = 0.0
+        total_distance = 0.0
+        periods = []
+        clipped = 0
         for vehicle_id in vehicles:
-            entry_0 = vehicles[vehicle_id].iloc[0]
-            entry_1 = vehicles[vehicle_id].iloc[-1]
-            time_delta = float(entry_1["time"] - entry_0["time"])
-            if (time_delta < 1e-8):
+            entries = vehicles[vehicle_id]
+            times = entries["time"].to_numpy(dtype=numpy.float64)
+            if len(times) < 2:
+                # One sample carries no displacement, so it can contribute time but no
+                # distance, which would drag the mean speed down. Settle these below at
+                # the box's own mean speed instead of dropping them from the density.
+                clipped += 1
                 continue
-            x_delta = float(entry_1["x"] - entry_0["x"])
-            y_delta = float(entry_1["y"] - entry_0["y"])
-            position_delta = ((x_delta ** 2) + (y_delta ** 2)) ** 0.5
-            velocity = position_delta / time_delta
-            velocity_list.append(velocity)
-        if len(velocity_list) == 0:
+            span = float(times[-1] - times[0])
+            if span < 1e-8:
+                clipped += 1
+                continue
+            period = (float(numpy.median(numpy.diff(times))) if sample_delta is None
+                      else float(sample_delta))
+            periods.append(period)
+            # A vehicle cannot be inside the box for longer than the box lasts; the
+            # query bounds are inclusive at both ends, so span can already equal T.
+            occupancy = min(span + period, float(time_delta))
+            positions = entries["s"].to_numpy(dtype=numpy.float64)
+            speed = abs(float(positions[-1] - positions[0])) / span
+            total_time += occupancy
+            total_distance += speed * occupancy
+        if clipped and total_time > 1e-8:
+            period = float(numpy.median(periods)) if periods else float(sample_delta or 0.0)
+            mean_speed = total_distance / total_time
+            total_time += clipped * period
+            total_distance += clipped * period * mean_speed
+        return total_time, total_distance
+
+    @staticmethod
+    def density(total_time, longitudinal_cell_size, time_delta):
+        """Edie's generalized density: TTS / (L*T)."""
+        return float(total_time) / (float(longitudinal_cell_size) * float(time_delta))
+
+    @staticmethod
+    def velocity(total_time, total_distance, max_velocity, min_velocity):
+        """Edie's space-mean speed: TTD / TTS.
+
+        This is a time-in-box weighted mean of the vehicles' speeds. The old unweighted
+        mean of per-vehicle speeds gave a vehicle that merely clipped the corner of the
+        box the same weight as one that sat in it for the whole window, which biases
+        the estimate toward the fast vehicles (they are the ones passing through).
+        """
+        if (total_time < 1e-8):
             return float('nan')
-        return max(min(sum(velocity_list) / float(len(velocity_list)), max_velocity), min_velocity)
-    
+        return max(min(float(total_distance) / float(total_time), max_velocity), min_velocity)
+
     @staticmethod
     def flow(density, velocity):
         if (math.isfinite(velocity) and math.isfinite(density)):
@@ -283,7 +333,7 @@ class I24MotionMacro:
             return float('nan')
     
     @staticmethod
-    def computeMacroData(queries, query_results, lane, longitudinal_cell_size, max_velocity, min_velocity):
+    def computeMacroData(queries, query_results, lane, longitudinal_cell_size, time_delta, max_velocity, min_velocity):
         density_result = numpy.zeros(len(query_results), dtype=numpy.float32)
         velocity_result = numpy.zeros(len(query_results), dtype=numpy.float32)
         flow_result = numpy.zeros(len(query_results), dtype=numpy.float32)
@@ -291,8 +341,9 @@ class I24MotionMacro:
             if (lane in query_results[i]):
                 lane_data = query_results[i][lane]
                 vehicles = I24MotionMacro.vehiclesInBox(lane_data)
-                density_result[i] = I24MotionMacro.density(vehicles, longitudinal_cell_size)
-                velocity_result[i] = I24MotionMacro.velocity(vehicles, max_velocity, min_velocity)
+                total_time, total_distance = I24MotionMacro.edieTotals(vehicles, time_delta)
+                density_result[i] = I24MotionMacro.density(total_time, longitudinal_cell_size, time_delta)
+                velocity_result[i] = I24MotionMacro.velocity(total_time, total_distance, max_velocity, min_velocity)
                 flow_result[i] = I24MotionMacro.flow(density_result[i], velocity_result[i])
             if ((i % 1000) == 0):
                 print(i)
@@ -306,7 +357,7 @@ class I24MotionMacro:
         raw_macro_data = {}
         for lane in self.lanes:
             raw_macro_data[lane] = {}
-            (lane_density, lane_velocity, lane_flow) = I24MotionMacro.computeMacroData(queries, query_results, lane, self.longitudinal_cell_size, self.max_velocity, self.min_velocity)
+            (lane_density, lane_velocity, lane_flow) = I24MotionMacro.computeMacroData(queries, query_results, lane, self.longitudinal_cell_size, self.time_delta, self.max_velocity, self.min_velocity)
             raw_macro_data[lane]["density"] = lane_density
             raw_macro_data[lane]["velocity"] = lane_velocity
             raw_macro_data[lane]["flow"] = lane_flow

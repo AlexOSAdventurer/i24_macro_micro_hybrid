@@ -125,5 +125,12 @@ class I24MicroSimBridge:
                 cell = self.sim.network.get_cell(road_id, cell_id)
                 cell.mass += cell.mask_mass
                 cell.mask_mass = 0
+                # `mass` now covers the whole cell again, so the remap state that
+                # said otherwise has to go with it. macro_length is the *unmasked*
+                # length the mask left behind; leaving it set makes the next
+                # base_to_active compute mass / sliver instead of mass / length,
+                # spiking a partially-masked cell by length/sliver (and creating
+                # that mass for real, since active_to_base writes it back).
+                cell.macro_length = None
             self.sim.unregister_step_callback(self.bridge_callback_name)
             self.micro_coupler.destroy()

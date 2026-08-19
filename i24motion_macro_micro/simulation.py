@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, is_dataclass, replace
 from typing import Dict, List, Tuple, Optional, Any, Set
 import copy
 import json
@@ -31,6 +31,11 @@ class Cell:
     # the two differ every step, and dividing by the new one compresses the whole
     # cell's mass into the shrinking sliver. None means "never masked, use length".
     macro_length: Optional[float] = None
+
+    # Mean speed (m/s). Only second-order macro models (METANETModel) carry speed as
+    # an independent state variable; under the default first-order Godunov/CTM path
+    # this stays None and speed is recovered from the FD as v = q(rho)/rho.
+    velocity: Optional[float] = None
 
     inflow_connections: List[Connection] = field(default_factory=list)
     outflow_connections: List[Connection] = field(default_factory=list)
@@ -154,6 +159,7 @@ class Network:
                     end_s=cell.end_s,
                     mass=cell.mass,
                     mask_mass=cell.mask_mass,
+                    velocity=cell.velocity,
                     inflow_connections=cell.inflow_connections,
                     outflow_connections=cell.outflow_connections,
                     fd=cell.fd,
@@ -243,6 +249,7 @@ class Network:
                             "end_s": float(cell.end_s),
                             "mass": float(cell.mass),
                             "mask_mass": float(cell.mask_mass),
+                            "velocity": None if cell.velocity is None else float(cell.velocity),
                             "inflow_connections": [[r, c] for (r, c) in cell.inflow_connections],
                             "outflow_connections": [[r, c] for (r, c) in cell.outflow_connections],
                             "fd": Network._fd_to_dict(cell.fd),
@@ -283,6 +290,10 @@ class Network:
                     end_s=float(cell_data["end_s"]),
                     mass=float(cell_data["mass"]),
                     mask_mass=float(cell_data["mask_mass"]),
+                    velocity=(
+                        None if cell_data.get("velocity") is None
+                        else float(cell_data["velocity"])
+                    ),
                     inflow_connections=[
                         (str(x[0]), str(x[1]))
                         for x in cell_data.get("inflow_connections", [])
@@ -501,6 +512,7 @@ class I24WestBoundNetwork(NetworkGenerator):
                 "lateral_position": -(lane_width*3.0)
             }
         }
+        road_lane_data = {k: v for (k, v) in road_lane_data.items() if k >= (-lane_count)}
 
         longitudinal_steps = np.arange(0.0, road_length, longitudinal_step).tolist()
         cells = {}
@@ -571,6 +583,7 @@ class I24EastBoundNetwork(NetworkGenerator):
                 "lateral_position": -(lane_width*3.0)
             }
         }
+        road_lane_data = {k: v for (k, v) in road_lane_data.items() if k >= (-lane_count)}
 
         longitudinal_steps = np.arange(0.0, road_length, longitudinal_step).tolist()
         cells = {}
@@ -607,6 +620,174 @@ class I24WestAndEastNetwork(NetworkGenerator):
         westbound_network.create_network(road_length, longitudinal_step, lane_count, lane_width)
         eastbound_network.create_network(road_length, longitudinal_step, lane_count, lane_width)
         self.network = Network.merge_networks(westbound_network.network, eastbound_network.network, network_id)
+
+class I24WestAndEastNetworkCollapsed(NetworkGenerator):
+    """`I24WestAndEastNetwork` with each carriageway's lanes collapsed into one cell.
+
+    One cell per longitudinal station per road instead of `lane_count` of them. The
+    collapsed cell's `mass` is the total across lanes, so its `density` is the total
+    (all-lane) density and the interface flux is total flow. This is the mesh METANET
+    is normally written on: pair it with `METANETParams.lanes` set to the lane count
+    and keep the paper's PER-LANE `rho_crit`/`kappa` (see `METANETModel`). Lane counts
+    per road are recorded on `lanes_per_road` after `create_network`.
+
+    Lateral exchange disappears by construction -- `lateral_delta_density` pairs
+    adjacent lanes and there are none left -- so the collapsed cells carry
+    `NoLaneChange`. Lane changing is no longer modelled explicitly; it is implicit in
+    the aggregated dynamics.
+
+    The collapsed `fd` is the per-lane `fd` with `rho_j` (and hence capacity) scaled
+    by the lane count, so a first-order CTM run -- or just the rollout colouring --
+    sees an aggregate jam density rather than a single lane's.
+
+    `collapse_lanes` is a plain `Network -> Network` conversion, so it also works on a
+    network loaded from JSON (e.g. `i24_westbound_network.json`), keeping the real
+    polylines. It is a construction-time helper: it refuses a network carrying live
+    remap state (`macro_length`).
+    """
+
+    def __init__(self, fd, lambda_lc=0.05):
+        super().__init__()
+        self.network = None
+        self.fd = fd
+        self.lambda_lc = lambda_lc
+        # Lanes aggregated into each road's cells; feed this to METANETParams.lanes.
+        self.lanes_per_road: Dict[str, int] = {}
+
+    def create_network(self, road_length=1600.0, longitudinal_step=50.0, lane_count=4, lane_width=3.6576):
+        network_id = "i24_west_and_east_network_collapsed"
+        source = I24WestAndEastNetwork(self.fd, self.lambda_lc)
+        source.create_network(road_length, longitudinal_step, lane_count, lane_width)
+        self.lanes_per_road = {
+            road_id: len(road.lane_data) for road_id, road in source.network.roads.items()
+        }
+        self.network = I24WestAndEastNetworkCollapsed.collapse_lanes(source.network, network_id)
+
+    @staticmethod
+    def scale_fd(fd: Optional[FundamentalDiagram], lanes: int) -> Optional[FundamentalDiagram]:
+        """Per-lane FD -> lane-aggregate FD: rho_j scales with lanes, speeds do not."""
+        if fd is None or lanes == 1:
+            return fd
+        if not is_dataclass(fd) or not hasattr(fd, "rho_j"):
+            raise ValueError(
+                f"Cannot scale {type(fd).__name__} to {lanes} lanes: it is not a "
+                f"dataclass with a rho_j field. Build the aggregate FD by hand."
+            )
+        return replace(fd, rho_j=float(fd.rho_j) * lanes)
+
+    @staticmethod
+    def collapse_lanes(network: Network, network_id: Optional[str] = None) -> Network:
+        """Return a copy of `network` with every road's lanes merged into one chain."""
+        # Pass 1: per road, the station list and the source-cell -> collapsed-cell map,
+        # so connections can be rewritten in pass 2 (including across roads).
+        per_road: Dict[str, Dict[str, Any]] = {}
+        id_map: Dict[Connection, Connection] = {}
+        for road_id, road in network.roads.items():
+            lanes = sorted(road.lane_data)
+            lane_count = len(lanes)
+
+            stations: Dict[Tuple[float, float], List[Cell]] = {}
+            for cell in road.cells.values():
+                if cell.macro_length is not None:
+                    raise ValueError(
+                        f"Cell {road_id}/{cell.cell_id} carries macro_length: "
+                        f"collapse_lanes is a construction-time helper and cannot "
+                        f"merge a network mid-run."
+                    )
+                key = (round(float(cell.start_s), 9), round(float(cell.end_s), 9))
+                stations.setdefault(key, []).append(cell)
+
+            ordered = sorted(stations)
+            collapsed_lane = max(lanes)
+            for i, extent in enumerate(ordered):
+                group = stations[extent]
+                if len(group) != lane_count:
+                    raise ValueError(
+                        f"Road {road_id} station {extent} has {len(group)} cells but "
+                        f"the road has {lane_count} lanes: lanes are not aligned "
+                        f"longitudinally, so they cannot be collapsed."
+                    )
+                collapsed_id = f"road_{road_id}_cell_collapsed_step_{i}"
+                for cell in group:
+                    id_map[(road_id, cell.cell_id)] = (road_id, collapsed_id)
+
+            per_road[road_id] = {
+                "road": road,
+                "lanes": lanes,
+                "stations": stations,
+                "ordered": ordered,
+                "collapsed_lane": collapsed_lane,
+            }
+
+        # Pass 2: build the collapsed cells.
+        roads: Dict[str, Road] = {}
+        for road_id, info in per_road.items():
+            road: Road = info["road"]
+            lanes: List[int] = info["lanes"]
+            lane_count = len(lanes)
+            collapsed_lane: int = info["collapsed_lane"]
+
+            # A single lane spanning the whole carriageway, so the cell polygons the
+            # plots draw still cover exactly the lanes they replaced.
+            top = max(float(road.lane_data[l]["lateral_position"]) for l in lanes)
+            bottom = min(
+                float(road.lane_data[l]["lateral_position"]) - float(road.lane_data[l]["width"])
+                for l in lanes
+            )
+            lane_data = {collapsed_lane: {"lateral_position": top, "width": top - bottom}}
+
+            cells: Dict[str, Cell] = {}
+            for i, extent in enumerate(info["ordered"]):
+                group: List[Cell] = info["stations"][extent]
+                collapsed_id = id_map[(road_id, group[0].cell_id)][1]
+
+                inflow: List[Connection] = []
+                outflow: List[Connection] = []
+                for cell in group:
+                    for conn in cell.inflow_connections:
+                        mapped = id_map[conn]
+                        if mapped not in inflow:
+                            inflow.append(mapped)
+                    for conn in cell.outflow_connections:
+                        mapped = id_map[conn]
+                        if mapped not in outflow:
+                            outflow.append(mapped)
+
+                mass = sum(float(c.mass) for c in group)
+                # Mean speed is a per-lane quantity, so it is mass-weighted rather
+                # than summed. Only second-order models set it; None stays None.
+                velocities = [(float(c.mass), float(c.velocity)) for c in group if c.velocity is not None]
+                if not velocities:
+                    velocity = None
+                elif mass > 1e-12:
+                    velocity = sum(m * v for m, v in velocities) / mass
+                else:
+                    velocity = sum(v for _, v in velocities) / len(velocities)
+
+                cells[collapsed_id] = Cell(
+                    road_id=road_id,
+                    cell_id=collapsed_id,
+                    lane=collapsed_lane,
+                    start_s=float(extent[0]),
+                    end_s=float(extent[1]),
+                    mass=mass,
+                    mask_mass=sum(float(c.mask_mass) for c in group),
+                    velocity=velocity,
+                    inflow_connections=inflow,
+                    outflow_connections=outflow,
+                    fd=I24WestAndEastNetworkCollapsed.scale_fd(group[0].fd, lane_count),
+                    lane_change_model=NoLaneChange(),
+                )
+
+            roads[road_id] = Road(
+                road_id=road_id,
+                left_polyline=road.left_polyline,
+                right_polyline=road.right_polyline,
+                lane_data=lane_data,
+                cells=cells,
+            )
+
+        return Network(network_id=network_id or f"{network.network_id}_collapsed", roads=roads)
 
 class SimplifiedOneLaneRoadNetwork(NetworkGenerator):
     def __init__(self, fd, lambda_lc=0.05):
@@ -881,6 +1062,8 @@ class ActiveCell:
     end_s: float
     kind: str  # "normal" or "mask"
     mass: float
+    # Mean speed (m/s); see Cell.velocity. None under the first-order path.
+    velocity: Optional[float] = None
     base_segments: List[Tuple[Connection, float, float]] = field(default_factory=list)
     mask_id: Optional[str] = None
     fd: Optional[FundamentalDiagram] = None
@@ -924,6 +1107,7 @@ class ActiveNetwork:
                 end_s=ac.end_s,
                 kind=ac.kind,
                 mass=ac.mass,
+                velocity=ac.velocity,
                 base_segments=ac.base_segments,
                 mask_id=ac.mask_id,
                 fd=ac.fd,
@@ -1190,6 +1374,13 @@ class ConservativeRemapper:
         # because mass intended for the masked portion is silently dropped.
         for ac in active.active_cells.values():
             total_mass = 0.0
+            # Velocity is intensive, so it is transported as a mass-weighted average
+            # over the overlapping base segments (with a length-weighted fallback for
+            # near-empty cells, where the mass weights carry no information).
+            vel_mass_num = 0.0
+            vel_mass_den = 0.0
+            vel_len_num = 0.0
+            vel_len_den = 0.0
             if ac.kind == "mask":
                 total_mass = float(simulation.masking_cells[ac.mask_id].mass)
             else:
@@ -1204,9 +1395,19 @@ class ConservativeRemapper:
                     if macro_len is None:
                         macro_len = base_cell.length
                     macro_density = (base_cell.mass / macro_len) if macro_len > 1e-12 else 0.0
-                    total_mass += macro_density * overlap_len
+                    seg_mass = macro_density * overlap_len
+                    total_mass += seg_mass
+                    if base_cell.velocity is not None:
+                        vel_mass_num += base_cell.velocity * seg_mass
+                        vel_mass_den += seg_mass
+                        vel_len_num += base_cell.velocity * overlap_len
+                        vel_len_den += overlap_len
 
             ac.mass = 0.0 if ac.length <= 1e-12 else total_mass
+            if vel_mass_den > 1e-12:
+                ac.velocity = vel_mass_num / vel_mass_den
+            elif vel_len_den > 1e-12:
+                ac.velocity = vel_len_num / vel_len_den
 
     @staticmethod
     def active_to_base(network: Network, active: ActiveNetwork) -> None:
@@ -1223,6 +1424,11 @@ class ConservativeRemapper:
         base_mass_updates: Dict[Connection, float] = {}
         base_mask_mass_updates: Dict[Connection, float] = {}
         base_covered_lengths: Dict[Connection, float] = {}
+        # Mass-weighted and length-weighted velocity accumulators, mirroring
+        # base_to_active. Mask active cells are skipped: speed inside the bubble is
+        # the micro simulation's state, not the macro model's.
+        base_vel_mass: Dict[Connection, Tuple[float, float]] = {}
+        base_vel_len: Dict[Connection, Tuple[float, float]] = {}
 
         # Reset all masses.
         for ac in active.active_cells.values():
@@ -1243,8 +1449,18 @@ class ConservativeRemapper:
                     if base_key not in base_mass_updates:
                         base_mass_updates[base_key] = 0.0
                         base_covered_lengths[base_key] = 0.0
-                    base_mass_updates[base_key] += float(ac.density * overlap_len)
+                    seg_mass = float(ac.density * overlap_len)
+                    base_mass_updates[base_key] += seg_mass
                     base_covered_lengths[base_key] += overlap_len
+                    if ac.velocity is not None:
+                        m_num, m_den = base_vel_mass.get(base_key, (0.0, 0.0))
+                        base_vel_mass[base_key] = (
+                            m_num + ac.velocity * seg_mass, m_den + seg_mass
+                        )
+                        l_num, l_den = base_vel_len.get(base_key, (0.0, 0.0))
+                        base_vel_len[base_key] = (
+                            l_num + ac.velocity * overlap_len, l_den + overlap_len
+                        )
 
         for base_key, mass in base_mass_updates.items():
             cell = network.get_cell(*base_key)
@@ -1257,6 +1473,15 @@ class ConservativeRemapper:
         for base_key, mass in base_mask_mass_updates.items():
             cell = network.get_cell(*base_key)
             cell.mask_mass = mass
+
+        for base_key in base_vel_mass:
+            cell = network.get_cell(*base_key)
+            m_num, m_den = base_vel_mass[base_key]
+            l_num, l_den = base_vel_len[base_key]
+            if m_den > 1e-12:
+                cell.velocity = m_num / m_den
+            elif l_den > 1e-12:
+                cell.velocity = l_num / l_den
 
     @staticmethod
     def move_active_masks(simulation: "Simulation", active: ActiveNetwork) -> None:
@@ -1539,6 +1764,330 @@ class SpeedIncentiveLaneChange(LaneChangeModel):
 
 
 # =========================
+# Macroscopic models
+# =========================
+
+
+class MacroModel(ABC):
+    """Strategy governing how the active mesh advances each step.
+
+    The default path (``Simulation.macro_model is None``) is first-order
+    Godunov/CTM: cell state is density alone and the interface flux is
+    ``min(demand(rho_u), supply(rho_v))`` read off each cell's `FundamentalDiagram`.
+
+    A `MacroModel` replaces that flux rule and may carry extra per-cell state
+    (e.g. METANET's mean speed). Everything else — external boundaries, lateral
+    lane exchange, mask coupling, the base<->active remap — is shared.
+    """
+
+    @abstractmethod
+    def prepare(self, simulation: "Simulation", active: "ActiveNetwork") -> None:
+        """Called once at the top of each step, before any state is mutated."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def sending_flow(self, ac: "ActiveCell") -> float:
+        """Flow (veh/s) this cell offers downstream. Replaces ``fd.demand``."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def receiving_flow(self, ac: "ActiveCell") -> float:
+        """Flow (veh/s) this cell will accept. Replaces ``fd.supply``.
+
+        Return ``math.inf`` for models with no supply-side constraint.
+        """
+        raise NotImplementedError
+
+    def boundary_capacity(self, ac: "ActiveCell") -> Optional[float]:
+        """Default cap at an unconnected downstream end; ``None`` means uncapped.
+
+        Only used when `outflow_boundary_map` has no entry for the cell.
+        """
+        return ac.fd.capacity if ac.fd is not None else None
+
+    def advance(self, simulation: "Simulation", active: "ActiveNetwork") -> None:
+        """Called after the density update to advance any extra state."""
+        return None
+
+
+@dataclass
+class METANETParams:
+    """METANET parameters in SI units (metres, seconds, veh/m).
+
+    Chan, Raghavan & Wu, "Open-Source METANET Calibration for Reproducible Freeway
+    Traffic Macroscopic Simulation" (ITSC 2026), arXiv:2605.23042, eqs. (1)-(4).
+
+    The paper states these in veh/km, km/h and hours; use `from_paper_units` to
+    convert. `rho_crit` and `kappa` are the paper's PER-LANE values converted to
+    veh/m, and `lanes` is the paper's lambda: the number of lanes the cell holding
+    this state represents. A cell's `density` is always the total across those lanes,
+    so the per-lane density the speed equation needs is `density / lanes`. With the
+    default `lanes=1` (one `Cell` == one lane) this reduces to the paper's rho.
+    """
+
+    tau: float        # relaxation time (s)
+    eta: float        # anticipation constant (m^2/s)
+    kappa: float      # smoothing constant (veh/m/lane)
+    v_free: float     # free-flow speed v* (m/s)
+    rho_crit: float   # critical density rho* (veh/m/lane)
+    alpha: float      # model exponent (dimensionless)
+    r: float = 0.0    # on-ramp inflow (veh/s), source term in eq. (1)
+    beta: float = 0.0  # off-ramp split ratio (dimensionless), eq. (1)
+    lanes: float = 1.0  # lambda: lanes aggregated into one cell, eq. (1)
+
+    @classmethod
+    def from_paper_units(
+        cls,
+        tau_h: float,
+        eta_km2_per_h: float,
+        kappa_veh_per_km_lane: float,
+        v_free_kmh: float,
+        rho_crit_veh_per_km_lane: float,
+        alpha: float,
+        r_veh_per_h: float = 0.0,
+        beta: float = 0.0,
+        lanes: float = 1.0,
+    ) -> "METANETParams":
+        """Build from the paper's units (hours, km, km/h, veh/km/lane).
+
+        eta carries units of [length]x[speed] so that eta/L is a speed; the paper's
+        bounds (5-60) and synthetic value (30) are in km^2/h, matching the standard
+        METANET literature.
+        """
+        return cls(
+            tau=float(tau_h) * 3600.0,
+            eta=float(eta_km2_per_h) * (1.0e6 / 3600.0),
+            kappa=float(kappa_veh_per_km_lane) / 1000.0,
+            v_free=float(v_free_kmh) / 3.6,
+            rho_crit=float(rho_crit_veh_per_km_lane) / 1000.0,
+            alpha=float(alpha),
+            r=float(r_veh_per_h) / 3600.0,
+            beta=float(beta),
+            lanes=float(lanes),
+        )
+
+    @classmethod
+    def synthetic_bottleneck(cls) -> "METANETParams":
+        """Ground-truth parameters for the paper's synthetic scenario (Table II)."""
+        return cls.from_paper_units(
+            tau_h=18.0 / 3600.0,
+            eta_km2_per_h=30.0,
+            kappa_veh_per_km_lane=40.0,
+            v_free_kmh=120.0,
+            rho_crit_veh_per_km_lane=37.45,
+            alpha=1.4,
+        )
+
+    def per_lane_density(self, rho: float) -> float:
+        """Paper's rho/lambda: total cell density -> per-lane density (veh/m/lane)."""
+        return float(rho) / self.lanes if self.lanes > 0.0 else float(rho)
+
+    def equilibrium_speed(self, rho: float) -> float:
+        """V[rho] from eq. (4): v* exp[-(1/alpha) ((rho/lambda) / rho*)^alpha].
+
+        `rho` is the cell's TOTAL density across its `lanes` lanes; rho* is per lane.
+        """
+        if rho <= 0.0:
+            return self.v_free
+        ratio = self.per_lane_density(rho) / self.rho_crit
+        return self.v_free * math.exp(-(1.0 / self.alpha) * (ratio ** self.alpha))
+
+
+class METANETModel(MacroModel):
+    """Second-order METANET dynamics on the active mesh (arXiv:2605.23042).
+
+    Density follows eq. (1) with the upwind flux q = rho*v of eq. (2); mean speed is
+    an independent state variable advanced by eq. (3) from relaxation toward the
+    equilibrium speed V[rho] of eq. (4), upwind convection, and downstream
+    anticipation.
+
+    Differences from the reference implementation, all reducing to it exactly on the
+    uniform ramp-free mesh the paper uses:
+
+    - The finite differences use centre-to-centre spacing rather than a single global
+      L, so the model stays well-posed on the non-uniform mesh the active builder
+      produces around a mask. On a uniform mesh centre spacing equals L.
+    - Parameters may vary per base cell (the paper's segment-varying calibration)
+      via `per_cell_params`, keyed by ``(road_id, cell_id)``.
+    - Lane count lambda lives on `METANETParams.lanes` (default 1, i.e. one `Cell`
+      per lane). Set it to aggregate a whole carriageway into one cell per
+      longitudinal station: the cell's density/mass are then totals across those
+      lanes, the flux q = rho*v is total flow, and only the speed equation converts
+      back to per-lane density via `per_lane_density`. Lambda may vary along the
+      road (lane drops) through `per_cell_params`; the extra lane-drop term of the
+      full METANET speed equation is not modelled.
+
+    Boundary conditions follow the paper: upstream demand (via the simulation's
+    `inflow_boundary_map`) and downstream density (via `downstream_density_map`).
+    Where either is unset the corresponding gradient term is taken as zero.
+    """
+
+    def __init__(
+        self,
+        params: METANETParams,
+        per_cell_params: Optional[Dict[Connection, METANETParams]] = None,
+        upstream_velocity_map: Optional[Dict[Connection, float]] = None,
+        downstream_density_map: Optional[Dict[Connection, float]] = None,
+        v_min: float = 0.0,
+        clamp_to_v_free: bool = False,
+    ):
+        self.params = params
+        self.per_cell_params = per_cell_params or {}
+        self.upstream_velocity_map = upstream_velocity_map or {}
+        self.downstream_density_map = downstream_density_map or {}
+        # Speeds are floored because a negative mean speed would reverse the upwind
+        # flux of eq. (2) and break the scheme. The paper specifies no upper clamp,
+        # so v may transiently exceed v_free unless clamp_to_v_free is set.
+        self.v_min = float(v_min)
+        self.clamp_to_v_free = bool(clamp_to_v_free)
+        # State at time t, captured by prepare() before the density update overwrites
+        # it. eq. (3) is evaluated entirely at time t.
+        self._prev: Dict[str, Tuple[float, float]] = {}
+
+    def params_for(self, ac: "ActiveCell") -> METANETParams:
+        if self.per_cell_params and ac.base_segments:
+            return self.per_cell_params.get(ac.base_segments[0][0], self.params)
+        return self.params
+
+    def prepare(self, simulation: "Simulation", active: "ActiveNetwork") -> None:
+        self._prev = {}
+        for aid, ac in active.active_cells.items():
+            if ac.kind != "normal":
+                continue
+            if ac.velocity is None:
+                # Cold start: begin at equilibrium for the current density.
+                ac.velocity = self.params_for(ac).equilibrium_speed(float(ac.density))
+            self._prev[aid] = (float(ac.density), float(ac.velocity))
+
+    def sending_flow(self, ac: "ActiveCell") -> float:
+        # eq. (2): q = rho * v, pure upwind. No supply-side min().
+        v = ac.velocity
+        if v is None:
+            v = self.params_for(ac).equilibrium_speed(float(ac.density))
+        return max(0.0, float(ac.density) * float(v))
+
+    def receiving_flow(self, ac: "ActiveCell") -> float:
+        # METANET has no supply function: a cell accepts whatever is sent to it.
+        return math.inf
+
+    def boundary_capacity(self, ac: "ActiveCell") -> Optional[float]:
+        # Free outflow at the downstream end unless outflow_boundary_map says otherwise.
+        return None
+
+    @staticmethod
+    def _centre_distance(a: "ActiveCell", b: "ActiveCell") -> float:
+        d = abs(((b.start_s + b.end_s) - (a.start_s + a.end_s)) * 0.5)
+        return d if d > 1e-9 else max(a.length, 1e-9)
+
+    def advance(self, simulation: "Simulation", active: "ActiveNetwork") -> None:
+        dt = float(simulation.time_resolution)
+        cells = active.active_cells
+
+        for aid, (rho, v) in self._prev.items():
+            ac = cells[aid]
+            p = self.params_for(ac)
+
+            # Neighbour state is read from _prev, never off the live cells: by the
+            # time advance() runs, the density update has already written rho_{t+1}
+            # and earlier iterations of this loop have written v_{t+1}. Mask cells
+            # are absent from _prev, which gives the hybrid seams their zero-gradient
+            # fallback for free.
+
+            # --- upwind neighbour: supplies v_{t,x-1} for the convection term ---
+            v_up, dx_up = v, ac.length
+            up = self._neighbour(cells, ac.inflow_neighbors)
+            if up is not None:
+                # HYBRID SEAM: a mask neighbour has no macro speed state (velocity is
+                # None inside the bubble), so we fall back to zero-gradient. Coupling
+                # a second-order macro model to the micro region means handing the
+                # mask a speed boundary condition here as well as a flux.
+                up_prev = self._prev.get(up.active_cell_id)
+                if up_prev is not None:
+                    v_up = up_prev[1]
+                    dx_up = self._centre_distance(up, ac)
+            else:
+                key = ac.base_segments[0][0] if ac.base_segments else None
+                if key in self.upstream_velocity_map:
+                    v_up = float(self.upstream_velocity_map[key])
+
+            # --- downstream neighbour: supplies rho_{t,x+1} for anticipation ---
+            # The anticipation term of eq. (3) is written in the paper's per-lane
+            # density, so both sides of the gradient are converted with their OWN
+            # lane count: across a lane drop the per-lane density jumps even when the
+            # total is continuous, which is exactly what the term should feel.
+            rho_lane = p.per_lane_density(rho)
+            rho_dn_lane, dx_dn = rho_lane, ac.length
+            dn = self._neighbour(cells, ac.outflow_neighbors)
+            if dn is not None:
+                # HYBRID SEAM: mask density is micro-derived; using it here would
+                # feed micro state into the macro speed update. Deliberately left as
+                # zero-gradient until the hybrid coupling is designed.
+                dn_prev = self._prev.get(dn.active_cell_id)
+                if dn_prev is not None:
+                    rho_dn_lane = self.params_for(dn).per_lane_density(dn_prev[0])
+                    dx_dn = self._centre_distance(ac, dn)
+            else:
+                key = ac.base_segments[-1][0] if ac.base_segments else None
+                if key in self.downstream_density_map:
+                    # Map values follow the cell convention: total across `lanes`.
+                    rho_dn_lane = p.per_lane_density(
+                        float(self.downstream_density_map[key])
+                    )
+
+            # eq. (3), evaluated wholly at time t.
+            relaxation = (dt / p.tau) * (p.equilibrium_speed(rho) - v)
+            convection = (dt * v / dx_up) * (v_up - v)
+            anticipation = (
+                (p.eta * dt) / (p.tau * dx_dn)
+                * (rho_dn_lane - rho_lane) / (rho_lane + p.kappa)
+            )
+            v_new = v + relaxation + convection - anticipation
+
+            if self.clamp_to_v_free:
+                v_new = min(v_new, p.v_free)
+            ac.velocity = max(self.v_min, v_new)
+
+            # Ramp source/sink of eq. (1). The mainline flux carried across the
+            # interface is the plain q of eq. (2), so the off-ramp share
+            # q*beta/(1-beta) is removed here rather than folded into edge_flow.
+            if p.r != 0.0:
+                ac.mass += dt * p.r
+            if p.beta != 0.0:
+                ac.mass -= dt * (rho * v) * (p.beta / (1.0 - p.beta))
+            if ac.mass < 0.0:
+                ac.mass = 0.0
+
+    @staticmethod
+    def _neighbour(cells: Dict[str, "ActiveCell"], ids: List[str]) -> Optional["ActiveCell"]:
+        # The active mesh is a 1-D chain within a lane, so there is at most one.
+        return cells[ids[0]] if len(ids) == 1 else None
+
+    def stability_report(self, simulation: "Simulation") -> List[str]:
+        """Return CFL / relaxation warnings for the current network. Empty if fine.
+
+        METANET's convection term is explicit upwind, so it needs v*dt <= dx, and the
+        relaxation term needs dt <= tau to avoid oscillating about V[rho].
+        """
+        warnings: List[str] = []
+        dt = float(simulation.time_resolution)
+        for road in simulation.network.roads.values():
+            for cell in road.cells.values():
+                p = self.per_cell_params.get((cell.road_id, cell.cell_id), self.params)
+                if dt > p.tau:
+                    warnings.append(
+                        f"{cell.road_id}/{cell.cell_id}: dt={dt:g}s exceeds tau={p.tau:g}s "
+                        f"— relaxation term will oscillate."
+                    )
+                cfl = p.v_free * dt / cell.length
+                if cfl > 1.0:
+                    warnings.append(
+                        f"{cell.road_id}/{cell.cell_id}: CFL={cfl:.2f} > 1 "
+                        f"(v_free={p.v_free:g} m/s, dt={dt:g}s, dx={cell.length:g}m)."
+                    )
+        return warnings
+
+
+# =========================
 # CTM / simulation
 # =========================
 
@@ -1569,9 +2118,14 @@ class Simulation:
         inflow_boundary_map: Optional[Dict[Connection, float]] = None,
         outflow_boundary_map: Optional[Dict[Connection, float]] = None,
         min_cell_length: Optional[float] = None,
+        macro_model: Optional["MacroModel"] = None,
     ):
         self.network = network
         self.active = None
+        # None => first-order Godunov/CTM on the cells' FundamentalDiagrams (the
+        # historical behaviour). Set to a MacroModel (e.g. METANETModel) to swap the
+        # flux rule and carry extra per-cell state.
+        self.macro_model = macro_model
         self.time_resolution = float(time_resolution)
         self.origin_time = float(origin_time)
         self.current_time = float(origin_time)
@@ -1594,6 +2148,20 @@ class Simulation:
         self.network.validate()
 
         self.gt_store = None
+        # Whether `gt_store` also *drives* the open ends, overwriting boundary cell
+        # mass at the end of every step (a Dirichlet density BC). That is the
+        # first-order path's boundary treatment, so it defaults on.
+        #
+        # Second-order models supply their own boundary conditions instead — an
+        # upstream demand and a downstream density, as fluxes and ghost states
+        # through inflow_boundary_map / outflow_boundary_map and the model's own
+        # upstream_velocity_map / downstream_density_map. Pinning the end cells'
+        # state on top of that fights them: the pinned cell is no longer simulated,
+        # and its q = rho*v is injected with no capacity limit. Those runs set this
+        # False. It is deliberately separate from `gt_store` itself, which stays
+        # attached either way because RolloutRenderer reads it for the empirical
+        # time-space heatmap.
+        self.gt_drives_boundaries = True
         self._cached_active_network: Optional[ActiveNetwork] = None
 
     @staticmethod
@@ -1604,6 +2172,7 @@ class Simulation:
         inflow_boundary_map: Optional[Dict[Connection, float]] = None,
         outflow_boundary_map: Optional[Dict[Connection, float]] = None,
         min_cell_length: Optional[float] = None,
+        macro_model: Optional["MacroModel"] = None,
     ) -> "Simulation":
         network = Network.from_json(json_path)
         return Simulation(
@@ -1613,6 +2182,7 @@ class Simulation:
             inflow_boundary_map=inflow_boundary_map,
             outflow_boundary_map=outflow_boundary_map,
             min_cell_length=min_cell_length,
+            macro_model=macro_model,
         )
 
     def add_masking_cell(self, mask: ArbitraryMaskingCell) -> None:
@@ -1657,10 +2227,19 @@ class Simulation:
         gt_store: GroundTruthStore,
         time_value: Optional[float] = None,
         tolerance: float = 1e-6,
+        drives_boundaries: bool = True,
     ) -> None:
+        """Seed every cell from the ground truth and attach the store.
+
+        `drives_boundaries` controls only what happens afterwards: with it set, the
+        store overwrites boundary cell mass every step. Pass False when the run
+        supplies its own boundary conditions (see `gt_drives_boundaries`); the store
+        stays attached for the initial condition and for the renderer either way.
+        """
         t = self.current_time if time_value is None else float(time_value)
         gt_store.apply_density_snapshot_to_network(self.network, t, tolerance=tolerance)
         self.gt_store = gt_store
+        self.gt_drives_boundaries = bool(drives_boundaries)
 
     def _update_masks(self) -> None:
         for mask in self.masking_cells.values():
@@ -1695,7 +2274,10 @@ class Simulation:
         for aid, ac in active.active_cells.items():
             if ac.kind == "normal":
                 rho = float(ac.density)
-                if ac.fd is not None:
+                if self.macro_model is not None:
+                    demand_map[aid] = self.macro_model.sending_flow(ac)
+                    supply_map[aid] = self.macro_model.receiving_flow(ac)
+                elif ac.fd is not None:
                     demand_map[aid] = ac.fd.demand(rho)
                     supply_map[aid] = ac.fd.supply(rho)
                 else:
@@ -1799,23 +2381,35 @@ class Simulation:
             ac = active.active_cells[aid]
             if ac.kind == "mask":
                 continue
-            cell_capacity = ac.fd.capacity if ac.fd is not None else None
+            if self.macro_model is not None:
+                cell_capacity = self.macro_model.boundary_capacity(ac)
+            else:
+                cell_capacity = ac.fd.capacity if ac.fd is not None else None
             if len(ac.inflow_neighbors) == 0:
                 base_key = ac.base_segments[0][0]
                 external_inflow[aid] = min(
                     float(self.inflow_boundary_map.get(base_key, 0.0)),
                     supply_map[aid],
-                ) if cell_capacity is not None else 0.0
+                )
             if len(ac.outflow_neighbors) == 0:
                 base_key = ac.base_segments[-1][0]
-                external_outflow[aid] = min(
-                    demand_map[aid],
-                    float(self.outflow_boundary_map.get(base_key, cell_capacity)),
-                ) if cell_capacity is not None else demand_map[aid]
+                # `cell_capacity` is None only when the model declares free outflow
+                # (METANET); the first-order path always has an FD capacity here, so
+                # this is equivalent to the previous min-against-capacity form.
+                cap = self.outflow_boundary_map.get(base_key, cell_capacity)
+                external_outflow[aid] = (
+                    demand_map[aid] if cap is None
+                    else min(demand_map[aid], float(cap))
+                )
 
         return edge_flow, external_inflow, external_outflow, mask_flow
 
     def _step_active_network(self, active: ActiveNetwork) -> None:
+        # Must run before the flux computation: it lazily seeds any missing extra
+        # state and captures the time-t state the model's own update is evaluated at.
+        if self.macro_model is not None:
+            self.macro_model.prepare(self, active)
+
         active_ids = active.ordered_ids()
         index_of = {aid: i for i, aid in enumerate(active_ids)}
 
@@ -1861,6 +2455,9 @@ class Simulation:
                 lateral_mass = lateral_deltas.get(aid, 0.0) * lengths[i]
                 ac.mass = float(new_masses[i] + lateral_mass)
 
+        if self.macro_model is not None:
+            self.macro_model.advance(self, active)
+
     def step(self) -> None:
         if self.record_rollout:
             self._snapshot()
@@ -1890,7 +2487,11 @@ class Simulation:
         """
         ConservativeRemapper.active_to_base(self.network, self.active)
         self.current_time += self.time_resolution
-        self.gt_store.apply_density_snapshot_to_network_boundaries(self.network, self.current_time)
+        # Optional: a run with no ground-truth store, or one that drives its own open
+        # ends (METANET), takes its boundary conditions from the inflow/outflow maps
+        # instead of having the end cells' mass overwritten here.
+        if self.gt_store is not None and self.gt_drives_boundaries:
+            self.gt_store.apply_density_snapshot_to_network_boundaries(self.network, self.current_time)
         callbacks = [cb for cb in self._poststep_callbacks]
         for cb in callbacks:
             if cb in self._poststep_callbacks:
@@ -1949,7 +2550,19 @@ class Simulation:
         if not self.rollout_results:
             raise ValueError("No rollout results. Run the simulation first.")
 
-        def _q_value(density: float, fd: Optional[FundamentalDiagram], q: str) -> float:
+        def _q_value(
+            density: float,
+            fd: Optional[FundamentalDiagram],
+            q: str,
+            velocity: Optional[float] = None,
+        ) -> float:
+            if q == "density":
+                return density
+            # A second-order model (METANET) solves for mean speed, so use it rather
+            # than inverting the FD. `velocity is None` is the first-order path, and
+            # also a mask cell in a hybrid run: both fall back to the FD.
+            if velocity is not None:
+                return float(velocity) if q == "velocity" else float(velocity) * density
             if fd is None:
                 return 0.0
             if q == "velocity":
@@ -1970,11 +2583,13 @@ class Simulation:
             for rs in self.rollout_results:
                 for road in rs.network.roads.values():
                     for cell in road.cells.values():
-                        vals.append(_q_value(cell.density_viz, cell.fd, q))
+                        vals.append(_q_value(cell.density_viz, cell.fd, q, cell.velocity))
                 if rs.active_network:
                     for ac in rs.active_network.active_cells.values():
                         if ac.kind == "normal" and ac.fd is not None:
-                            vals.append(_q_value(ac.density_viz, ac.fd, q))
+                            # ActiveCell has no density_viz: mask mass lives in `mass`
+                            # on the active mesh, so density already includes it.
+                            vals.append(_q_value(ac.density, ac.fd, q, ac.velocity))
             ranges[q] = (float(min(vals)) if vals else 0.0, float(max(vals)) if vals else 1.0)
 
         # Base cell polygons — geometry fixed, only densities vary
@@ -2029,7 +2644,7 @@ class Simulation:
                 traces.append(go.Scatter(
                     x=px, y=py,
                     fill="toself",
-                    fillcolor=_rgba(_q_value(cell.density_viz, fd, q), vmin, vmax),
+                    fillcolor=_rgba(_q_value(cell.density_viz, fd, q, cell.velocity), vmin, vmax),
                     mode="lines",
                     line=dict(color=NORMAL_LINE, width=0.5),
                     showlegend=False,
@@ -2046,7 +2661,7 @@ class Simulation:
                     ac = first_active[i]
                     road = self.network.roads[ac.road_id]
                     px, py = _rotate(*Network._cell_polygon(road, ac.start_s, ac.end_s, ac.lane))
-                    fill = MASK_FILL if ac.kind == "mask" else _rgba(_q_value(ac.density_viz, ac.fd, q), vmin, vmax)
+                    fill = MASK_FILL if ac.kind == "mask" else _rgba(_q_value(ac.density, ac.fd, q, ac.velocity), vmin, vmax)
                     lcolor = MASK_LINE if ac.kind == "mask" else NORMAL_LINE
                 else:
                     px, py = [], []
@@ -2105,6 +2720,11 @@ class Simulation:
             [rs.network.get_cell(rid, cid).density_viz for rid, cid, _px, _py, _fd in base_cells]
             for rs in self.rollout_results
         ])  # (N_frames, N_base)
+        # Model mean speed per frame, None where the model does not carry one.
+        base_vel: List[List[Optional[float]]] = [
+            [rs.network.get_cell(rid, cid).velocity for rid, cid, _px, _py, _fd in base_cells]
+            for rs in self.rollout_results
+        ]
 
         base_frame_colors: Dict[str, List[List[str]]] = {}
         for q in QUANTITIES:
@@ -2114,7 +2734,9 @@ class Simulation:
             else:
                 vals = np.zeros_like(base_rho)
                 for j, (_rid, _cid, _px, _py, fd) in enumerate(base_cells):
-                    vals[:, j] = [_q_value(rho, fd, q) for rho in base_rho[:, j]]
+                    vals[:, j] = [
+                        _q_value(rho, fd, q, base_vel[f][j]) for f, rho in enumerate(base_rho[:, j])
+                    ]
             base_frame_colors[q] = _color_matrix(vals, vmin, vmax)
 
         print("Rho computed!")
@@ -2128,6 +2750,7 @@ class Simulation:
             step_geo: List[Tuple[List, List]] = []
             step_lc: List[str] = []
             step_density: List[float] = []
+            step_velocity: List[Optional[float]] = []
             step_fd: List[Optional[FundamentalDiagram]] = []
             step_is_mask: List[bool] = []
 
@@ -2138,12 +2761,14 @@ class Simulation:
                     step_geo.append(_rotate(*Network._cell_polygon(road, ac.start_s, ac.end_s, ac.lane)))
                     step_lc.append(MASK_LINE if ac.kind == "mask" else NORMAL_LINE)
                     step_density.append(ac.density)
+                    step_velocity.append(ac.velocity)
                     step_fd.append(ac.fd)
                     step_is_mask.append(ac.kind == "mask")
                 else:
                     step_geo.append(([], []))
                     step_lc.append(NORMAL_LINE)
                     step_density.append(0.0)
+                    step_velocity.append(None)
                     step_fd.append(None)
                     step_is_mask.append(False)
 
@@ -2157,7 +2782,7 @@ class Simulation:
                     if step_is_mask[i]:
                         step_colors.append(MASK_FILL)
                     elif step_fd[i] is not None:
-                        t = float(np.clip((_q_value(step_density[i], step_fd[i], q) - vmin) / max(vmax - vmin, 1e-12), 0.0, 1.0))
+                        t = float(np.clip((_q_value(step_density[i], step_fd[i], q, step_velocity[i]) - vmin) / max(vmax - vmin, 1e-12), 0.0, 1.0))
                         r, g, b, _ = CMAP(t)
                         step_colors.append(f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}")
                     else:
@@ -2288,10 +2913,16 @@ class Simulation:
             for road_id, road in net.roads.items():
                 for cell_id, cell in road.cells.items():
                     rho = float(cell.density)
-                    if cell.fd is None:
+                    if cell.velocity is not None:
+                        # Second-order model (METANET): mean speed is state, and the
+                        # flux it carries is q = rho*v, not the FD's demand.
+                        v = float(cell.velocity)
+                        q = v * rho
+                    elif cell.fd is None:
                         raise ValueError(f"Cell {road_id}/{cell_id} has no FundamentalDiagram assigned.")
-                    q = cell.fd.demand(rho)
-                    v = cell.fd.velocity_from_density(rho)
+                    else:
+                        q = cell.fd.demand(rho)
+                        v = cell.fd.velocity_from_density(rho)
                     rows.append(
                         {
                             "time": step.sim_time,
@@ -2347,7 +2978,19 @@ class RolloutRenderer:
 
         self._rotate = _rotate
 
-        def _q_value(density: float, fd: Optional[FundamentalDiagram], q: str) -> float:
+        def _q_value(
+            density: float,
+            fd: Optional[FundamentalDiagram],
+            q: str,
+            velocity: Optional[float] = None,
+        ) -> float:
+            if q == "density":
+                return density
+            # Second-order models (METANET) carry mean speed as state; prefer it over
+            # inverting the FD. None means the first-order path, or a mask cell in a
+            # hybrid run — both keep the FD behaviour.
+            if velocity is not None:
+                return float(velocity) if q == "velocity" else float(velocity) * density
             if fd is None:
                 return 0.0
             if q == "velocity":
@@ -2391,28 +3034,46 @@ class RolloutRenderer:
         self._polygon = _polygon
 
         # --- Vectorised quantity transform (matches scalar _q_value exactly) ---
-        def _q_transform(rho: np.ndarray, fd: Optional[FundamentalDiagram], q: str) -> np.ndarray:
+        def _q_transform(
+            rho: np.ndarray,
+            fd: Optional[FundamentalDiagram],
+            q: str,
+            velocity: Optional[np.ndarray] = None,
+        ) -> np.ndarray:
+            """Vectorised _q_value. `velocity` is the model's own speed, NaN where absent."""
             rho = np.asarray(rho, dtype=float)
             if q == "density":
                 return rho
             if fd is None:
-                return np.zeros_like(rho)
-            guard = np.where(rho > 1e-12, rho, 1.0)
-            if isinstance(fd, TriangularFD):
-                flow_raw = np.where(rho > fd.rho_c, fd.w * (fd.rho_j - rho), fd.v_f * rho)
-            elif isinstance(fd, GreenshieldsFD):
-                rc = np.clip(rho, 0.0, fd.rho_j)
-                flow_raw = fd.v_f * rc * (1.0 - rc / fd.rho_j)
-            else:  # generic fallback (rare)
-                flow_raw = np.vectorize(lambda x: fd._flow(x))(rho)
-            vel = np.where(rho > 1e-12, flow_raw / guard, fd.v_f)
+                vel = np.zeros_like(rho)
+            else:
+                guard = np.where(rho > 1e-12, rho, 1.0)
+                if isinstance(fd, TriangularFD):
+                    flow_raw = np.where(rho > fd.rho_c, fd.w * (fd.rho_j - rho), fd.v_f * rho)
+                elif isinstance(fd, GreenshieldsFD):
+                    rc = np.clip(rho, 0.0, fd.rho_j)
+                    flow_raw = fd.v_f * rc * (1.0 - rc / fd.rho_j)
+                else:  # generic fallback (rare)
+                    flow_raw = np.vectorize(lambda x: fd._flow(x))(rho)
+                vel = np.where(rho > 1e-12, flow_raw / guard, fd.v_f)
+            if velocity is not None:
+                # Per cell and per frame: the model's speed where it has one, the FD's
+                # otherwise. All-NaN (the first-order path) leaves `vel` untouched.
+                velocity = np.asarray(velocity, dtype=float)
+                vel = np.where(np.isfinite(velocity), velocity, vel)
             if q == "velocity":
                 return vel
-            return vel * rho  # flow == velocity_from_density * density
+            return vel * rho  # flow == mean speed * density
         self._q_transform = _q_transform
         self._q_value_scalar = _q_value
 
-        def _q_matrix(density: np.ndarray, fds: List[Any], q: str) -> np.ndarray:
+        def _q_matrix(
+            density: np.ndarray,
+            fds: List[Any],
+            q: str,
+            velocity: Optional[np.ndarray] = None,
+        ) -> np.ndarray:
+            """Per-FD-group _q_transform. `velocity` must match `density`'s shape."""
             density = np.asarray(density, dtype=float)
             if q == "density" or density.size == 0:
                 return density
@@ -2421,7 +3082,8 @@ class RolloutRenderer:
             for j, fd in enumerate(fds):
                 groups.setdefault(id(fd), (fd, []))[1].append(j)
             for _fdid, (fd, cols) in groups.items():
-                out[:, cols] = _q_transform(density[:, cols], fd, q)
+                vel_cols = None if velocity is None else np.asarray(velocity, dtype=float)[:, cols]
+                out[:, cols] = _q_transform(density[:, cols], fd, q, vel_cols)
             return out
 
         def _color_matrix(vals: np.ndarray, vmin: float, vmax: float) -> List[List[str]]:
@@ -2471,22 +3133,33 @@ class RolloutRenderer:
             base_lengths = np.where(base_lengths > 0.0, base_lengths, 1.0)
             mass = np.empty((self.N_frames, len(base_keys)))
             mask_mass = np.empty((self.N_frames, len(base_keys)))
+            # Model mean speed, NaN where the cell carries none (the first-order path,
+            # and mask cells in a hybrid run). Gathered here so every velocity/flow
+            # consumer can prefer it over inverting the FD.
+            base_velocity = np.full((self.N_frames, len(base_keys)), np.nan)
             for f, rs in enumerate(sim.rollout_results):
                 cells_by_road = {rid: road.cells for rid, road in rs.network.roads.items()}
                 mass[f] = [cells_by_road[rid][cid].mass for (rid, cid) in base_keys]
                 mask_mass[f] = [cells_by_road[rid][cid].mask_mass for (rid, cid) in base_keys]
+                base_velocity[f] = [
+                    np.nan if cells_by_road[rid][cid].velocity is None
+                    else cells_by_road[rid][cid].velocity
+                    for (rid, cid) in base_keys
+                ]
             base_rho = mass / base_lengths
             self._base_density_viz = (mass + mask_mass) / base_lengths
         else:
             base_rho = np.zeros((self.N_frames, 0))
+            base_velocity = np.zeros((self.N_frames, 0))
             self._base_density_viz = np.zeros((self.N_frames, 0))
+        self._base_velocity = base_velocity
 
         # Global per-quantity value ranges for a consistent colorbar. Computed
         # from the base mesh; normal active cells are conservatively remapped
         # from it, so their value range coincides.
         self.ranges: Dict[str, Tuple[float, float]] = {}
         for q in self.QUANTITIES:
-            vals = _q_matrix(base_rho, base_fds, q)
+            vals = _q_matrix(base_rho, base_fds, q, base_velocity)
             self.ranges[q] = (float(vals.min()) if vals.size else 0.0,
                               float(vals.max()) if vals.size else 1.0)
 
@@ -2521,6 +3194,14 @@ class RolloutRenderer:
             for lane in sorted(road.lane_data)
             if road.cells_for_lane(lane)
         ]
+
+    def _has_macro_gt(self) -> bool:
+        """True when there is empirical macro data to compare against.
+
+        Pure-macro runs (e.g. METANET validation) often have no ground-truth store at
+        all, and a store built from micro data alone has no macro_df attribute.
+        """
+        return getattr(self._gt_store, "macro_df", None) is not None
 
     def _macro_pivots(self):
         """Lazily pivot the empirical macro data into (times, density, velocity)
@@ -2558,9 +3239,10 @@ class RolloutRenderer:
         # once at construction (no per-frame snapshot re-reads).
         cols = [self._base_col[(road_id, cid)] for cid in cell_ids]
         rho_ts = self._base_density_viz[:, cols]  # (N_frames, N_cells)
+        vel_ts = self._base_velocity[:, cols]     # NaN where there is no model speed
         sim_entry: Dict[str, Any] = {"s_mids": s_mids, "density": rho_ts}
         for q in ("flow", "velocity"):
-            sim_entry[q] = self._q_matrix(rho_ts, fds, q)
+            sim_entry[q] = self._q_matrix(rho_ts, fds, q, vel_ts)
 
         # Mask extents per timestep: (start_s, end_s) or None
         mask_extents: List[List[Optional[Tuple[float, float]]]] = [[]]
@@ -2579,7 +3261,12 @@ class RolloutRenderer:
         sim_entry["mask_extents"] = mask_extents
         self.ts_data[(road_id, lane, "sim")] = sim_entry
 
-        # Empirical (ground-truth macro) heatmap, vectorised via pivot.
+        # Empirical (ground-truth macro) heatmap, vectorised via pivot. Skipped when
+        # there is no macro ground truth: the sim heatmap must still work for a
+        # pure-macro run with no store, and get_ts_figure returns an empty figure for
+        # the "empirical" version that is then absent.
+        if not self._has_macro_gt():
+            return
         _times, dp, vp = self._macro_pivots()
         cols = [(road_id, cid) for cid in cell_ids]
         vals_density = dp.reindex(columns=cols).to_numpy()
@@ -2672,13 +3359,14 @@ class RolloutRenderer:
         if cached is not None:
             return cached
         row = self._base_rho[step_idx:step_idx + 1]
+        vel = self._base_velocity[step_idx:step_idx + 1]
         vmin, vmax = self.ranges[q]
-        colors = self._color_matrix(self._q_matrix(row, self._base_fds, q), vmin, vmax)[0]
+        colors = self._color_matrix(self._q_matrix(row, self._base_fds, q, vel), vmin, vmax)[0]
         self._base_color_cache[key] = colors
         return colors
 
     def _active_frame_geo(self, step_idx: int):
-        """Lazily build (geometry, line-colors, density, fd, is_mask) for one
+        """Lazily build (geometry, line-colors, density, velocity, fd, is_mask) for one
         frame's active cells, padded to max_active. Cached per frame."""
         cached = self._active_geo_cache.get(step_idx)
         if cached is not None:
@@ -2687,6 +3375,7 @@ class RolloutRenderer:
         geo: List[Tuple[List, List]] = []
         lc: List[str] = []
         dens: List[float] = []
+        vels: List[Optional[float]] = []
         fds: List[Optional[FundamentalDiagram]] = []
         is_mask: List[bool] = []
         for i in range(self.max_active):
@@ -2695,15 +3384,17 @@ class RolloutRenderer:
                 geo.append(self._polygon(ac.road_id, ac.start_s, ac.end_s, ac.lane))
                 lc.append(self.MASK_LINE if ac.kind == "mask" else self.NORMAL_LINE)
                 dens.append(ac.density)
+                vels.append(ac.velocity)
                 fds.append(ac.fd)
                 is_mask.append(ac.kind == "mask")
             else:
                 geo.append(([], []))
                 lc.append(self.NORMAL_LINE)
                 dens.append(0.0)
+                vels.append(None)
                 fds.append(None)
                 is_mask.append(False)
-        cached = (geo, lc, dens, fds, is_mask)
+        cached = (geo, lc, dens, vels, fds, is_mask)
         self._active_geo_cache[step_idx] = cached
         return cached
 
@@ -2713,14 +3404,14 @@ class RolloutRenderer:
         cached = self._active_color_cache.get(key)
         if cached is not None:
             return cached
-        _geo, _lc, dens, fds, is_mask = self._active_frame_geo(step_idx)
+        _geo, _lc, dens, vels, fds, is_mask = self._active_frame_geo(step_idx)
         vmin, vmax = self.ranges[q]
         colors: List[str] = []
         for i in range(self.max_active):
             if is_mask[i]:
                 colors.append(self.MASK_FILL)
             elif fds[i] is not None:
-                t = float(np.clip((self._q_value_scalar(dens[i], fds[i], q) - vmin) / max(vmax - vmin, 1e-12), 0.0, 1.0))
+                t = float(np.clip((self._q_value_scalar(dens[i], fds[i], q, vels[i]) - vmin) / max(vmax - vmin, 1e-12), 0.0, 1.0))
                 r, g, b, _ = self._cmap(t)
                 colors.append(f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}")
             else:
@@ -2754,7 +3445,7 @@ class RolloutRenderer:
                     "hoverinfo": "skip",
                 })
         else:
-            geo, lcs, _dens, _fds, _is_mask = self._active_frame_geo(step_idx)
+            geo, lcs, _dens, _vels, _fds, _is_mask = self._active_frame_geo(step_idx)
             colors = self._active_frame_colors(step_idx, q)
             for i in range(self.max_active):
                 px, py = geo[i]

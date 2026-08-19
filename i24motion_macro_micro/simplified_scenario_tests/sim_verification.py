@@ -259,6 +259,17 @@ def arz_case(sim: Simulation, config_file_name: str):
     return bridge
 
 
+def vanilla_lwr_case(sim: Simulation, config_file_name: str):
+    """Mask-free control: the pure fluid solver, no bridge and no micro domain.
+
+    Returning None is the whole implementation -- Logger treats a null bridge as "no mask"
+    and writes only the macro log. This isolates the base scheme's own convergence rate, so
+    coupler error can be told apart from discretisation error. The case name matches the
+    ground-truth file name, so `analysis_helpers.default_gt_case` already resolves it.
+    """
+    return None
+
+
 verification_config = {
     "result_folder": "verification_results/",
     "macro_cases" : {
@@ -268,7 +279,8 @@ verification_config = {
                 "micro_case_b_5": micro_case_b_5,
                 "newell_case": newell_case,
                 "idm_case": idm_case,
-                "arz_case": arz_case
+                "arz_case": arz_case,
+                "vanilla_lwr": vanilla_lwr_case
             }
         },
         "m_2": {
@@ -278,7 +290,8 @@ verification_config = {
                 "micro_case_b_3": micro_case_b_3,
                 "newell_case": newell_case,
                 "idm_case": idm_case,
-                "arz_case": arz_case
+                "arz_case": arz_case,
+                "vanilla_lwr": vanilla_lwr_case
             }
         },
         "m_3": {
@@ -288,7 +301,8 @@ verification_config = {
                 "micro_case_b_8": micro_case_b_8,
                 "newell_case": newell_case,
                 "idm_case": idm_case,
-                "arz_case": arz_case
+                "arz_case": arz_case,
+                "vanilla_lwr": vanilla_lwr_case
             }
         },
         "m_4": {
@@ -297,7 +311,8 @@ verification_config = {
                 "micro_case_b_6": micro_case_b_6,
                 "newell_case": newell_case,
                 "idm_case": idm_case,
-                "arz_case": arz_case
+                "arz_case": arz_case,
+                "vanilla_lwr": vanilla_lwr_case
             }
         }
     }
@@ -393,7 +408,10 @@ def load_sim_verification(config_path: str, config: dict, micro_case_function: c
     sim.initialize_from_ground_truth(gt, time_value=config["time_origin"])
 
     bridge = micro_case_function(sim, config_path)
-    logger = Logger(sim, bridge, micro_case_macro_result_path, micro_case_mask_result_path)
+    # A None bridge is the mask-free control; Logger then needs the FD explicitly, since it
+    # normally reads the velocity relation off the bridge.
+    logger = Logger(sim, bridge, micro_case_macro_result_path, micro_case_mask_result_path,
+                    fd=None if bridge is not None else lwr_triangular_fd())
 
     return sim, bridge, logger
 
@@ -455,13 +473,23 @@ def _last_logged_time(path, tail_bytes=65536):
         return None
 
 
+def writes_mask_log(macro_case, micro_case):
+    """False for the mask-free control, which has no bridge and so no mask log."""
+    macro_key = macro_case.replace("case_", "")
+    factory = verification_config["macro_cases"][macro_key]["micro_cases"][micro_case]
+    return factory is not vanilla_lwr_case
+
+
 def is_complete(result_folder, macro_case, micro_case, grid):
-    """A run counts as complete only if both logs exist and the macro log reaches
+    """A run counts as complete only if its logs exist and the macro log reaches
     time_length. Logger streams, so a killed job leaves a short file rather than none."""
     run_dir = os.path.join(result_folder, f"{macro_case}_dx_{grid}")
     macro_path = os.path.join(run_dir, f"{micro_case}_macro.csv")
     mask_path = os.path.join(run_dir, f"{micro_case}_mask.csv")
-    if not (os.path.exists(macro_path) and os.path.exists(mask_path)):
+    # The control writes no mask log at all; requiring one would mark it permanently
+    # incomplete and re-run it on every invocation.
+    needed = [macro_path] + ([mask_path] if writes_mask_log(macro_case, micro_case) else [])
+    if not all(os.path.exists(p) for p in needed):
         return False, "missing"
     try:
         config = load_sim_verification_config(

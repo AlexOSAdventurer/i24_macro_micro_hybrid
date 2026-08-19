@@ -44,7 +44,11 @@ class Logger:
         "time", "dt", "vehicle_id", "s", "s_dt", "length", "mask_rear_s",
     )
 
-    def __init__(self, sim: Simulation, bridge: SimplifiedSimBridge | PrescribedSimBridge = None, sim_macro_path="sim_data.csv", mask_path="mask_data.csv", callback_name="logger", vehicle_path=None):
+    def __init__(self, sim: Simulation, bridge: SimplifiedSimBridge | PrescribedSimBridge = None, sim_macro_path="sim_data.csv", mask_path="mask_data.csv", callback_name="logger", vehicle_path=None, fd=None):
+        # bridge=None is the mask-free control: the pure fluid solver, no micro domain.
+        # No mask log is opened at all in that case -- a mask file full of zeros would read
+        # as data to anything downstream. `fd` supplies the velocity relation that would
+        # otherwise come off the bridge.
         self.sim_macro_data = {c: [] for c in self.MACRO_COLUMNS}
         self.mask_data = {c: [] for c in self.MASK_COLUMNS}
         self.vehicle_data = {c: [] for c in self.VEHICLE_COLUMNS}
@@ -55,10 +59,14 @@ class Logger:
         self.vehicle_path = vehicle_path
         self.callback_name = callback_name
 
+        self._fd = fd if fd is not None else (bridge.fd if bridge is not None else None)
+        if self._fd is None:
+            raise ValueError("Logger needs either a bridge or an explicit fd")
+
         # Opened for the life of the run; truncates any previous output up front so a
         # killed run leaves a short file rather than a stale complete one.
         self._macro_handle = open(sim_macro_path, "w", newline="")
-        self._mask_handle = open(mask_path, "w", newline="")
+        self._mask_handle = open(mask_path, "w", newline="") if bridge is not None else None
         self._vehicle_handle = open(vehicle_path, "w", newline="") if vehicle_path else None
         self._headers_written = False
         self._closed = False
@@ -66,12 +74,12 @@ class Logger:
         sim.register_poststep_callback(self._step, callback_name)
 
     def _step(self, sim_time: float, dt: float):
-        for cell_id in self.bridge.sim.active.active_cells:
-            cell = self.bridge.sim.active.active_cells[cell_id]
+        for cell_id in self.sim.active.active_cells:
+            cell = self.sim.active.active_cells[cell_id]
             cell_length = cell.length
             cell_x_start_position = cell.start_s
             cell_density = cell.mass / cell_length
-            cell_velocity = self.bridge.fd.velocity_from_density(cell_density)
+            cell_velocity = self._fd.velocity_from_density(cell_density)
             cell_flow = cell_density * cell_velocity
             self.sim_macro_data["time"].append(sim_time)
             self.sim_macro_data["dt"].append(dt)
@@ -80,6 +88,12 @@ class Logger:
             self.sim_macro_data["density"].append(cell_density)
             self.sim_macro_data["velocity"].append(cell_velocity)
             self.sim_macro_data["flow"].append(cell_flow)
+
+        if self.bridge is None:
+            # Mask-free control: nothing below this point exists.
+            if len(self.sim_macro_data["time"]) >= self.flush_rows:
+                self._write_chunk()
+            return
 
         self.mask_data["time"].append(sim_time)
         self.mask_data["dt"].append(dt)
@@ -142,15 +156,16 @@ class Logger:
         header = not self._headers_written
         pandas.DataFrame(self.sim_macro_data, columns=list(self.MACRO_COLUMNS)).to_csv(
             self._macro_handle, header=header, index=False)
-        pandas.DataFrame(self.mask_data, columns=list(self.MASK_COLUMNS)).to_csv(
-            self._mask_handle, header=header, index=False)
+        if self._mask_handle is not None:
+            pandas.DataFrame(self.mask_data, columns=list(self.MASK_COLUMNS)).to_csv(
+                self._mask_handle, header=header, index=False)
+            self._mask_handle.flush()
         if self._vehicle_handle is not None:
             pandas.DataFrame(self.vehicle_data, columns=list(self.VEHICLE_COLUMNS)).to_csv(
                 self._vehicle_handle, header=header, index=False)
             self._vehicle_handle.flush()
         self._headers_written = True
         self._macro_handle.flush()
-        self._mask_handle.flush()
         for buf in (self.sim_macro_data, self.mask_data, self.vehicle_data):
             for column in buf:
                 buf[column].clear()
@@ -161,7 +176,8 @@ class Logger:
             return
         self._write_chunk()
         self._macro_handle.close()
-        self._mask_handle.close()
+        if self._mask_handle is not None:
+            self._mask_handle.close()
         if self._vehicle_handle is not None:
             self._vehicle_handle.close()
         self._closed = True

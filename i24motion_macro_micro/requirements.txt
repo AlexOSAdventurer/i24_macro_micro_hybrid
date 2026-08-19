@@ -7,9 +7,9 @@ ffmpeg-python
 duckdb
 ipykernel
 jupyter
-torch
-torchvision
-torchaudio
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128
+torchaudio==2.11.0+cu128
 optuna
 jax
 plotly

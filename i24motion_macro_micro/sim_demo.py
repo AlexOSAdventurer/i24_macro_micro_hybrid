@@ -20,8 +20,8 @@ Standalone (requires a pickled Simulation at demo_sim.pickle)::
     python sim_demo.py
 """
 from __future__ import annotations
-
-from simulation import Simulation, RolloutRenderer, GroundTruthStore
+import sim_calibration_metanet
+from simulation import Simulation, RolloutRenderer, GroundTruthStore, I24WestAndEastNetworkCollapsed, METANETModel, METANETParams, TriangularFD
 from i24_trajectory_replayer import I24TrajectoryReplayer
 from i24_carla_coupler import I24CarlaCoupler
 from i24_micro_bridge import I24MicroSimBridge
@@ -57,10 +57,12 @@ def run_app(
         {"label": "Show Masks",   "value": True}
     ]
 
-    # Build road/lane options from ts_data keys
+    # Build road/lane options from ts_road_lanes, NOT from ts_data: the time-space
+    # entries are built lazily (only for the lane being viewed), so ts_data is still
+    # empty at this point and the dropdown would come up with no options at all.
     road_lane_options = [
         {"label": f"Road {rid} · Lane {lane}", "value": f"{rid}:{lane}"}
-        for rid, lane, version in sorted(renderer.ts_data.keys()) if version == "sim"
+        for rid, lane in sorted(renderer.ts_road_lanes)
     ]
     default_road_lane = road_lane_options[0]["value"] if road_lane_options else ""
     default_rid, default_lane = default_road_lane.split(":") if default_road_lane else ("", 0)
@@ -170,6 +172,8 @@ def run_app(
         Input("render_masks", "value")
     )
     def update_ts_sim(road_lane: str, quantity: str, render_masks: bool) -> go.Figure:
+        if not road_lane or ":" not in road_lane:
+            return go.Figure()
         rid, lane_str = road_lane.split(":")
         return renderer.get_ts_figure(rid, int(lane_str), quantity, version="sim", render_masks=render_masks)
     
@@ -179,6 +183,8 @@ def run_app(
         Input("quantity", "value"),
     )
     def update_ts_empirical(road_lane: str, quantity: str) -> go.Figure:
+        if not road_lane or ":" not in road_lane:
+            return go.Figure()
         rid, lane_str = road_lane.split(":")
         return renderer.get_ts_figure(rid, int(lane_str), quantity, version="empirical")
 
@@ -296,7 +302,7 @@ def run_demo_carla():
         micro_coupler=coupler,
         bridge_callback_name="bridge_step"
     )
-    bridge_time_step = 1200.0 #360.0 #1080.0
+    bridge_time_step = 3600.0 #1200.0 #360.0 #1080.0
     bridge_time_window = 90.0
     current_bridge_iteration = 1
     def update_bridge_callback(current_time, resolution):
@@ -328,5 +334,108 @@ def run_demo_carla():
         sim.step()
     run_app(sim, rotation_deg=82.8192)
 
+def run_demo_metanet():
+    """
+    -0.7499999999999981 -0.8339045886961388
+    1.0478862366201542 0.44127095672850625
+    -1.583904588696137
+    [I 2026-08-19 09:21:27,102] Trial 922 finished with value: -1.583904588696137 and parameters: {'tau_s': 47.86898722920049, 'eta_km2_per_h': 54.498074688599296, 'kappa_veh_per_km_lane': 45.95143563683463, 'v_free_kmh': 134.4172710870525, 'rho_crit_veh_per_km_lane': 24.27930712745335, 'alpha': 4.7917591228885, 'jam_threshold': 5.003871736480674}. Best is trial 922 with value: -1.583904588696137.
+    """
+
+    with open("i24_motion_to_dataset.json", "r") as f:
+        config = json.load(f)
+    road_config = config["road_data"]["2"]
+    # The FD is decorative under METANET (the model supplies demand and supply
+    # itself); it is kept only so the cells carry one for plotting. The collapsed
+    # generator scales its rho_j by the lane count.
+    generator = I24WestAndEastNetworkCollapsed(
+        fd=TriangularFD(v_f=49.73562026160161, w=5.697835695812354, rho_j=0.1304577157114563),
+        lambda_lc=0.0,  # unused: one lane per road leaves no pair to exchange across
+    )
+    generator.create_network(
+        road_config["road_length"],
+        road_config["cell_length"],
+        road_config["lanes"],
+        lane_width=road_config["lane_width"],
+    )
+
+    lane_counts = set(generator.lanes_per_road.values())
+    if len(lane_counts) != 1:
+        raise ValueError(
+            f"Roads have differing lane counts {generator.lanes_per_road}; a single "
+            f"shared METANETParams cannot describe them. Use per_cell_params."
+        )
+
+    """
+    param_dict = {'tau_s': 36.346679071778006, 
+                  'eta_km2_per_h': 21.832917579225892, 
+                  'kappa_veh_per_km_lane': 53.30974608164321, 
+                  'v_free_kmh': 73.12670738279476, 
+                  'rho_crit_veh_per_km_lane': 56.0129859172635, 
+                  'alpha': 3.437269967637944}
+    """
+    param_dict = {'tau_s': 43.164200788896046, 
+                  'eta_km2_per_h': 58.568518349307425, 
+                  'kappa_veh_per_km_lane': 28.33113239006788, 
+                  'v_free_kmh': 84.25118380338283, 
+                  'rho_crit_veh_per_km_lane': 22.680665531296675, 
+                  'alpha': 4.566277768236043}
+    #{'jam_recall': 0.7997352927753183, 'free_recall': 0.8387589013224821, 'metric_interior': -1.6210698664883636, 'velocity_rmse': 3.88641774859314, 'density_rmse': 0.03729489497405928}
+    params = METANETParams.from_paper_units(tau_h=param_dict["tau_s"] / 3600.0,
+        eta_km2_per_h=param_dict["eta_km2_per_h"],
+        kappa_veh_per_km_lane=param_dict["kappa_veh_per_km_lane"],
+        v_free_kmh=param_dict["v_free_kmh"],
+        rho_crit_veh_per_km_lane=param_dict["rho_crit_veh_per_km_lane"],
+        alpha=param_dict["alpha"],
+        lanes=4
+    )
+
+    model = METANETModel(params)
+    # No masks, so the active mesh is just the base cells: leave min_cell_length at
+    # its default rather than passing the cell length and risking a merge.
+    sim = Simulation(
+        network=generator.network,
+        time_resolution=config["time_step"],
+        origin_time=config["time_origin"],
+        macro_model=model,
+    )
+    sim.record_rollout = True
+
+    t0 = float(config["time_origin"])
+    sim.initialize_from_ground_truth(sim_calibration_metanet.gt_collapsed, time_value=t0, drives_boundaries=False)
+    inlets, outlets = [], []
+    for road_id, road in sim.network.roads.items():
+        for cell in road.cells.values():
+            # The same test apply_density_snapshot_to_network_boundaries uses to pick
+            # its targets, so the two treatments select exactly the same cells and no
+            # cell ends up both pinned and flux-driven.
+            if not cell.inflow_connections:
+                inlets.append((road_id, cell.cell_id))
+            if not cell.outflow_connections:
+                outlets.append((road_id, cell.cell_id))
+    def update(current_time, resolution):
+        t = sim_calibration_metanet.gt_series.nearest(current_time)
+        rho_map, v_map = sim_calibration_metanet.gt_series.density[t], sim_calibration_metanet.gt_series.velocity[t]
+        for key in inlets:
+            rho, v = rho_map.get(key), v_map.get(key)
+            if rho is None or v is None:
+                continue
+            sim.inflow_boundary_map[key] = float(rho) * float(v)
+            model.upstream_velocity_map[key] = float(v)
+        for key in outlets:
+            rho, v = rho_map.get(key), v_map.get(key)
+            if rho is None:
+                continue
+            # Both maps follow the cell convention: totals across `lanes`. The model
+            # converts to the paper's per-lane density itself.
+            model.downstream_density_map[key] = float(rho)
+            if v is not None:
+                sim.outflow_boundary_map[key] = float(rho) * float(v)
+
+    sim.register_prestep_callback(update, "metanet_boundary_conditions")
+    for i in range(3599):
+        sim.step()
+    run_app(sim, rotation_deg=82.8192)
+
 if __name__ == "__main__":
-    run_demo_carla()
+    run_demo_metanet()

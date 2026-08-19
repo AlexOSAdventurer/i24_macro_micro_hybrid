@@ -122,6 +122,7 @@ def run_calibration(trial):
         jam_threshold = 15.0
         metric = 0.0
         for lane in lanes:
+            renderer._ensure_ts_lane("2", lane)
             sim_velocity_data = renderer.ts_data[("2", lane, "sim")]["velocity"]
             empirical_velocity_data = renderer.ts_data[("2", lane, "empirical")]["velocity"][1:]
             sim_in_jam = (sim_velocity_data < jam_threshold).astype(int).reshape(-1)
