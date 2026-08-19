@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Vehicle types for the coupled (bridge-driven) corridor runs.
+
+  There is deliberately no demand here: every vehicle is inserted by
+  I24MotionSumoSimulationCoupled over TraCI, either from empirical seeding or
+  from macroscopic boundary flux. i24_corridor.rou.xml is the standalone
+  free-flow load and is NOT used by the coupled path.
+
+  length/width are overridden per vehicle at insertion time with the empirical
+  dimensions, so the values here only apply to a vehicle whose source data is
+  missing them.
+-->
+<additional xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+            xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/additional_file.xsd">
+
+    <vType id="car" vClass="passenger" carFollowModel="IDM"
+           accel="1.5" decel="2.0" emergencyDecel="9.0" sigma="0.5"
+           tau="1.0" minGap="2.5" length="4.5" maxSpeed="33.5"
+           speedFactor="normc(1.0,0.1,0.8,1.2)"
+           laneChangeModel="LC2013"/>
+
+</additional>

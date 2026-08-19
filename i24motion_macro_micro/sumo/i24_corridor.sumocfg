@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Standalone SUMO run of the 1-mile I-24 corridor.
+
+    sumo     -c sumo/i24_corridor.sumocfg      (headless)
+    sumo-gui -c sumo/i24_corridor.sumocfg      (visual)
+
+  step-length matches the 1.0 s macroscopic timestep used by the hybrid
+  simulation (i24_motion_to_dataset.json: "time_step": 1.0).
+-->
+<configuration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+               xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/sumoConfiguration.xsd">
+
+    <input>
+        <net-file value="i24_corridor.net.xml"/>
+        <route-files value="i24_corridor.rou.xml"/>
+    </input>
+
+    <time>
+        <begin value="0"/>
+        <end value="3600"/>
+        <step-length value="1.0"/>
+    </time>
+
+    <processing>
+        <!-- Lane changing and collision handling tuned for a freeway mainline. -->
+        <collision.action value="warn"/>
+        <time-to-teleport value="-1"/>
+        <max-depart-delay value="60"/>
+    </processing>
+
+    <report>
+        <verbose value="true"/>
+        <no-step-log value="true"/>
+        <duration-log.statistics value="true"/>
+    </report>
+
+</configuration>
