@@ -116,7 +116,7 @@ class AdaptiveSmoothing(nn.Module):
         self.v_delta = nn.Parameter(torch.tensor(init_v_delta))
         self.high_is_congestion = high_is_congestion
 
-    def forward(self, raw_data: torch.Tensor):
+    def forward(self, raw_data: torch.Tensor, w: torch.Tensor = None):
         # Ensure input is 4D: (B, C, T, X)
         
         if raw_data.ndim == 2:
@@ -153,16 +153,16 @@ class AdaptiveSmoothing(nn.Module):
 
         v_cong = sum_cong / N_cong
         v_free = sum_free / N_free
-        
-        if (self.high_is_congestion):
-            v_max = torch.max(v_cong, v_free)
-            w = 0.5 * (1 + torch.tanh((v_max - self.v_thr) / self.v_delta))
-            v = w * v_cong + (1 - w) * v_free
-        else:
-            v_min = torch.min(v_cong, v_free)
-            w = 0.5 * (1 + torch.tanh((self.v_thr - v_min) / self.v_delta))
-            v = w * v_cong + (1 - w) * v_free
 
+        if (w is None):
+            if (self.high_is_congestion):
+                v_max = torch.max(v_cong, v_free)
+                w = 0.5 * (1 + torch.tanh((v_max - self.v_thr) / self.v_delta))
+            else:
+                v_min = torch.min(v_cong, v_free)
+                w = 0.5 * (1 + torch.tanh((self.v_thr - v_min) / self.v_delta))
+        
+        v = w * v_cong + (1 - w) * v_free
         valid_cong = (N_cong > 0).float()
         valid_free = (N_free > 0).float()
         # if no cong data → use free; if no free data → use cong
@@ -172,7 +172,7 @@ class AdaptiveSmoothing(nn.Module):
             print("Warning! NaN detected in output")
             print(N_cong)
         # print size of v
-        return v.squeeze(1)
+        return v.squeeze(1), w
 
 class I24MotionMacro:
     def __init__(self, data_source, road_id, data_folder, config_path="i24_motion_to_dataset.json", longitudinal_cell_size=100.0, time_delta=1.0, max_velocity=45.0, min_velocity=-15.0):
@@ -187,6 +187,7 @@ class I24MotionMacro:
         self.min_velocity = min_velocity
         os.makedirs(self.data_folder, exist_ok=True)
         self.lanes = i24_motion_data.I24MotionData.road_lane_lookup[road_id]
+        self.lane_asm_calibrations = i24_motion_data.I24MotionData.road_lane_asm_lookup[road_id]
 
     def computeBox(self, time_index, long_cell_index):
         return {
@@ -387,9 +388,21 @@ class I24MotionMacro:
                     if (s_min >= outage[0]) and (s_min <= outage[1]):
                         outage_mask[-1] = True
             
-            asm_velocity = AdaptiveSmoothing(t_size, s_size, dx=self.longitudinal_cell_size, dt=self.time_delta, init_delta=15.0, init_tau=1.0, init_c_cong=-7.7, init_c_free=50.0, init_v_thr=21.22, init_v_delta=0.5).to("cuda").to(device=f"cuda:{0 % device_count}")
-            asm_density = AdaptiveSmoothing(t_size, s_size, dx=self.longitudinal_cell_size, dt=self.time_delta, init_delta=15.0, init_tau=1.0, init_c_cong=-7.7, init_c_free=50.0, init_v_thr=0.10, init_v_delta=0.001, high_is_congestion=True).to(device=f"cuda:{1 % device_count}")
             for lane in self.lanes:
+                asm_velocity = AdaptiveSmoothing(t_size, s_size, dx=self.longitudinal_cell_size, dt=self.time_delta, 
+                                        init_delta=self.lane_asm_calibrations[lane]["init_delta"], 
+                                        init_tau=self.lane_asm_calibrations[lane]["init_tau"],
+                                        init_c_cong=self.lane_asm_calibrations[lane]["init_c_cong"],
+                                        init_c_free=self.lane_asm_calibrations[lane]["init_c_free"],
+                                        init_v_thr=self.lane_asm_calibrations[lane]["init_v_thr"],
+                                        init_v_delta=self.lane_asm_calibrations[lane]["init_v_delta"]).to(device=f"cuda:{0 % device_count}")
+                asm_density = AdaptiveSmoothing(t_size, s_size, dx=self.longitudinal_cell_size, dt=self.time_delta, 
+                                        init_delta=self.lane_asm_calibrations[lane]["init_delta"], 
+                                        init_tau=self.lane_asm_calibrations[lane]["init_tau"],
+                                        init_c_cong=self.lane_asm_calibrations[lane]["init_c_cong"],
+                                        init_c_free=self.lane_asm_calibrations[lane]["init_c_free"],
+                                        init_v_thr=self.lane_asm_calibrations[lane]["init_v_thr"],
+                                        init_v_delta=self.lane_asm_calibrations[lane]["init_v_delta"]).to(device=f"cuda:{1 % device_count}")
                 print(f"Processing lane {lane}")
                 processed_macro_data = {}
                 raw_macro_data_lane = raw_macro_data[lane]
@@ -407,9 +420,11 @@ class I24MotionMacro:
                 density_asm_input = torch.from_numpy(density_asm_input).to(torch.float32).to(device=f"cuda:{1 % device_count}")
                 print(f"Lane data loaded!")
 
-                velocity_asm_output = asm_velocity(velocity_asm_input)
+                velocity_asm_output, w = asm_velocity(velocity_asm_input)
+                w = w.cpu().to(device=f"cuda:{1 % device_count}") # Send to density CUDA device
                 print("Velocity done!")
-                density_asm_output = asm_density(density_asm_input)
+                # We use the weights from the previous velocity reconstruction
+                density_asm_output, w = asm_density(density_asm_input, w)
                 print("Density done!")
                 flow_asm_output = velocity_asm_output * density_asm_output.to(device=f"cuda:{0 % device_count}")
                 print("Flow done!")
@@ -433,6 +448,7 @@ class I24MotionMacro:
         return processed_macro_data
         
 if __name__ == "__main__":
+    """
     print("Loading data source...")
     data_source = i24_motion_data.I24MotionData(2, 1669812350, 1669812350+3600, 0, 1600)
     print("Creating macro processing object...")
@@ -449,3 +465,30 @@ if __name__ == "__main__":
     macro.createRawMacroData()
     print("Creating processed macro and saving it...")
     macro.createProcessedMacroData()
+    """
+    config_folder = "config/"
+    datasets = os.listdir(config_folder)
+    for dataset in datasets:
+        config_path = os.path.join(config_folder, dataset)
+        with open(config_path, "r") as f:
+            config = json.load(f)
+        time_origin = config["time_origin"]
+        time_length = config["time_length"]
+        road_length_1 = config["road_data"]["1"]["road_length"]
+        road_length_2 = config["road_data"]["2"]["road_length"]
+        print(f"Loading data source for {dataset}...")
+        data_source = i24_motion_data.I24MotionData(2, time_origin, time_origin+time_length, 0, road_length_1, config_path=config_path)
+        print("Creating macro processing object...")
+        macro = I24MotionMacro(data_source, 2, "road_2", config_path=config_path)
+        print("Creating raw macro data and saving it...")
+        macro.createRawMacroData()
+        print("Creating processed macro and saving it...")
+        macro.createProcessedMacroData()
+        print("Loading data source...")
+        data_source = i24_motion_data.I24MotionData(1, time_origin, time_origin+time_length, 0, road_length_2, config_path=config_path)
+        print("Creating macro processing object...")
+        macro = I24MotionMacro(data_source, 1, "road_1", config_path=config_path)
+        print("Creating raw macro data and saving it...")
+        macro.createRawMacroData()
+        print("Creating processed macro and saving it...")
+        macro.createProcessedMacroData()

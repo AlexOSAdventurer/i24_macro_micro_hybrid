@@ -17,6 +17,7 @@ class I24SimulationData:
     def __init__(self, config_path="i24_motion_to_dataset.json", network_path="network.json", network_metanet_path="network_metanet.json", macro_path="macro.parquet", macro_metanet_path="macro_metanet.parquet", micro_path="micro.parquet"):
         with open(config_path, "r") as f:
             self.config = json.load(f)
+        self.config_path = config_path
         self.preprocessing_path = self.config["storage_locations"]["preprocessing_data"]
         self.simulation_path = self.config["storage_locations"]["simulation_dataset"]
         self.network_path = os.path.join(self.simulation_path, network_path)
@@ -32,8 +33,10 @@ class I24SimulationData:
     def create_network_file(self):
         # For now both roads have the same length, so just grab one of them for config.
         config = self.config["road_data"]["2"]
-        params = {'v_f': 43.906521944351404, 'rho_j': 0.13154571531898504, 'lambda_lc': 0.0789091812007707, 'w': 6.054218545965104}
-        params_original = {'v_f': 49.73562026160161, "rho_j": 0.1304577157114563, "lambda_lc": 0.13951724538021434, 'w': 5.697835695812354}
+        params = {'v_f': 30.019341712559083, 'rho_j': 0.09411385875052518, 'lambda_lc': 0.16914326352090997, 'w': 4.573064692495487} #. Best is trial 71 with value: -1.6869119514065773.
+        #params = {'v_f': 44.628171971976364, 'rho_j': 0.10161810757336569, 'lambda_lc': 0.12233207260740411, 'w': 4.939175703300891}
+        #params = {'v_f': 43.906521944351404, 'rho_j': 0.13154571531898504, 'lambda_lc': 0.0789091812007707, 'w': 6.054218545965104}
+        #params_original = {'v_f': 49.73562026160161, "rho_j": 0.1304577157114563, "lambda_lc": 0.13951724538021434, 'w': 5.697835695812354}
         triangular_fd = simulation.TriangularFD(v_f=params['v_f'], w=params['w'], rho_j=params['rho_j'])
         self.network_generator = simulation.I24WestAndEastNetwork(fd=triangular_fd, lambda_lc=params['lambda_lc'])
         #triangular_fd = simulation.TriangularFD(v_f=49.816011505539535, w=6.053452290089522, rho_j=0.12998583138493472)
@@ -65,8 +68,8 @@ class I24SimulationData:
 
     def load_source_data(self):
         for road in self.config["road_data"]:
-            self.micro_source_data[int(road)] = i24_motion_data.I24MotionData(int(road), self.config["road_data"][road]["time_origin"], self.config["road_data"][road]["time_origin"] + self.config["road_data"][road]["time_length"], 0.0, self.config["road_data"][road]["road_length"])
-            self.macro_source_data[int(road)] = i24_motion_macro.I24MotionMacro(self.micro_source_data[int(road)], int(road), f"road_{road}")
+            self.micro_source_data[int(road)] = i24_motion_data.I24MotionData(int(road), self.config["road_data"][road]["time_origin"], self.config["road_data"][road]["time_origin"] + self.config["road_data"][road]["time_length"], 0.0, self.config["road_data"][road]["road_length"], config_path=self.config_path)
+            self.macro_source_data[int(road)] = i24_motion_macro.I24MotionMacro(self.micro_source_data[int(road)], int(road), f"road_{road}", config_path=self.config_path)
 
     def generate_micro_data(self):
         feet_to_meters = 0.3048
@@ -231,9 +234,22 @@ class I24SimulationData:
         pq.write_table(table, self.macro_metanet_path, compression="zstd", row_group_size=1000, sorting_columns=sorting_columns)
 
 if __name__ == "__main__":
-    sim_data = I24SimulationData()
-    sim_data.create_network_file()
-    sim_data.create_network_file_metanet()
+    #sim_data = I24SimulationData()
+    #sim_data.create_network_file()
+    #sim_data.create_network_file_metanet()
     #sim_data.generate_micro_data()
-    sim_data.generate_macro_data_metanet()
-    sim_data.generate_macro_data()
+    #sim_data.generate_macro_data_metanet()
+    #sim_data.generate_macro_data()
+    config_folder = "config/"
+    datasets = os.listdir(config_folder)
+    for dataset in datasets:
+        print(dataset)
+        config_path = os.path.join(config_folder, dataset)
+        with open(config_path, "r") as f:
+            config = json.load(f)
+        sim_data = I24SimulationData(config_path=config_path)
+        sim_data.create_network_file()
+        sim_data.create_network_file_metanet()
+        #sim_data.generate_micro_data()
+        #sim_data.generate_macro_data_metanet()
+        #sim_data.generate_macro_data()

@@ -29,6 +29,14 @@ RUN packages="vulkan-tools fontconfig libxml2-dev xdg-user-dirs" && \
     apt-get install -y $packages && \
     rm -rf /var/lib/apt/lists/*
 
+# Install LaTEX
+# Install minimal or full texlive distribution along with build tools
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    texlive-latex-extra \
+    texlive-fonts-recommended \
+    latexmk \
+    && rm -rf /var/lib/apt/lists/*
+
 ENV XDG_RUNTIME_DIR=/run/user/${UID}
 
 # Install runtime python libraries (to run examples and utils)
@@ -140,3 +148,4 @@ RUN --mount=type=secret,id=epic_user,uid=${UID} \
       --ue4-root ${UE4_ROOT} \
       --epic-user $(cat /run/secrets/epic_user) \
       --epic-token $(cat /run/secrets/epic_token)
+

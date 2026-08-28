@@ -8,144 +8,8 @@ import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
 
-# We assume all entries have the same time step
-def generate_ground_truth_alignment_with_simulation_result(gt: pd.DataFrame, sim_macro: pd.DataFrame, sim_mask: pd.DataFrame, eps: float = 1e-8):
-    mask_position = float(sim_mask.iloc[0]["x_start_position"])
-    mask_length = float(sim_mask.iloc[0]["length"])
-    sim_macro = sim_macro[(sim_macro["x_start_position"] - mask_position).abs() > eps]
-
-    t = float(sim_macro.iloc[0]["time"])
-    dt = float(sim_macro.iloc[0]["dt"])
-    assert((gt["time"].nunique() == 1) and (float(gt["time"].iloc[0]) == t)), f"{t}, {gt}, {sim_macro}, {sim_mask}"
-    assert((sim_macro["time"].nunique() == 1))
-    assert((sim_mask["time"].nunique() == 1) and (float(sim_mask["time"].iloc[0]) == t))
-    assert((sim_macro["dt"].nunique() == 1))
-    assert((sim_mask["dt"].nunique() == 1) and (float(sim_mask["dt"].iloc[0]) == dt))
-
-    time_array = []
-    dt_array = []
-    x_start_position_array = []
-    length_array = []
-    density_array = []
-    for i in range(len(sim_macro)):
-        macro_data = sim_macro.iloc[i]
-        new_time = t
-        new_dt = dt
-        x_start_position_new = float(macro_data["x_start_position"])
-        length_new = float(macro_data["length"])
-        mass_new = 0.0
-        for j in range(len(gt)):
-            gt_data = gt.iloc[j]
-            gt_position = float(gt_data["position"])
-            gt_length = float(gt_data["length"])
-            gt_density = float(gt_data["density"])
-            overlap_start = max(x_start_position_new, gt_position)
-            overlap_end = min(gt_position + gt_length, x_start_position_new + length_new)
-            overlap_length = overlap_end - overlap_start
-            if (overlap_length > eps):
-                mass_new += (overlap_length * gt_density)
-        density_new = mass_new / length_new
-        time_array.append(new_time)
-        dt_array.append(new_dt)
-        x_start_position_array.append(x_start_position_new)
-        length_array.append(length_new)
-        density_array.append(density_new)
-
-    sim_macro = sim_macro.reset_index(drop=True)
-    return pd.DataFrame({
-        "time": time_array,
-        "dt": dt_array,
-        "x_start_position": x_start_position_array,
-        "length": length_array,
-        "density": density_array
-    }), sim_macro
-
-def generate_ground_truth_and_sim_result(gt: pd.DataFrame, sim_macro: pd.DataFrame, sim_mask: pd.DataFrame, eps: float = 1e-8):
-    gt = gt.sort_values(["time", "position"], kind="mergesort", ascending=True)
-    sim_macro = sim_macro.sort_values(["time", "x_start_position"], kind="mergesort", ascending=True)
-    sim_mask = sim_mask.sort_values(["time", "x_start_position"], kind="mergesort", ascending=True)
-    # By default, remove the first and last x position from sim_macro and sim_mask - those are always being overwritten anyway
-    x_positions = sorted(sim_macro["x_start_position"].unique().tolist())
-    sim_macro = sim_macro[(sim_macro["x_start_position"] > x_positions[0]) & (sim_macro["x_start_position"] < x_positions[-1])]
-    times = sim_macro["time"].unique().tolist()
-    tasks = []
-    for time in times:
-        sim_macro_first_index = sim_macro["time"].searchsorted(time, side="left")
-        sim_macro_last_index = sim_macro["time"].searchsorted(time, side="right")
-        sim_mask_first_index = sim_mask["time"].searchsorted(time, side="left")
-        sim_mask_last_index = sim_mask["time"].searchsorted(time, side="right")
-        gt_first_index = gt["time"].searchsorted(time, side="left")
-        gt_last_index = gt["time"].searchsorted(time, side="right")
-        sim_macro_time = sim_macro[sim_macro_first_index:sim_macro_last_index]
-        sim_mask_time = sim_mask[sim_mask_first_index:sim_mask_last_index]
-        #sim_macro_time = sim_macro[(sim_macro["time"] - time).abs() <= eps]
-        #sim_mask_time = sim_mask[(sim_mask["time"] - time).abs() <= eps]
-        gt_time = gt[gt_first_index:gt_last_index]
-        tasks.append({
-            "gt": gt_time,
-            "sim_macro": sim_macro_time,
-            "sim_mask": sim_mask_time
-        })
-        print(time)
-    df_results = Parallel(n_jobs=24)(delayed(generate_ground_truth_alignment_with_simulation_result)(gt=task["gt"], sim_macro=task["sim_macro"], sim_mask=task["sim_mask"]) for task in tasks)
-    gt_step_list = []
-    sim_macro_step_list = []
-    for (gt_step, sim_macro_step) in df_results:
-        gt_step_list.append(gt_step)
-        sim_macro_step_list.append(sim_macro_step)
-    gt_result = pd.concat(gt_step_list, axis=0, ignore_index=True)
-    macro_result = pd.concat(sim_macro_step_list, axis=0, ignore_index=True)
-    return gt_result, macro_result
-
-
-def generate_convergence_order(ground_truth_file_coarse: str, ground_truth_file_fine: str, sim_macro_coarse_file: str, sim_mask_coarse_file: str, sim_macro_fine_file: str, sim_mask_fine_file: str, scaling: float):
-    """Two-grid L1 convergence order.
-
-    WARNING: this excludes the mask cell (see the filter in
-    generate_ground_truth_alignment_with_simulation_result), so it is blind to any mass
-    error living inside the micro bubble. That blindness inverted the case_m_4 model
-    ranking and reported case_m_2 as exactly convergent when the complete norm is flat.
-    Prefer convergence_table() below, which reports the macro and bubble terms separately
-    and sums them. Kept because existing notebooks call it.
-    """
-    lwr_ground_truth_coarse = pd.read_csv(ground_truth_file_coarse)
-    lwr_ground_truth_fine = pd.read_csv(ground_truth_file_fine)
-    sim_macro_coarse = pd.read_csv(sim_macro_coarse_file)
-    sim_mask_coarse = pd.read_csv(sim_mask_coarse_file)
-    sim_macro_fine = pd.read_csv(sim_macro_fine_file)
-    sim_mask_fine = pd.read_csv(sim_mask_fine_file)
-    coarse_dt = float(sim_macro_coarse.iloc[0]["dt"])
-    fine_dt = float(sim_macro_fine.iloc[0]["dt"])
-    lwr_ground_truth_coarse_post, sim_macro_coarse_post = generate_ground_truth_and_sim_result(lwr_ground_truth_coarse, sim_macro_coarse, sim_mask_coarse)
-    lwr_ground_truth_fine_post, sim_macro_fine_post = generate_ground_truth_and_sim_result(lwr_ground_truth_fine, sim_macro_fine, sim_mask_fine)
-    lwr_ground_truth_coarse_post["mass"] = lwr_ground_truth_coarse_post["density"] * lwr_ground_truth_coarse_post["length"]
-    lwr_ground_truth_fine_post["mass"] = lwr_ground_truth_fine_post["density"] * lwr_ground_truth_fine_post["length"]
-    sim_macro_coarse_post["mass"] = sim_macro_coarse_post["density"] * sim_macro_coarse_post["length"]
-    sim_macro_fine_post["mass"] = sim_macro_fine_post["density"] * sim_macro_fine_post["length"]
-    coarse_l1_error = np.absolute(sim_macro_coarse_post["mass"].values - lwr_ground_truth_coarse_post["mass"].values).sum() * coarse_dt
-    fine_l1_error = np.absolute(sim_macro_fine_post["mass"].values - lwr_ground_truth_fine_post["mass"].values).sum() * fine_dt
-    #return coarse_l1_error, fine_l1_error, math.log(coarse_l1_error / fine_l1_error) / math.log(scaling)
-    #coarse_mse_error = ((sim_macro_coarse_post["mass"] -  lwr_ground_truth_coarse_post["mass"]) ** 2).sum() / (sim_macro_coarse_post["length"].sum())
-    #fine_mse_error = ((sim_macro_fine_post["mass"] -  lwr_ground_truth_fine_post["mass"]) ** 2).sum() / (sim_macro_fine_post["length"].sum())
-    #coarse_raw_error = (sim_macro_coarse_post["mass"] - lwr_ground_truth_coarse_post["mass"]).abs().sum()
-    #fine_raw_error = (sim_macro_fine_post["mass"] - lwr_ground_truth_fine_post["mass"]).abs().sum()
-    #return coarse_raw_error, fine_raw_error
-    return lwr_ground_truth_coarse_post, sim_macro_coarse_post, lwr_ground_truth_fine_post, sim_macro_fine_post, coarse_l1_error, fine_l1_error
-
-
-#analysis_helpers.generate_convergence_order("verification_config/case_m_2_dx_128.0_dt_1.0/vanilla_lwr.csv", "verification_config/case_m_2_dx_64.0_dt_0.5/vanilla_lwr.csv", "verification_results/case_m_2_dx_128.0_dt_1.0/newell_case_macro.csv", "verification_results/case_m_2_dx_128.0_dt_1.0/newell_case_mask.csv", "verification_results/case_m_2_dx_64.0_dt_0.5/newell_case_macro.csv", "verification_results/case_m_2_dx_64.0_dt_0.5/newell_case_mask.csv", 2.0)
-# (np.float64(427.0002880439491), np.float64(827.9486403238341))
-#(np.float64(427.0002880439491), np.float64(413.97432016191703))
-#>>> analysis_helpers.generate_convergence_order("verification_config/case_m_2_dx_128.0_dt_1.0/vanilla_lwr.csv", "verification_config/case_m_2_dx_64.0_dt_0.5/vanilla_lwr.csv", "verification_results/case_m_2_dx_128.0_dt_1.0/newell_case_macro.csv", "verification_results/case_m_2_dx_128.0_dt_1.0/newell_case_mask.csv", "verification_results/case_m_2_dx_64.0_dt_0.5/newell_case_macro.csv", "verification_results/case_m_2_dx_64.0_dt_0.5/newell_case_mask.csv", 2.0)
-# analysis_helpers.generate_convergence_order("verification_config/case_m_2_dx_128.0_dt_1.0/micro_case_b_1.csv", "verification_config/case_m_2_dx_64.0_dt_0.5/micro_case_b_1.csv", "verification_results/case_m_2_dx_128.0_dt_1.0/micro_case_b_1_macro.csv", "verification_results/case_m_2_dx_128.0_dt_1.0/micro_case_b_1_mask.csv", "verification_results/case_m_2_dx_64.0_dt_0.5/micro_case_b_1_macro.csv", "verification_results/case_m_2_dx_64.0_dt_0.5/micro_case_b_1_mask.csv", 2.0)
-# analysis_helpers.generate_convergence_order("verification_config/case_m_2_dx_128.0_dt_1.0/micro_case_b_1.csv", "verification_config/case_m_2_dx_8.0_dt_0.0625/micro_case_b_1.csv", "verification_results/case_m_2_dx_128.0_dt_1.0/micro_case_b_1_macro.csv", "verification_results/case_m_2_dx_128.0_dt_1.0/micro_case_b_1_mask.csv", "verification_results/case_m_2_dx_8.0_dt_0.0625/micro_case_b_1_macro.csv", "verification_results/case_m_2_dx_8.0_dt_0.0625/micro_case_b_1_mask.csv", 2.0)
-
-
 # ======================================================================================
 # Convergence tables
-#
-# Replaces the pairwise generate_convergence_order() above with a whole-sweep table. Four
-# differences, each of which changed a published conclusion at some point:
 #
 #   1. THE BUBBLE TERM. The macro L1 excludes the mask cell, so mass error inside the
 #      micro domain is invisible to it. That systematically rewards models which leak
@@ -218,6 +82,31 @@ def default_gt_case(micro_case):
     return micro_case if micro_case.startswith("micro_case_b_") else "vanilla_lwr"
 
 
+MEMORY_COLUMNS = ("rear_flux_memory", "front_flux_memory")
+
+
+def _bubble_counts(mask_log, bubble_source):
+    """Time -> vehicles held in the bubble, or None to fall back to the fluid mass.
+
+    Shared by analyse_run and bubble_timeseries so the integrated metric and the plotted
+    series can never disagree about what "held" means. See analyse_run's docstring for
+    why the accumulators belong in the total.
+    """
+    if bubble_source == "fluid" or "vehicle_count" not in mask_log.columns:
+        return None
+    held = mask_log.set_index("time")["vehicle_count"].astype(float)
+    if bubble_source == "vehicle_count_memory":
+        if not all(c in mask_log.columns for c in MEMORY_COLUMNS):
+            raise ValueError(
+                "mask log predates the flux-memory columns; "
+                "re-run or use bubble_source='vehicle_count'")
+        indexed = mask_log.set_index("time")
+        # Sign convention (bridge_coupler): a POSITIVE rear memory and a NEGATIVE front
+        # memory both mean "vehicles owed to the bubble", hence rear - front.
+        held = held + indexed["rear_flux_memory"] - indexed["front_flux_memory"]
+    return held.to_dict()
+
+
 def _analyse_mask_free_run(grid, macro_path, gt_path):
     """Macro-only error for a run with no micro domain (the mask-free control).
 
@@ -258,7 +147,7 @@ def _analyse_mask_free_run(grid, macro_path, gt_path):
 
 def analyse_run(macro_case, micro_case, grid, results_folder,
                 gt_case=None, config_folder="verification_config", tolerance=1e-6,
-                bubble_source="vehicle_count"):
+                bubble_source="vehicle_count_memory"):
     """Error of one run: macro (upstream/downstream), bubble, and cumulative-count.
 
     Returns a dict. `bubble`, `moskowitz` and `moskowitz_mean` are NaN when the ground
@@ -281,8 +170,33 @@ def analyse_run(macro_case, micro_case, grid, results_folder,
     computation below -- at the cost of being a weaker norm.
 
     bubble_source selects what counts as "mass in the bubble":
-      "vehicle_count" (default) -- len(vehicles) from the mask log. Always an integer, and
-          the honest answer to how much traffic the micro domain is actually holding.
+      "vehicle_count_memory" (default) -- len(vehicles) PLUS the coupler's pending flux
+          accumulators, vehicle_count + rear_flux_memory - front_flux_memory. This is the
+          integer count corrected by the fractional vehicles the boundary is owed but has
+          not yet been able to place.
+
+          Why this combination: it is exactly invariant under every spawn and despawn.
+          A front exit does count -= 1 and flow_memory_front -= 1; a rear exit does
+          count -= 1 and flow_memory_rear += 1; the two spawn paths debit their memory by
+          the number actually placed (bridge_coupler.remove_vehicles_from_macro and
+          _spawn_vehicles_in_{rear,front}). So the sum changes ONLY when the macro flux
+          updates a memory, which makes it a measure of the continuum coupling alone with
+          the integer spawn quantisation algebraically removed.
+
+          It matters because _spawn_vehicles_in_rear places math.floor(memory) vehicles,
+          and E[floor(x)] = x - 0.5, so each boundary sits half a vehicle in debt BY
+          CONSTRUCTION; worse, a sub-unit debt can be stranded permanently (case_m_3
+          freezes at front_flux_total = -0.797 from t=15 s and floor(0.797) = 0 forever).
+          On case_m_3 the raw count is a flat -2.0 vehicles against the exact solution
+          while the corrected value is -0.70, and the residual is then exactly the t=0
+          seeding quantisation, conserved thereafter.
+
+          Caveat: the correction is only meaningful where the boundary is actively
+          exchanging. In a quiescent free-flow window the memory holds stale residue that
+          will never be worked off, and adding it back makes things worse -- on
+          case_m_4/newell it moves +0.49 (the true integer-quantisation floor) to +1.07.
+      "vehicle_count" -- len(vehicles) alone, the raw integer occupancy. What the micro
+          domain literally holds, but biased low by the floor() spawn quantisation above.
       "fluid" -- the mask cell's density*length from the macro log. The fluid side's
           bookkeeping of the same quantity, which carries an O(dt) ALE operator-splitting
           residual: measured against case_m_4/newell, the gap has max |.| of 6.461, 3.231,
@@ -290,7 +204,7 @@ def analyse_run(macro_case, micro_case, grid, results_folder,
           results produced before the vehicle_count column existed.
     Older logs have no vehicle_count column, and fall back to "fluid" automatically.
     """
-    if bubble_source not in ("vehicle_count", "fluid"):
+    if bubble_source not in ("vehicle_count_memory", "vehicle_count", "fluid"):
         raise ValueError(f"unknown bubble_source {bubble_source!r}")
     gt_case = gt_case or default_gt_case(micro_case)
     run_dir = os.path.join(results_folder, f"{macro_case}_dx_{grid}")
@@ -309,9 +223,7 @@ def analyse_run(macro_case, micro_case, grid, results_folder,
     dt = float(mask_log["dt"].iloc[0])
     # Logger gained a vehicle_count column partway through the study; derive it from the
     # mask cell's mass when reading an older log, since mask.mass == len(vehicles).
-    counts = (mask_log.set_index("time")["vehicle_count"].to_dict()
-              if (bubble_source == "vehicle_count"
-                  and "vehicle_count" in mask_log.columns) else None)
+    counts = _bubble_counts(mask_log, bubble_source)
     last_mask_position = mask_log.set_index("time")["x_start_position"].to_dict()
 
     gt = pd.read_csv(gt_path)
@@ -406,7 +318,7 @@ def analyse_run(macro_case, micro_case, grid, results_folder,
 def convergence_table(macro_case, micro_case, results_folder,
                       gt_case=None, grids=GRID_SWEEP, scaling=2.0,
                       config_folder="verification_config",
-                      bubble_source="vehicle_count"):
+                      bubble_source="vehicle_count_memory"):
     """Convergence table across a grid sweep, with observed orders.
 
     `p_macro` is the order of the macro term alone, `p_total` the order of macro+bubble.
@@ -510,7 +422,6 @@ def sweep_tables(results_folder, macro_cases=("case_m_1", "case_m_2", "case_m_3"
             print(format_convergence_table(table))
             print()
     return tables
-
 
 def bubble_decomposition(macro_case, micro_case, results_folder, grids=GRID_SWEEP,
                          gt_case=None, config_folder="verification_config",
@@ -676,6 +587,9 @@ def _pyplot():
 def dx_of_grid(grid):
     return float(grid.split("_dt_")[0])
 
+def dt_of_grid(grid):
+    return float(grid.split("_dt_")[1])
+
 
 # --------------------------------------------------------------------------------------
 # Figure data: computed once, cached, so figure iteration does not re-stream 60 GB.
@@ -699,6 +613,7 @@ def build_figure_data(results_folder, grids=None, cache_path="figure_data.csv",
         frame["macro_case"] = macro_case
         frame["micro_case"] = micro_case
         frame["dx"] = frame["grid"].map(dx_of_grid)
+        frame["dt"] = frame["grid"].map(dt_of_grid)
         frames.append(frame)
     data = pd.concat(frames, ignore_index=True)
     data.to_csv(cache_path, index=False)
@@ -912,7 +827,8 @@ def figure_observed_order(data, macro_case="case_m_4", out_path=None):
 # --------------------------------------------------------------------------------------
 
 def bubble_timeseries(macro_case, micro_case, grid, results_folder,
-                      gt_case=None, config_folder="verification_config", tolerance=1e-6):
+                      gt_case=None, config_folder="verification_config", tolerance=1e-6,
+                      bubble_source="vehicle_count_memory"):
     """Per-step vehicles held in the bubble against the exact mass over the same window.
 
     Mask geometry comes from the macro log rather than the mask log: the latter's
@@ -923,8 +839,7 @@ def bubble_timeseries(macro_case, micro_case, grid, results_folder,
     run_dir = os.path.join(results_folder, f"{macro_case}_dx_{grid}")
     mask_log = pd.read_csv(os.path.join(run_dir, f"{micro_case}_mask.csv"))
     mask_length = float(mask_log["length"].iloc[0])
-    counts = (mask_log.set_index("time")["vehicle_count"].to_dict()
-              if "vehicle_count" in mask_log.columns else {})
+    counts = _bubble_counts(mask_log, bubble_source) or {}
     gt = pd.read_csv(os.path.join(config_folder, f"{macro_case}_dx_{grid}",
                                   f"{gt_case}.csv"))
     gt_groups = {float(t): g for t, g in gt.groupby("time")}
@@ -1168,6 +1083,7 @@ def save_publication_figures(results_folder, out_dir="figures",
     else:
         data = build_figure_data(results_folder, grids=grids, cache_path=cache_path)
 
+    """
     builders = {
         "f1_boundary_orders": lambda: figure_boundary_orders(data),
         "f2_two_term": lambda: figure_two_term(data),
@@ -1177,6 +1093,22 @@ def save_publication_figures(results_folder, out_dir="figures",
         "f5_space_time": lambda: figure_space_time(results_folder, grid=visual_grid),
         "f6_trajectories": lambda: figure_trajectories(
             figure_run_folder, grid=visual_grid),
+    }
+    """
+    """
+    builders = {
+        "f1_space_time_m1_newell": lambda: figure_space_time(results_folder, grid=visual_grid, macro_case="case_m_1", micro_case="newell_case"),
+        "f2_space_time_m1_idm": lambda: figure_space_time(results_folder, grid=visual_grid, macro_case="case_m_1", micro_case="idm_case"),
+        "f3_space_time_m1_arz": lambda: figure_space_time(results_folder, grid=visual_grid, macro_case="case_m_1", micro_case="arz_case"),
+        "f4_space_time_m2_newell": lambda: figure_space_time(results_folder, grid=visual_grid, macro_case="case_m_2", micro_case="newell_case"),
+        "f5_space_time_m2_idm": lambda: figure_space_time(results_folder, grid=visual_grid, macro_case="case_m_2", micro_case="idm_case"),
+        "f6_space_time_m2_arz": lambda: figure_space_time(results_folder, grid=visual_grid, macro_case="case_m_2", micro_case="arz_case"),
+        "f7_space_time_m3_newell": lambda: figure_space_time(results_folder, grid=visual_grid, macro_case="case_m_3", micro_case="newell_case"),
+        "f8_space_time_m3_idm": lambda: figure_space_time(results_folder, grid=visual_grid, macro_case="case_m_3", micro_case="idm_case"),
+        "f9_space_time_m3_arz": lambda: figure_space_time(results_folder, grid=visual_grid, macro_case="case_m_3", micro_case="arz_case"),
+        "f10_space_time_m4_newell": lambda: figure_space_time(results_folder, grid=visual_grid, macro_case="case_m_4", micro_case="newell_case"),
+        "f11_space_time_m4_idm": lambda: figure_space_time(results_folder, grid=visual_grid, macro_case="case_m_4", micro_case="idm_case"),
+        "f12_space_time_m4_arz": lambda: figure_space_time(results_folder, grid=visual_grid, macro_case="case_m_4", micro_case="arz_case"),
     }
     written = []
     for name, build in builders.items():
@@ -1192,6 +1124,8 @@ def save_publication_figures(results_folder, out_dir="figures",
         plt.close(figure)
     for path in written:
         print(f"  wrote {path}")
+    """
+    written = []
 
     if tables:
         _, standalone = write_latex_tables(cache_path=cache_path, out_dir=table_dir)
@@ -1217,8 +1151,9 @@ def save_publication_figures(results_folder, out_dir="figures",
 # ======================================================================================
 
 LATEX_PREAMBLE = r"""\documentclass[11pt]{article}
-\usepackage[margin=1in,landscape]{geometry}
+\usepackage[a2paper, portrait, margin=1in]{geometry}
 \usepackage{booktabs}
+\usepackage{subcaption}
 \begin{document}
 \pagestyle{empty}
 """
@@ -1300,6 +1235,233 @@ def latex_case_block(data, macro_case, micro_cases, columns=("macro", "p_macro")
     return "\n".join(lines)
 
 
+# --------------------------------------------------------------------------------------
+# Collapsed tables -- one table per family instead of one per scenario.
+#
+# `latex_case_block` puts the case in the columns, which only works when every scenario
+# runs the same set of cases. The car-following family does; the prescribed family does
+# not -- m1 runs b_4/b_5, m2 runs b_1/b_2/b_3, m3 runs b_1/b_7/b_8, m4 runs b_2/b_6 -- so
+# collapsing it along that axis needs eight column groups with two thirds of the cells
+# empty. Transposing fixes it: the case moves into the rows and the grid into the columns.
+#
+# The transpose also buys the point of the figure. With cases in the rows they can be
+# ordered by wave type, so every contact sits at ~1/2 in one block and every shock at ~1
+# in the next, instead of the reader having to assemble that from four separate tables.
+# --------------------------------------------------------------------------------------
+
+# Grouped by the Riemann structure each case drives (see B_CASE_WAVE), not by scenario.
+GROUPED_PRESCRIBED_ROWS = (
+    ("Contact", (
+        ((r"m1", r"b\_4"), "case_m_1", "micro_case_b_4"),
+        ((r"m1", r"b\_5"), "case_m_1", "micro_case_b_5"),
+        ((r"m2", r"b\_2$^{\dagger}$"), "case_m_2", "micro_case_b_2"),
+        ((r"m4", r"b\_2"), "case_m_4", "micro_case_b_2"),
+        ((r"m4", r"b\_6"), "case_m_4", "micro_case_b_6"),
+    )),
+    ("Shock", (
+        ((r"m2", r"b\_1"), "case_m_2", "micro_case_b_1"),
+        ((r"m2", r"b\_3"), "case_m_2", "micro_case_b_3"),
+        ((r"m3", r"b\_1"), "case_m_3", "micro_case_b_1"),
+        ((r"m3", r"b\_7$^{\ddagger}$"), "case_m_3", "micro_case_b_7"),
+        ((r"m3", r"b\_8"), "case_m_3", "micro_case_b_8"),
+    )),
+)
+
+# case_m_1 and case_m_2 are model-degenerate: the three car-following models agree to
+# roundoff there (max relative spread 7e-16 and 5e-05 respectively, the latter on errors
+# that are themselves ~1e-10). Printing three identical columns would imply a comparison
+# that the data does not contain, so those collapse to one row -- latex_grouped_table
+# re-checks the agreement rather than trusting this comment.
+GROUPED_MODEL_ROWS = (
+    ("m1", ((("all models",), "case_m_1", MODEL_ORDER),)),
+    ("m2", ((("all models$^{\\dagger}$",), "case_m_2", MODEL_ORDER),)),
+    ("m3", tuple(((MODEL_LABEL[c],), "case_m_3", c) for c in MODEL_ORDER)),
+    ("m4", tuple(((MODEL_LABEL[c],), "case_m_4", c) for c in MODEL_ORDER)),
+)
+
+# Individual numbers that are real outputs but are not what the surrounding block claims.
+# Flagged in place rather than dropped, so the table stays a faithful record of the sweep.
+GROUPED_PRESCRIBED_NOTES = (
+    (r"\dagger", "Uniform state with no wave; the error is at machine zero "
+                 r"($\sim$$10^{-10}$) and the orders are floating-point noise. Included "
+                 "as an exactness check, not as a measured contact rate."),
+    (r"\ddagger", r"The error halves to five significant figures at every level "
+                  r"($p=1.000$ throughout), the signature of a $\Delta x$-proportional "
+                  "geometric term rather than of shock capture."),
+    (r"\ast", r"Not in the asymptotic range: the $\Delta x=128$ cell is orders of "
+              r"magnitude away from $\Delta x=64$, so the order fitted against it is "
+              r"spurious and is reported only for completeness."),
+)
+
+GROUPED_MODEL_NOTES = (
+    (r"\dagger", r"Errors are at machine zero ($\sim$$10^{-10}$); the orders are "
+                 "floating-point noise."),
+)
+
+# (macro_case, micro_case or None for any, column, dx) -> marker. All three case_m_3 runs
+# sit three orders of magnitude high at the coarsest grid; case_m_2's b_1 is the mirror
+# image, exact at 128 and then jumping to 4.46, which is what produces its $p=-34.964$.
+GROUPED_PRESCRIBED_CELL_MARKS = {
+    ("case_m_3", None, "macro", 128.0): r"\ast",
+    ("case_m_2", "micro_case_b_1", "macro", 128.0): r"\ast",
+}
+
+
+def latex_grouped_table(data, groups, quantities=(("macro", r"$L_1$"), ("p_macro", "$p$")),
+                        group_header="", row_headers=("Case",), label=None, caption=None,
+                        notes=(), cell_marks=None, grids=None):
+    """One booktabs table covering every scenario: rows are cases, columns are grids.
+
+    This is the transposed counterpart to `latex_case_block`, which stays the way to emit
+    a single scenario. `groups` is a sequence of ``(group_label, rows)`` and each row is
+    ``(label_cells, macro_case, micro_case)``, where `label_cells` is a tuple matching
+    `row_headers`. Every row occupies one printed line per entry in `quantities`.
+
+    `micro_case` may be a tuple of cases expected to be numerically identical. They are
+    verified column by column and then rendered as one row; a mismatch raises rather than
+    quietly showing one case's numbers under a label that promises all of them.
+
+    `cell_marks` maps ``(macro_case, micro_case or None, column, dx)`` to a footnote
+    marker, so a single suspect number can be flagged where it sits instead of being
+    dropped. `notes` is a sequence of ``(marker, text)`` printed beneath the rule.
+    """
+    cell_marks = cell_marks or {}
+    n_label = 1 + len(row_headers) + 1              # group, row labels, quantity name
+
+    def frame_for(macro_case, micro_case):
+        """The per-grid table for one row, indexed by dx and ordered coarse to fine."""
+        cases = (micro_case,) if isinstance(micro_case, str) else tuple(micro_case)
+        picked = []
+        for case in cases:
+            sub = data[(data.macro_case == macro_case) & (data.micro_case == case)]
+            if not sub.empty:
+                picked.append(sub.set_index("dx").sort_index(ascending=False))
+        if not picked:
+            return None
+        # Compare the errors, not the orders. An order is a ratio of two errors, so when
+        # the errors agree the runs are the same run -- but where those errors sit at
+        # machine zero the ratio amplifies roundoff into a spread of ~1e-3, which would
+        # reject case_m_2 for a difference that is not physically there.
+        checked = [column for column, _ in quantities if not column.startswith("p_")]
+        checked = checked or [column for column, _ in quantities]
+        reference = picked[0]
+        for case, other in zip(cases[1:], picked[1:]):
+            other = other.reindex(reference.index)
+            for column in checked:
+                left = reference[column].to_numpy(dtype=float)
+                right = other[column].to_numpy(dtype=float)
+                # MACHINE_ZERO floors the scale. Below it the runs agree exactly and the
+                # surviving digits are roundoff, so a purely relative test would reject
+                # case_m_2 -- where the models are identical -- over a gap of 7e-14.
+                scale = max(np.nanmax(np.abs(left)), MACHINE_ZERO)
+                gap = np.nanmax(np.abs(left - right))
+                if gap > 1e-6 * scale:
+                    raise ValueError(
+                        f"{macro_case}: {cases[0]} and {case} were collapsed into one row "
+                        f"but differ on '{column}' by {gap:.3g} (relative {gap / scale:.3g})")
+        return reference
+
+    resolved = []
+    for group_label, rows in groups:
+        kept = [(labels, macro_case, micro_case, frame_for(macro_case, micro_case))
+                for labels, macro_case, micro_case in rows]
+        kept = [row for row in kept if row[3] is not None]
+        if kept:
+            resolved.append((group_label, kept))
+    if not resolved:
+        return ""
+
+    if grids is None:
+        seen = set()
+        for _, rows in resolved:
+            seen.update((float(dx), float(dt)) for frame in (row[3] for row in rows) for (dx, dt) in zip(frame["dx"], frame["dt"]))
+        grids = sorted(seen, key=lambda k: k[0], reverse=True)
+
+    spec = "l" * n_label + " " + "r" * len(grids)
+    lines = [r"\begin{subtable}[t]{\textwidth}", r"\centering"]
+    if caption:
+        lines.append(rf"\caption{{{caption}}}")
+    if label:
+        lines.append(rf"\label{{{label}}}")
+    lines.append(rf"\begin{{tabular}}{{{spec}}}")
+    lines.append(r"\toprule")
+    lines.append(" & ".join([""] * n_label
+                            + [rf"\multicolumn{{{len(grids)}}}{{c}}{{$\Delta x$ (m)}}"])
+                 + r" \\")
+    lines.append(rf"\cmidrule(lr){{{n_label + 1}-{n_label + len(grids)}}}")
+    lines.append(" & ".join([group_header] + list(row_headers) + [""]
+                            + [f"{dx:g}/{dt:g}" for (dx, dt) in grids]) + r" \\")
+
+    for group_label, rows in resolved:
+        lines.append(r"\midrule")
+        for row_index, (labels, macro_case, micro_case, frame) in enumerate(rows):
+            for quantity_index, (column, header) in enumerate(quantities):
+                first = row_index == 0 and quantity_index == 0
+                cells = [group_label if first else ""]
+                cells += [text if quantity_index == 0 else "" for text in labels]
+                cells.append(header)
+                for dx in grids:
+                    if dx not in frame.index:
+                        cells.append("---")
+                        continue
+                    value = float(frame.loc[dx, column])
+                    text = _fmt_order(value) if column.startswith("p_") else _fmt_error(value)
+                    mark = (cell_marks.get((macro_case, micro_case, column, dx))
+                            or cell_marks.get((macro_case, None, column, dx)))
+                    if mark:
+                        # A marker butted against a value already in math mode lands at
+                        # exponent height and reads as part of the exponent.
+                        gap = r"\," if text.endswith("$") else ""
+                        text = f"{text}{gap}$^{{{mark}}}$"
+                    cells.append(text)
+                lines.append(" & ".join(cells) + r" \\")
+
+    lines.append(r"\bottomrule")
+    lines.append(r"\end{tabular}")
+    # Notes go outside the tabular. As \multicolumn rows they sit in an `l` column, which
+    # cannot line-break, so any note longer than the table overfulls the box.
+    if notes:
+        lines.append(r"\vspace{2pt}")
+        lines.append(r"\begin{centering}\begin{minipage}{\linewidth}\footnotesize\raggedright")
+        for marker, text in notes:
+            lines.append(rf"${marker}$~{text}\par")
+        lines.append(r"\end{minipage}\end{centering}")
+    lines.append(r"\end{subtable}")
+    return "\n".join(lines)
+
+def latex_convergence_tables_grouped(data):
+    prescribed = latex_grouped_table(
+        data, GROUPED_PRESCRIBED_ROWS,
+        quantities=(("macro", r"$L_1$"), ("p_macro", "$p$")),
+        group_header="Wave", row_headers=("Scen.", "Case"),
+        label="tab:prescribed",
+        caption=(r"Prescribed boundary cases, all scenarios. $L_1$ mass error "
+                r"(veh$\cdot$s) over the macroscopic domain and observed order $p$ "
+                r"against the next coarser grid. Rows are grouped by the Riemann "
+                r"structure the case drives."),
+        notes=GROUPED_PRESCRIBED_NOTES,
+        cell_marks=GROUPED_PRESCRIBED_CELL_MARKS)
+
+    models = latex_grouped_table(
+        data, GROUPED_MODEL_ROWS,
+        quantities=(("macro", r"$L_1$ macro"), ("bubble", r"$L_1$ bubble"),
+                    ("total", r"$L_1$ total"), ("p_macro", "$p$")),
+        group_header="Scen.", row_headers=("Model",),
+        label="tab:models",
+        caption=(r"Car-following models, all scenarios. The macroscopic term converges; "
+                r"the bubble term is a grid-independent floor set by the model."),
+        notes=GROUPED_MODEL_NOTES)
+
+    body = "\n\n".join([r"\begin{table}", 
+                        r"\centering",
+                        r"\caption{Convergence results}",
+                        prescribed,
+                        models,
+                        r"\end{table}"])
+
+    return body
+
+
 def latex_convergence_tables(data, macro_cases=("case_m_1", "case_m_2",
                                                 "case_m_3", "case_m_4")):
     """Both table families: prescribed boundary cases, then the car-following models."""
@@ -1320,8 +1482,8 @@ def latex_convergence_tables(data, macro_cases=("case_m_1", "case_m_2",
     for macro_case in macro_cases:
         blocks.append(latex_case_block(
             data, macro_case, MODEL_ORDER,
-            columns=("macro", "p_macro", "bubble"),
-            headers=("$L_1$ macro", "$p$", "$L_1$ bubble"),
+            columns=("macro", "p_total", "bubble"),
+            headers=("$L_1$ macro", "$p_{total}$", "$L_1$ bubble"),
             label=f"tab:models-{macro_case}",
             caption=(f"Scenario {macro_case.replace('case_', '').replace('_', '')}: "
                      r"car-following models. The macro term converges; the bubble term is "
@@ -1333,7 +1495,7 @@ def write_latex_tables(cache_path="figure_data.csv", out_dir="tables",
                        basename="convergence_tables"):
     """Write both a bare fragment (for \\input) and a standalone document (for rendering)."""
     data = load_figure_data(cache_path)
-    body = latex_convergence_tables(data)
+    body = "\n\n".join([latex_convergence_tables(data), latex_convergence_tables_grouped(data)])
     os.makedirs(out_dir, exist_ok=True)
     fragment = os.path.join(out_dir, f"{basename}.tex")
     with open(fragment, "w") as handle:
@@ -1372,3 +1534,6 @@ def render_latex_pdf(standalone_path, engine=None):
         return None
     print(f"  wrote {pdf}")
     return pdf
+
+if __name__ == "__main__":
+    save_publication_figures("verification_results_full/")

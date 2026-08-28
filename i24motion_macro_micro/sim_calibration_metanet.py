@@ -19,10 +19,13 @@ Two structural differences from the first-order scripts:
   inverting the FD, and the two were verified to agree exactly), but scoring here
   avoids paying for a per-step network clone plus a renderer build on every trial.
 
-Boundary conditions are supplied as fluxes and ghost states rather than by pinning
-the end cells, so all 16 cells per carriageway are genuinely simulated -- see
-`install_boundary_conditions`. `initialize_from_ground_truth` is called with
-drives_boundaries=False to stop the store overwriting boundary cell mass on top.
+Boundary conditions follow METANET's own formulation -- see
+`install_boundary_conditions`. Upstream is a prescribed demand flux plus the speed
+that carries it, so the inlet cell is genuinely simulated and is scored. Downstream,
+the terminal cell is the ghost: it is held at the measurement and excluded from the
+score, which is the classic METANET downstream BC. `initialize_from_ground_truth` is
+called with drives_boundaries=False so the store supplies the initial condition and
+the renderer's heatmap without also overwriting the inlet every step.
 """
 
 from simulation import (
@@ -144,44 +147,61 @@ def suggest_params(trial, lanes: int) -> METANETParams:
     27.4 m/s.
     """
     return METANETParams.from_paper_units(
-        tau_h=trial.suggest_float("tau_s", 1.0, 60.0) / 3600.0,
+        tau_h=trial.suggest_float("tau_s", 1.0, 50.0) / 3600.0,
         eta_km2_per_h=trial.suggest_float("eta_km2_per_h", 1.0, 60.0),
         kappa_veh_per_km_lane=trial.suggest_float("kappa_veh_per_km_lane", 1.0, 100.0),
-        v_free_kmh=trial.suggest_float("v_free_kmh", 40.0, 140.0),
-        rho_crit_veh_per_km_lane=trial.suggest_float("rho_crit_veh_per_km_lane", 15.0, 100.0),
-        alpha=trial.suggest_float("alpha", 0.5, 5.0),
+        v_free_kmh=trial.suggest_float("v_free_kmh", 80.0, 150.0),
+        rho_crit_veh_per_km_lane=trial.suggest_float("rho_crit_veh_per_km_lane", 1.0, 80.0),
+        alpha=trial.suggest_float("alpha", 0.15, 5.0),
         lanes=lanes,
-    ), 15.0 #, trial.suggest_float("jam_threshold", 5.0, 20.0)
+    ), 10.0 #, trial.suggest_float("jam_threshold", 5.0, 20.0)
 
+"""
+    param_dict = {'tau_s': 33.72040903687276, 
+                  'eta_km2_per_h': 47.61756065182183, 
+                  'kappa_veh_per_km_lane': 8.723241418517004, 
+                  'v_free_kmh': 108.10927769531456, 
+                  'rho_crit_veh_per_km_lane': 18.28264894850955, 
+                  'alpha': 2.34894932671552}
+"""
 
-def install_boundary_conditions(sim: Simulation, model: METANETModel) -> None:
+def install_boundary_conditions(
+    sim: Simulation, model: METANETModel, gt_collapsed: GroundTruthStore
+) -> None:
     """Drive the open ends the way METANET expects, rather than pinning their state.
 
-    The paper's boundary conditions are a prescribed upstream demand and a prescribed
-    downstream density, with the end cells still simulated. `simulation.py` already
-    carries every hook for that:
+    Upstream, the paper's boundary condition is a prescribed demand plus the speed
+    that carries it, and `simulation.py` has the hooks for both:
 
         Simulation.inflow_boundary_map      -> external_inflow = min(q_in, supply)
-        Simulation.outflow_boundary_map     -> the discharge at the far end
         METANETModel.upstream_velocity_map  -> v_{x-1} for the convection term
-        METANETModel.downstream_density_map -> rho_{x+1} for the anticipation term
 
-    Two deliberate departures, both because this corridor is measured at both ends:
+    Downstream, the terminal cell IS the ghost: its density is held at the measurement
+    so cell N-1 discharges freely into a real exterior state and reads that state for
+    its anticipation term. The terminal cell is therefore a boundary condition, not a
+    prediction, and `score_run` excludes it.
 
-    - The discharge is prescribed too. The paper lets the last cell empty itself at
-      its own q = rho*v, which is right when nothing downstream is measured, but here
-      it lets the road drift far off the data (down to 93 vehicles against 211 over an
-      hour) without the model being wrong about anything the jam/free metric can see.
-    - There is no measured cell beyond the domain, so the downstream ghost density is
-      the last cell's *own* ground truth. That makes the anticipation term a soft pull
-      toward the data rather than a true exterior state. The alternative is to leave
-      the map unset, which zeroes the term (the model's built-in fallback); neither is
-      clean on a corridor with nothing past the end of it.
+    Do NOT prescribe the discharge through `outflow_boundary_map` instead. That map is
+    applied as a *cap*, `external_outflow = min(demand, q_gt)`, which is one-sided: it
+    stores the surplus of a step where demand exceeds q_gt in the cell but cannot bank
+    the headroom of a step where it falls short, so E[min(D,C)] <= min(E[D],E[C]) and
+    the terminal cell ratchets up without bound. Measured on road 1 it bound on 80% of
+    steps and buried 1038 undischarged vehicles in a 100 m cell (2.1x the measured
+    density). It also feeds back: with `downstream_density_map` keyed by the terminal
+    cell, the ghost is that cell's own measurement, so once rho_sim passes rho_gt the
+    anticipation term turns negative and *accelerates* the cell -- 18 veh/km/lane at
+    25 m/s, a state on no fundamental diagram. Any parameter set calibrated against
+    that cap is fitted to the artifact.
 
-    Written as a *prestep* callback so the maps are current when `_step_active_network`
-    computes the fluxes -- prestep callbacks run before the step callbacks and before
-    the active mesh is built.
+    Registered as both a *prestep* and a *poststep* callback: prestep so the inflow map
+    is current when `_step_active_network` computes the fluxes, poststep so the density
+    neighbours read is the measurement rather than whatever the free discharge left.
+
+    `gt_collapsed` is the store the boundaries are read from; the per-time lookup is
+    built here so callers do not have to reach for the module-level `gt_series`, and so
+    a caller with its own store gets boundaries consistent with it.
     """
+    series = MacroSeries(gt_collapsed)
     inlets, outlets = [], []
     for road_id, road in sim.network.roads.items():
         for cell in road.cells.values():
@@ -194,8 +214,8 @@ def install_boundary_conditions(sim: Simulation, model: METANETModel) -> None:
                 outlets.append((road_id, cell.cell_id))
 
     def update(current_time, resolution):
-        t = gt_series.nearest(current_time)
-        rho_map, v_map = gt_series.density[t], gt_series.velocity[t]
+        t = series.nearest(current_time)
+        rho_map, v_map = series.density[t], series.velocity[t]
         for key in inlets:
             rho, v = rho_map.get(key), v_map.get(key)
             if rho is None or v is None:
@@ -206,13 +226,15 @@ def install_boundary_conditions(sim: Simulation, model: METANETModel) -> None:
             rho, v = rho_map.get(key), v_map.get(key)
             if rho is None:
                 continue
-            # Both maps follow the cell convention: totals across `lanes`. The model
-            # converts to the paper's per-lane density itself.
-            model.downstream_density_map[key] = float(rho)
+            # Ground-truth density follows the cell convention: a total across `lanes`,
+            # which is exactly what `Cell.density` is, so it goes straight into mass.
+            cell = sim.network.get_cell(*key)
+            cell.mass = float(rho) * cell.length
             if v is not None:
-                sim.outflow_boundary_map[key] = float(rho) * float(v)
+                cell.velocity = float(v)
 
     sim.register_prestep_callback(update, "metanet_boundary_conditions")
+    sim.register_poststep_callback(update, "metanet_boundary_conditions_repin")
 
 
 def build_simulation(params_for_lanes) -> tuple[Simulation, METANETModel]:
@@ -270,7 +292,7 @@ def build_simulation(params_for_lanes) -> tuple[Simulation, METANETModel]:
         for cell in road.cells.values():
             if (road_id, cell.cell_id) in v0:
                 cell.velocity = float(v0[(road_id, cell.cell_id)])
-    install_boundary_conditions(sim, model)
+    install_boundary_conditions(sim, model, gt_collapsed)
     return sim, model, JAM_THRESHOLD
 
 
@@ -284,12 +306,18 @@ def run_calibration(trial):
         print("Pruning:", warnings[0])
         raise optuna.TrialPruned()
 
-    cells = sorted(sim.network.roads[ROAD_ID].cells.values(), key=lambda c: c.start_s)
-    scored_keys = [(ROAD_ID, c.cell_id) for c in cells]
-    # Every cell is simulated now that the open ends are driven by flux rather than by
-    # overwriting their state, so this is a diagnostic on the cells furthest from the
-    # boundary conditions rather than a correction for cells that are really data.
-    interior = np.array([bool(c.inflow_connections) and bool(c.outflow_connections) for c in cells])
+    # The terminal cell is the downstream ghost -- install_boundary_conditions holds it
+    # at the measurement -- so scoring it would just be scoring the boundary condition
+    # against itself. The inlet cell IS scored: it only receives a prescribed flux, and
+    # its own density and speed are the model's to get right.
+    cells_road_1 = [("1", c) for c in sorted(sim.network.roads["1"].cells.values(), key=lambda c: c.start_s)
+             if c.outflow_connections]
+    cells_road_2 = [("2", c) for c in sorted(sim.network.roads["2"].cells.values(), key=lambda c: c.start_s)
+             if c.outflow_connections]
+    cells = cells_road_1 + cells_road_2
+    scored_keys = [(road_id, c.cell_id) for (road_id, c) in cells]
+    # Diagnostic on the cells furthest from either boundary condition.
+    interior = np.array([bool(c.inflow_connections) for (_, c) in cells])
 
     sim_velocity: list[list[float]] = []
     sim_density: list[list[float]] = []
@@ -299,8 +327,8 @@ def run_calibration(trial):
     def record(current_time, resolution):
         t = gt_series.nearest(current_time)
         v_map, rho_map = gt_series.velocity[t], gt_series.density[t]
-        sim_velocity.append([float(c.velocity) if c.velocity is not None else 0.0 for c in cells])
-        sim_density.append([float(c.density) for c in cells])
+        sim_velocity.append([float(c.velocity) if c.velocity is not None else 0.0 for (_, c) in cells])
+        sim_density.append([float(c.density) for (_, c) in cells])
         gt_velocity.append([float(v_map[k]) for k in scored_keys])
         gt_density.append([float(rho_map[k]) for k in scored_keys])
 
@@ -354,6 +382,6 @@ def run_calibration(trial):
 
 if __name__ == "__main__":
     study = optuna.create_study()
-    study.optimize(run_calibration, n_trials=500, n_jobs=1)
+    study.optimize(run_calibration, n_trials=5000, n_jobs=1)
     print(study.best_params)
     print(study.best_trial.user_attrs)

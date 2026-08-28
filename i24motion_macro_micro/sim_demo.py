@@ -24,6 +24,7 @@ import sim_calibration_metanet
 from simulation import Simulation, RolloutRenderer, GroundTruthStore, I24WestAndEastNetworkCollapsed, METANETModel, METANETParams, TriangularFD
 from i24_trajectory_replayer import I24TrajectoryReplayer
 from i24_carla_coupler import I24CarlaCoupler
+from i24_sumo_coupler import I24SumoCoupler
 from i24_micro_bridge import I24MicroSimBridge
 from dash import Dash, dcc, html, Input, Output, State, callback
 import plotly.graph_objects as go
@@ -225,6 +226,23 @@ bridge = I24MicroSimBridge(
 )
 """
 
+def run_demo_lwr_triangular():
+    with open("config/2022-11-30.json", "r") as f:
+        config = json.load(f)
+
+    sim = Simulation.from_json(
+        json_path=os.path.join(config["storage_locations"]["simulation_dataset"], "network.json"),
+        time_resolution=config["time_step"],
+        origin_time=config["time_origin"],
+        min_cell_length=100.0
+    )
+
+    gt = GroundTruthStore.from_parquet(os.path.join(config["storage_locations"]["simulation_dataset"], "micro.parquet"), os.path.join(config["storage_locations"]["simulation_dataset"], "macro.parquet"))
+    sim.initialize_from_ground_truth(gt, time_value=config["time_origin"])
+    for i in range(14399):
+        sim.step()
+    run_app(sim, rotation_deg=82.8192)
+
 def run_demo_open_loop():
     with open("i24_motion_to_dataset.json", "r") as f:
         config = json.load(f)
@@ -334,6 +352,92 @@ def run_demo_carla():
         sim.step()
     run_app(sim, rotation_deg=82.8192)
 
+def run_demo_sumo():
+    with open("i24_motion_to_dataset.json", "r") as f:
+        config = json.load(f)
+
+    sim = Simulation.from_json(
+        json_path=os.path.join(config["storage_locations"]["simulation_dataset"], "network.json"),
+        time_resolution=config["time_step"],
+        origin_time=config["time_origin"],
+        min_cell_length=100.0
+    )
+
+    gt = GroundTruthStore.from_parquet(os.path.join(config["storage_locations"]["simulation_dataset"], "micro.parquet"), os.path.join(config["storage_locations"]["simulation_dataset"], "macro.parquet"))
+    sim.initialize_from_ground_truth(gt, time_value=config["time_origin"])
+    coupler = I24SumoCoupler(
+        gt,
+        dt=config["time_step"],
+        lanes=[-1, -2, -3, -4],
+        mapping=config,
+        hero_road="2",
+        desired_time=config["time_origin"],
+        desired_s=350.0,
+        visible_window=150.0,
+        ghost_window=0.0,
+        step_length=0.1,
+        seed=42,
+        gui=False,
+        verbose=True,
+    )
+    #I24CarlaCoupler(gt, dt=1.0, lanes=[-1, -2, -3, -4], mapping=config, hero_road="2", desired_time=config["time_origin"], desired_s=350.0, visible_window=150.0, ghost_window=0.0, bev_video_path="carla_camera_1_low_congestion")
+    bridge = I24MicroSimBridge(
+        sim=sim,
+        road_id="2",
+        lanes=[-1, -2, -3, -4],
+        initial_middle_s=350.0,
+        margin_s=150.0,
+        max_middle_s=1300,
+        micro_coupler=coupler,
+        bridge_callback_name="bridge_step"
+    )
+    bridge_time_step = 360.0 #1200.0 #360.0 #1080.0
+    bridge_time_window = 90.0
+    current_bridge_iteration = 1
+    def update_bridge_callback(current_time, resolution):
+        nonlocal bridge
+        nonlocal bridge_time_step
+        nonlocal current_bridge_iteration
+        nonlocal sim
+        if ((current_time - sim.origin_time) >= ((bridge_time_step * (current_bridge_iteration - 1)) + bridge_time_window)) and (bridge.running):
+            print("Resetting bridge!")
+            if (bridge.running):
+                bridge.destroy()
+        if ((current_time - sim.origin_time) >= (bridge_time_step * (current_bridge_iteration))):
+            current_bridge_iteration += 1
+            coupler = I24SumoCoupler(
+                gt,
+                dt=config["time_step"],
+                lanes=[-1, -2, -3, -4],
+                mapping=config,
+                hero_road="2",
+                desired_time=sim.current_time,
+                desired_s=350.0,
+                visible_window=150.0,
+                ghost_window=0.0,
+                step_length=0.1,
+                seed=42,
+                gui=False,
+                verbose=True,
+            )
+            #I24CarlaCoupler(gt, dt=1.0, lanes=[-1, -2, -3, -4], mapping=config, hero_road="2", desired_time=sim.current_time, desired_s=350.0, visible_window=150.0, ghost_window=0.0, bev_video_path=f"carla_camera_{current_bridge_iteration}_low_congestion")
+            bridge = I24MicroSimBridge(
+                sim=sim,
+                road_id="2",
+                lanes=[-1, -2, -3, -4],
+                initial_middle_s=350.0,
+                margin_s=150.0,
+                max_middle_s=1300,
+                micro_coupler=coupler,
+                bridge_callback_name="bridge_step"
+            )
+            #bridge._step(sim.current_time, sim.time_resolution)
+            print("Bridge reset!")
+    sim.register_step_callback(update_bridge_callback, "bridge_restart")
+    for i in range(3599):
+        sim.step()
+    run_app(sim, rotation_deg=82.8192)
+
 def run_demo_metanet():
     """
     -0.7499999999999981 -0.8339045886961388
@@ -374,12 +478,12 @@ def run_demo_metanet():
                   'rho_crit_veh_per_km_lane': 56.0129859172635, 
                   'alpha': 3.437269967637944}
     """
-    param_dict = {'tau_s': 43.164200788896046, 
-                  'eta_km2_per_h': 58.568518349307425, 
-                  'kappa_veh_per_km_lane': 28.33113239006788, 
-                  'v_free_kmh': 84.25118380338283, 
-                  'rho_crit_veh_per_km_lane': 22.680665531296675, 
-                  'alpha': 4.566277768236043}
+    param_dict = {'tau_s': 30.376601542684984, 
+                  'eta_km2_per_h': 50.49894847234014, 
+                  'kappa_veh_per_km_lane': 17.004542409940868, 
+                  'v_free_kmh': 107.36993061424273, 
+                  'rho_crit_veh_per_km_lane': 18.562273787100544, 
+                  'alpha': 2.1228564728742834}
     #{'jam_recall': 0.7997352927753183, 'free_recall': 0.8387589013224821, 'metric_interior': -1.6210698664883636, 'velocity_rmse': 3.88641774859314, 'density_rmse': 0.03729489497405928}
     params = METANETParams.from_paper_units(tau_h=param_dict["tau_s"] / 3600.0,
         eta_km2_per_h=param_dict["eta_km2_per_h"],
@@ -403,39 +507,17 @@ def run_demo_metanet():
 
     t0 = float(config["time_origin"])
     sim.initialize_from_ground_truth(sim_calibration_metanet.gt_collapsed, time_value=t0, drives_boundaries=False)
-    inlets, outlets = [], []
-    for road_id, road in sim.network.roads.items():
-        for cell in road.cells.values():
-            # The same test apply_density_snapshot_to_network_boundaries uses to pick
-            # its targets, so the two treatments select exactly the same cells and no
-            # cell ends up both pinned and flux-driven.
-            if not cell.inflow_connections:
-                inlets.append((road_id, cell.cell_id))
-            if not cell.outflow_connections:
-                outlets.append((road_id, cell.cell_id))
-    def update(current_time, resolution):
-        t = sim_calibration_metanet.gt_series.nearest(current_time)
-        rho_map, v_map = sim_calibration_metanet.gt_series.density[t], sim_calibration_metanet.gt_series.velocity[t]
-        for key in inlets:
-            rho, v = rho_map.get(key), v_map.get(key)
-            if rho is None or v is None:
-                continue
-            sim.inflow_boundary_map[key] = float(rho) * float(v)
-            model.upstream_velocity_map[key] = float(v)
-        for key in outlets:
-            rho, v = rho_map.get(key), v_map.get(key)
-            if rho is None:
-                continue
-            # Both maps follow the cell convention: totals across `lanes`. The model
-            # converts to the paper's per-lane density itself.
-            model.downstream_density_map[key] = float(rho)
-            if v is not None:
-                sim.outflow_boundary_map[key] = float(rho) * float(v)
-
-    sim.register_prestep_callback(update, "metanet_boundary_conditions")
+    # Shared with the calibration rather than copied: this used to be an inline
+    # duplicate, and it drifted into prescribing the discharge through
+    # outflow_boundary_map. That map is applied as min(demand, q_gt), a one-sided cap
+    # that buried 1038 undischarged vehicles in road 1's 100 m terminal cell over an
+    # hour and drove it to 2.1x the measured density.
+    sim_calibration_metanet.install_boundary_conditions(
+        sim, model, sim_calibration_metanet.gt_collapsed
+    )
     for i in range(3599):
         sim.step()
     run_app(sim, rotation_deg=82.8192)
 
 if __name__ == "__main__":
-    run_demo_metanet()
+    run_demo_lwr_triangular()
