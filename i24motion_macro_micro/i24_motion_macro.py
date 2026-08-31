@@ -10,75 +10,75 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-def fft_four_convs(Dp, Mp, k_cong, k_free, eps=1e-12, use_ortho=True):
+def fft_four_convs(dp, mp, k_cong, k_free, eps=1e-12, use_ortho=True):
     """
     Compute via FFT:
-        sum_cong = conv2d(Dp, k_cong)
-        sum_free = conv2d(Dp, k_free)
-        N_cong   = conv2d(Mp, k_cong)
-        N_free   = conv2d(Mp, k_free)
+        sum_cong = conv2d(dp, k_cong)
+        sum_free = conv2d(dp, k_free)
+        n_cong   = conv2d(mp, k_cong)
+        n_free   = conv2d(mp, k_free)
     Inputs:
-      Dp, Mp:   (B, C, H, W)
-      k_cong,:  (F, C, Kh, Kw)
-      k_free:   (F, C, Kh, Kw)
+      dp, mp:   (B, C, H, W)
+      k_cong,:  (F, C, kh, kw)
+      k_free:   (F, C, kh, kw)
     Returns:
-      sum_cong, N_cong, sum_free, N_free each of shape (B, F, H-Kh+1, W-Kw+1)
+      sum_cong, n_cong, sum_free, n_free each of shape (B, F, H-kh+1, W-kw+1)
     """
     #  sanitize inputs ———
-    Dp = torch.nan_to_num(Dp, nan=0.0, posinf=0.0, neginf=0.0)
-    Mp = torch.nan_to_num(Mp, nan=0.0, posinf=0.0, neginf=0.0)
+    dp = torch.nan_to_num(dp, nan=0.0, posinf=0.0, neginf=0.0)
+    mp = torch.nan_to_num(mp, nan=0.0, posinf=0.0, neginf=0.0)
 
-    B, C, H, W        = Dp.shape
-    F, _, Kh, Kw      = k_cong.shape
-    Fh, Fw            = H + Kh - 1, W + Kw - 1
-    device, dtype     = Dp.device, Dp.dtype
+    B, C, H, W        = dp.shape
+    F, _, kh, kw      = k_cong.shape
+    fh, fw            = H + kh - 1, W + kw - 1
+    device, dtype     = dp.device, dp.dtype
 
     # ——— pad inputs ———
-    print(B, C, Fh, Fw)
-    Dp_pad = torch.zeros(B, C, Fh, Fw, device=device, dtype=dtype)
-    Mp_pad = torch.zeros(B, C, Fh, Fw, device=device, dtype=dtype)
-    Dp_pad[..., :H, :W] = Dp
-    Mp_pad[..., :H, :W] = Mp
+    print(B, C, fh, fw)
+    dp_pad = torch.zeros(B, C, fh, fw, device=device, dtype=dtype)
+    mp_pad = torch.zeros(B, C, fh, fw, device=device, dtype=dtype)
+    dp_pad[..., :H, :W] = dp
+    mp_pad[..., :H, :W] = mp
 
     # ——— pad kernels ———
-    k1_pad = torch.zeros(F, C, Fh, Fw, device=device, dtype=dtype)
-    k2_pad = torch.zeros(F, C, Fh, Fw, device=device, dtype=dtype)
-    k1_pad[..., :Kh, :Kw] = k_cong
-    k2_pad[..., :Kh, :Kw] = k_free
+    k1_pad = torch.zeros(F, C, fh, fw, device=device, dtype=dtype)
+    k2_pad = torch.zeros(F, C, fh, fw, device=device, dtype=dtype)
+    k1_pad[..., :kh, :kw] = k_cong
+    k2_pad[..., :kh, :kw] = k_free
 
     # choose normalization
     norm = "ortho" if use_ortho else None
 
     # ——— FFT both inputs and kernels ———
-    Df  = torch.fft.rfftn(Dp_pad, dim=(-2, -1), s=(Fh, Fw), norm=norm)
-    Mf  = torch.fft.rfftn(Mp_pad, dim=(-2, -1), s=(Fh, Fw), norm=norm)
-    Kf1 = torch.fft.rfftn(k1_pad, dim=(-2, -1), s=(Fh, Fw), norm=norm)
-    Kf2 = torch.fft.rfftn(k2_pad, dim=(-2, -1), s=(Fh, Fw), norm=norm)
+    df  = torch.fft.rfftn(dp_pad, dim=(-2, -1), s=(fh, fw), norm=norm)
+    mf  = torch.fft.rfftn(mp_pad, dim=(-2, -1), s=(fh, fw), norm=norm)
+    kf1 = torch.fft.rfftn(k1_pad, dim=(-2, -1), s=(fh, fw), norm=norm)
+    kf2 = torch.fft.rfftn(k2_pad, dim=(-2, -1), s=(fh, fw), norm=norm)
 
     # ——— pointwise multiply in freq domain ———
-    Y1 = Df * Kf1    # for sum_cong
-    Y2 = Df * Kf2    # for sum_free
-    Z1 = Mf * Kf1    # for N_cong
-    Z2 = Mf * Kf2    # for N_free
+    Y1 = df * kf1    # for sum_cong
+    Y2 = df * kf2    # for sum_free
+    Z1 = mf * kf1    # for n_cong
+    Z2 = mf * kf2    # for n_free
 
     # ——— inverse FFT back to real ———
-    y1 = torch.fft.irfftn(Y1, dim=(-2, -1), s=(Fh, Fw), norm=norm)
-    y2 = torch.fft.irfftn(Y2, dim=(-2, -1), s=(Fh, Fw), norm=norm)
-    z1 = torch.fft.irfftn(Z1, dim=(-2, -1), s=(Fh, Fw), norm=norm)
-    z2 = torch.fft.irfftn(Z2, dim=(-2, -1), s=(Fh, Fw), norm=norm)
+    y1 = torch.fft.irfftn(Y1, dim=(-2, -1), s=(fh, fw), norm=norm)
+    y2 = torch.fft.irfftn(Y2, dim=(-2, -1), s=(fh, fw), norm=norm)
+    z1 = torch.fft.irfftn(Z1, dim=(-2, -1), s=(fh, fw), norm=norm)
+    z2 = torch.fft.irfftn(Z2, dim=(-2, -1), s=(fh, fw), norm=norm)
 
     # ——— crop “valid” region ———
-    oh, ow = H - Kh + 1, W - Kw + 1
-    sum_cong = y1[..., Kh-1:Kh-1+oh, Kw-1:Kw-1+ow]
-    sum_free = y2[..., Kh-1:Kh-1+oh, Kw-1:Kw-1+ow]
-    N_cong   = z1[..., Kh-1:Kh-1+oh, Kw-1:Kw-1+ow]
-    N_free   = z2[..., Kh-1:Kh-1+oh, Kw-1:Kw-1+ow]
+    oh, ow = H - kh + 1, W - kw + 1
+    sum_cong = y1[..., kh-1:kh-1+oh, kw-1:kw-1+ow]
+    sum_free = y2[..., kh-1:kh-1+oh, kw-1:kw-1+ow]
+    n_cong   = z1[..., kh-1:kh-1+oh, kw-1:kw-1+ow]
+    n_free   = z2[..., kh-1:kh-1+oh, kw-1:kw-1+ow]
 
     # ——— optional epsilon to counts to avoid zero division downstream ———
-    N_cong = N_cong + eps
-    N_free = N_free + eps
+    n_cong = n_cong + eps
+    n_free = n_free + eps
 
-    return sum_cong, N_cong, sum_free, N_free
+    return sum_cong, n_cong, sum_free, n_free
 
 class AdaptiveSmoothing(nn.Module):
     def __init__(self,
@@ -141,18 +141,18 @@ class AdaptiveSmoothing(nn.Module):
 
         #pad = (self.size_t, self.size_t, self.size_x, self.size_x) # to deal with the edge effects
         pad = (self.size_x, self.size_x, self.size_t, self.size_t) # to deal with the edge effects
-        Dp = F.pad(data, pad, value=0.0)
-        Mp = F.pad(mask, pad, value=0.0)
+        dp = F.pad(data, pad, value=0.0)
+        mp = F.pad(mask, pad, value=0.0)
 
-        sum_cong = F.conv2d(Dp, k_cong)
-        N_cong   = F.conv2d(Mp, k_cong)
-        sum_free = F.conv2d(Dp, k_free)
-        N_free   = F.conv2d(Mp, k_free)
+        sum_cong = F.conv2d(dp, k_cong)
+        n_cong   = F.conv2d(mp, k_cong)
+        sum_free = F.conv2d(dp, k_free)
+        n_free   = F.conv2d(mp, k_free)
         # use FFT to compute the convolutions
-        #sum_cong, N_cong, sum_free, N_free = fft_four_convs(Dp, Mp, k_cong, k_free)
+        #sum_cong, n_cong, sum_free, n_free = fft_four_convs(dp, mp, k_cong, k_free)
 
-        v_cong = sum_cong / N_cong
-        v_free = sum_free / N_free
+        v_cong = sum_cong / n_cong
+        v_free = sum_free / n_free
 
         if (w is None):
             if (self.high_is_congestion):
@@ -163,14 +163,14 @@ class AdaptiveSmoothing(nn.Module):
                 w = 0.5 * (1 + torch.tanh((self.v_thr - v_min) / self.v_delta))
         
         v = w * v_cong + (1 - w) * v_free
-        valid_cong = (N_cong > 0).float()
-        valid_free = (N_free > 0).float()
+        valid_cong = (n_cong > 0).float()
+        valid_free = (n_free > 0).float()
         # if no cong data → use free; if no free data → use cong
         v = valid_cong*valid_free*v + (1-valid_cong)*v_free + (1-valid_free)*v_cong
         # check if there's nan if so print
         if torch.isnan(v).any():
             print("Warning! NaN detected in output")
-            print(N_cong)
+            print(n_cong)
         # print size of v
         return v.squeeze(1), w
 
@@ -189,14 +189,14 @@ class I24MotionMacro:
         self.lanes = i24_motion_data.I24MotionData.road_lane_lookup[road_id]
         self.lane_asm_calibrations = i24_motion_data.I24MotionData.road_lane_asm_lookup[road_id]
 
-    def computeBox(self, time_index, long_cell_index):
+    def compute_box(self, time_index, long_cell_index):
         return {
             "time": {"min": (time_index * self.time_delta) + self.data_source.timestamp_min, "max": ((time_index + 1) * self.time_delta) + self.data_source.timestamp_min},
             "position": {"min": long_cell_index * self.longitudinal_cell_size, "max": (long_cell_index + 1) * self.longitudinal_cell_size}
         }
     
     @staticmethod
-    def vehiclesInBox(vehicles):
+    def vehicles_in_box(vehicles):
         vehicles_sorted_by_time = vehicles.sort_values(by='time', ascending=True)
         vehicle_ids = vehicles_sorted_by_time["id"].unique().tolist()
         result = {}
@@ -204,7 +204,7 @@ class I24MotionMacro:
             result[id] = vehicles_sorted_by_time[vehicles_sorted_by_time["id"] == id]
         return result
     
-    def computeEdieBoxQueries(self):
+    def compute_edie_box_queries(self):
         timestamp_mins = numpy.arange(self.data_source.timestamp_min, self.data_source.timestamp_max, self.time_delta)
         s_mins = numpy.arange(self.data_source.s_min, self.data_source.s_max, self.longitudinal_cell_size)
         queries = {"timestamp_min": [], "timestamp_max": [], "s_min": [], "s_max": []}
@@ -215,47 +215,47 @@ class I24MotionMacro:
             queries["s_max"].append(r[1] + self.longitudinal_cell_size)
         return queries
     
-    def queryEdieBoxes(self, queries):
+    def query_edie_boxes(self, queries):
         return self.data_source.queryEdieBoxBatch(queries["timestamp_min"], queries["timestamp_max"], queries["s_min"], queries["s_max"])
     
-    def pickleEdieBoxResults(self, query_results):
+    def pickle_edie_box_results(self, query_results):
         path = os.path.join(self.data_folder, "raw_trajectories.pickle")
         with open(path, "wb") as file:
             pickle.dump(query_results, file)
 
-    def unpickleEdieBoxResults(self):
+    def unpickle_edie_box_results(self):
         path = os.path.join(self.data_folder, "raw_trajectories.pickle")
         with open(path, "rb") as file:
             return pickle.load(file)
         
-    def pickleRawMacroData(self, lane, raw_macro):
+    def pickle_raw_macro_data(self, lane, raw_macro):
         folder = os.path.join(self.data_folder, str(lane))
         data_file = os.path.join(folder, "raw_macro.pickle")
         os.makedirs(folder, exist_ok=True)
         with open(data_file, "wb") as file:
             pickle.dump(raw_macro, file)
 
-    def unpickleRawMacroData(self, lane):
+    def unpickle_raw_macro_data(self, lane):
         folder = os.path.join(self.data_folder, str(lane))
         data_file = os.path.join(folder, "raw_macro.pickle")
         with open(data_file, "rb") as file:
             return pickle.load(file)
         
-    def pickleProcessedMacroData(self, lane, processed_macro):
+    def pickle_processed_macro_data(self, lane, processed_macro):
         folder = os.path.join(self.data_folder, str(lane))
         data_file = os.path.join(folder, "processed_macro.pickle")
         os.makedirs(folder, exist_ok=True)
         with open(data_file, "wb") as file:
             pickle.dump(processed_macro, file)
 
-    def unpickleProcessedMacroData(self, lane):
+    def unpickle_processed_macro_data(self, lane):
         folder = os.path.join(self.data_folder, str(lane))
         data_file = os.path.join(folder, "processed_macro.pickle")
         with open(data_file, "rb") as file:
             return pickle.load(file)
     
     @staticmethod
-    def edieTotals(vehicles, time_delta, sample_delta=None):
+    def edie_totals(vehicles, time_delta, sample_delta=None):
         """Edie's total time spent (veh*s) and total distance travelled (veh*m) in one box.
 
         `vehicles` maps vehicle id -> that vehicle's samples inside the box, ordered by
@@ -334,15 +334,15 @@ class I24MotionMacro:
             return float('nan')
     
     @staticmethod
-    def computeMacroData(queries, query_results, lane, longitudinal_cell_size, time_delta, max_velocity, min_velocity):
+    def compute_macro_data(queries, query_results, lane, longitudinal_cell_size, time_delta, max_velocity, min_velocity):
         density_result = numpy.zeros(len(query_results), dtype=numpy.float32)
         velocity_result = numpy.zeros(len(query_results), dtype=numpy.float32)
         flow_result = numpy.zeros(len(query_results), dtype=numpy.float32)
         for i, (timestamp_min, timestamp_max, s_min, s_max) in enumerate(zip(queries["timestamp_min"], queries["timestamp_max"], queries["s_min"], queries["s_max"])):
             if (lane in query_results[i]):
                 lane_data = query_results[i][lane]
-                vehicles = I24MotionMacro.vehiclesInBox(lane_data)
-                total_time, total_distance = I24MotionMacro.edieTotals(vehicles, time_delta)
+                vehicles = I24MotionMacro.vehicles_in_box(lane_data)
+                total_time, total_distance = I24MotionMacro.edie_totals(vehicles, time_delta)
                 density_result[i] = I24MotionMacro.density(total_time, longitudinal_cell_size, time_delta)
                 velocity_result[i] = I24MotionMacro.velocity(total_time, total_distance, max_velocity, min_velocity)
                 flow_result[i] = I24MotionMacro.flow(density_result[i], velocity_result[i])
@@ -350,29 +350,29 @@ class I24MotionMacro:
                 print(i)
         return density_result, velocity_result, flow_result
     
-    def createRawMacroData(self):
-        queries = self.computeEdieBoxQueries()
-        #query_results = self.unpickleEdieBoxResults()
-        query_results = self.queryEdieBoxes(queries)
-        self.pickleEdieBoxResults(query_results)
+    def create_raw_macro_data(self):
+        queries = self.compute_edie_box_queries()
+        #query_results = self.unpickle_edie_box_results()
+        query_results = self.query_edie_boxes(queries)
+        self.pickle_edie_box_results(query_results)
         raw_macro_data = {}
         for lane in self.lanes:
             raw_macro_data[lane] = {}
-            (lane_density, lane_velocity, lane_flow) = I24MotionMacro.computeMacroData(queries, query_results, lane, self.longitudinal_cell_size, self.time_delta, self.max_velocity, self.min_velocity)
+            (lane_density, lane_velocity, lane_flow) = I24MotionMacro.compute_macro_data(queries, query_results, lane, self.longitudinal_cell_size, self.time_delta, self.max_velocity, self.min_velocity)
             raw_macro_data[lane]["density"] = lane_density
             raw_macro_data[lane]["velocity"] = lane_velocity
             raw_macro_data[lane]["flow"] = lane_flow
-            self.pickleRawMacroData(lane, raw_macro_data[lane])
+            self.pickle_raw_macro_data(lane, raw_macro_data[lane])
 
-    def loadRawMacroData(self):
+    def load_raw_macro_data(self):
         raw_macro_data = {}
         for lane in self.lanes:
             raw_macro_data[lane] = {}
-            raw_macro_data[lane] = self.unpickleRawMacroData(lane)
+            raw_macro_data[lane] = self.unpickle_raw_macro_data(lane)
         return raw_macro_data
     
-    def createProcessedMacroData(self):
-        raw_macro_data = self.loadRawMacroData()
+    def create_processed_macro_data(self):
+        raw_macro_data = self.load_raw_macro_data()
         print("Raw data loaded!")
         s_size = self.data_source.s_max - self.data_source.s_min
         t_size = self.data_source.timestamp_max - self.data_source.timestamp_min
@@ -380,7 +380,7 @@ class I24MotionMacro:
         outage_locations = self.config["road_data"][str(self.road_id)]["outage_locations"]
         with torch.no_grad():
             outage_mask = []
-            queries = self.computeEdieBoxQueries()
+            queries = self.compute_edie_box_queries()
             for i, entry in enumerate(zip(queries['s_min'], queries['s_max'])):
                 s_min, s_max = entry[0], entry[1]
                 outage_mask.append(False)
@@ -437,14 +437,14 @@ class I24MotionMacro:
                 processed_macro_data["density"] = density_asm_output
                 processed_macro_data["flow"] = flow_asm_output
                 print("Pickling processed data!")
-                self.pickleProcessedMacroData(lane, processed_macro_data)
+                self.pickle_processed_macro_data(lane, processed_macro_data)
                 print(f"Picked lane {lane}!")
 
-    def loadProcessedMacroData(self):
+    def load_processed_macro_data(self):
         processed_macro_data = {}
         for lane in self.lanes:
             processed_macro_data[lane] = {}
-            processed_macro_data[lane] = self.unpickleProcessedMacroData(lane)
+            processed_macro_data[lane] = self.unpickle_processed_macro_data(lane)
         return processed_macro_data
         
 if __name__ == "__main__":
@@ -454,17 +454,17 @@ if __name__ == "__main__":
     print("Creating macro processing object...")
     macro = I24MotionMacro(data_source, 2, "road_2")
     print("Creating raw macro data and saving it...")
-    #macro.createRawMacroData()
+    #macro.create_raw_macro_data()
     print("Creating processed macro and saving it...")
-    macro.createProcessedMacroData()
+    macro.create_processed_macro_data()
     print("Loading data source...")
     data_source = i24_motion_data.I24MotionData(1, 1669812350, 1669812350+3600, 0, 1600)
     print("Creating macro processing object...")
     macro = I24MotionMacro(data_source, 1, "road_1")
     print("Creating raw macro data and saving it...")
-    macro.createRawMacroData()
+    macro.create_raw_macro_data()
     print("Creating processed macro and saving it...")
-    macro.createProcessedMacroData()
+    macro.create_processed_macro_data()
     """
     config_folder = "config/"
     datasets = os.listdir(config_folder)
@@ -481,14 +481,14 @@ if __name__ == "__main__":
         print("Creating macro processing object...")
         macro = I24MotionMacro(data_source, 2, "road_2", config_path=config_path)
         print("Creating raw macro data and saving it...")
-        macro.createRawMacroData()
+        macro.create_raw_macro_data()
         print("Creating processed macro and saving it...")
-        macro.createProcessedMacroData()
+        macro.create_processed_macro_data()
         print("Loading data source...")
         data_source = i24_motion_data.I24MotionData(1, time_origin, time_origin+time_length, 0, road_length_2, config_path=config_path)
         print("Creating macro processing object...")
         macro = I24MotionMacro(data_source, 1, "road_1", config_path=config_path)
         print("Creating raw macro data and saving it...")
-        macro.createRawMacroData()
+        macro.create_raw_macro_data()
         print("Creating processed macro and saving it...")
-        macro.createProcessedMacroData()
+        macro.create_processed_macro_data()

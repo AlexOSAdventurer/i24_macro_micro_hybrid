@@ -122,35 +122,35 @@ class I24MotionSumoSimulationCoupled:
     # Identifiers and geometry
     # ------------------------------------------------------------------
 
-    def edgeID(self, road_id) -> str:
+    def edge_id(self, road_id) -> str:
         return "-" + str(road_id)
 
-    def roadIDFromEdge(self, edge_id: str) -> Optional[str]:
+    def road_id_from_edge(self, edge_id: str) -> Optional[str]:
         if not edge_id.startswith("-"):
             return None
         return edge_id[1:]
 
-    def laneCount(self, road_id) -> int:
+    def lane_count(self, road_id) -> int:
         return int(self.mapping[str(road_id)]["lanes"])
 
-    def laneIndex(self, road_id, lane_id) -> int:
+    def lane_index(self, road_id, lane_id) -> int:
         """OpenDRIVE lane id -> SUMO lane index. Lane -1 is the innermost."""
-        return self.laneCount(road_id) + int(lane_id)
+        return self.lane_count(road_id) + int(lane_id)
 
-    def openDriveLane(self, road_id, lane_index) -> int:
-        return int(lane_index) - self.laneCount(road_id)
+    def open_drive_lane(self, road_id, lane_index) -> int:
+        return int(lane_index) - self.lane_count(road_id)
 
-    def laneID(self, road_id, lane_id) -> str:
-        return f"{self.edgeID(road_id)}_{self.laneIndex(road_id, lane_id)}"
+    def lane_id(self, road_id, lane_id) -> str:
+        return f"{self.edge_id(road_id)}_{self.lane_index(road_id, lane_id)}"
 
-    def vehicleID(self, cosim_id) -> str:
+    def vehicle_id(self, cosim_id) -> str:
         return f"v{int(cosim_id)}"
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
-    def _importSumo(self):
+    def _import_sumo(self):
         if self.use_libsumo:
             import libsumo
 
@@ -170,7 +170,7 @@ class I24MotionSumoSimulationCoupled:
         except Exception:
             return name
 
-    def _buildCommand(self) -> List[str]:
+    def _build_command(self) -> List[str]:
         command = [
             self._binary(),
             "-n",
@@ -200,7 +200,7 @@ class I24MotionSumoSimulationCoupled:
         command += self.extra_args
         return command
 
-    def _registerRoutes(self):
+    def _register_routes(self):
         """One route per coupled road: the mainline edge plus whatever follows it.
 
         The bubble never reaches the end of the mainline in the configured runs,
@@ -209,7 +209,7 @@ class I24MotionSumoSimulationCoupled:
         """
         net = self._sumolib.net.readNet(self.net_file)
         for road_id in self.mapping:
-            edge_id = self.edgeID(road_id)
+            edge_id = self.edge_id(road_id)
             try:
                 edge = net.getEdge(edge_id)
             except KeyError:
@@ -219,9 +219,9 @@ class I24MotionSumoSimulationCoupled:
             self.conn.route.add(route_id, edges)
             self.route_ids[str(road_id)] = route_id
 
-    def connectToHost(self):
-        self._importSumo()
-        command = self._buildCommand()
+    def connect_to_host(self):
+        self._import_sumo()
+        command = self._build_command()
         if self.use_libsumo:
             self._traci.start(command)
             self.conn = self._traci
@@ -230,21 +230,21 @@ class I24MotionSumoSimulationCoupled:
             self.conn = self._traci.getConnection(self.label)
         self.started = True
 
-    def initializeSimulation(self):
-        self.connectToHost()
-        self._registerRoutes()
+    def initialize_simulation(self):
+        self.connect_to_host()
+        self._register_routes()
         self.current_timestamp = self.coupler.current_timestamp
         if self.hero_policy is not None:
             self.hero_policy.reset(self)
-        self.spawnHeroVehicle()
-        self.spawnAndDespawnVisibleVehiclesFromCoSIM()
+        self.spawn_hero_vehicle()
+        self.spawn_and_despawn_visible_vehicles_from_co_sim()
         # Deliberately no simulationStep() here. Stepping now would advance every
         # vehicle by one substep that the coupler's clock never sees, putting the
         # seeded positions permanently out of step with self.current_timestamp.
-        # The first runSimulationOver() steps before it reads anything back, so
+        # The first run_simulation_over() steps before it reads anything back, so
         # the forced insertions are in the network by the time they are sampled.
 
-    def destroySimulation(self):
+    def destroy_simulation(self):
         if not self.started:
             return
         try:
@@ -259,7 +259,7 @@ class I24MotionSumoSimulationCoupled:
     # Spawning and despawning
     # ------------------------------------------------------------------
 
-    def _trackingRecord(self, cosim_data, veh_id, spawn_side):
+    def _tracking_record(self, cosim_data, veh_id, spawn_side):
         return {
             "sumo_id": veh_id,
             "cosim_data": cosim_data,
@@ -271,26 +271,26 @@ class I24MotionSumoSimulationCoupled:
             "last_lane_id": int(cosim_data["lane_id"]),
         }
 
-    def _spawnSideFor(self, cosim_data) -> str:
+    def _spawn_side_for(self, cosim_data) -> str:
         """Which bubble boundary this vehicle entered through.
 
         Used to refund the right flux memory if the insertion turns out to have
         failed, so a rejected spawn exactly undoes the decrement that paid for it.
         """
-        window = self.coupler.getCurrentVisibleWindow()
+        window = self.coupler.get_current_visible_window()
         centre = 0.5 * (window[2] + window[3])
         return "rear" if float(cosim_data["s"]) < centre else "front"
 
-    def spawnVehicleFromCoSIM(self, cosim_data) -> Optional[str]:
+    def spawn_vehicle_from_co_sim(self, cosim_data) -> Optional[str]:
         road_id = str(cosim_data["road_id"])
         route_id = self.route_ids.get(road_id)
         if route_id is None:
             print(f"WARNING: no SUMO route registered for road {road_id}; cannot spawn {cosim_data['id']}")
             return None
 
-        veh_id = self.vehicleID(cosim_data["id"])
-        lane_index = self.laneIndex(road_id, cosim_data["lane_id"])
-        lane_id = self.laneID(road_id, cosim_data["lane_id"])
+        veh_id = self.vehicle_id(cosim_data["id"])
+        lane_index = self.lane_index(road_id, cosim_data["lane_id"])
+        lane_id = self.lane_id(road_id, cosim_data["lane_id"])
         length = max(float(cosim_data["length"]), self.min_vehicle_length)
         width = max(float(cosim_data["width"]), self.min_vehicle_width)
         speed = max(0.0, float(cosim_data["velocity"]))
@@ -325,74 +325,74 @@ class I24MotionSumoSimulationCoupled:
             print(f"WARNING: could not place {veh_id} at {lane_id}@{front_pos:.2f}: {exc}")
         return veh_id
 
-    def spawnHeroVehicle(self):
-        cosim_data = self.coupler.getHeroData()
-        veh_id = self.spawnVehicleFromCoSIM(cosim_data)
+    def spawn_hero_vehicle(self):
+        cosim_data = self.coupler.get_hero_data()
+        veh_id = self.spawn_vehicle_from_co_sim(cosim_data)
         if veh_id is None:
             raise RuntimeError(f"Failed to insert the hero vehicle into SUMO: {cosim_data}")
-        self.hero_state = self._trackingRecord(cosim_data, veh_id, self._spawnSideFor(cosim_data))
+        self.hero_state = self._tracking_record(cosim_data, veh_id, self._spawn_side_for(cosim_data))
         try:
             self.conn.vehicle.setColor(veh_id, (255, 0, 0, 255))
         except Exception:
             pass
 
-    def spawnVisibleVehicle(self, cosim_data):
-        veh_id = self.spawnVehicleFromCoSIM(cosim_data)
+    def spawn_visible_vehicle(self, cosim_data):
+        veh_id = self.spawn_vehicle_from_co_sim(cosim_data)
         if veh_id is None:
             # Nothing entered the engine, so give the mass straight back.
-            self.coupler.creditLostVehicle(int(cosim_data["lane_id"]), self._spawnSideFor(cosim_data))
+            self.coupler.credit_lost_vehicle(int(cosim_data["lane_id"]), self._spawn_side_for(cosim_data))
             return
-        self.visible_states[cosim_data["id"]] = self._trackingRecord(
-            cosim_data, veh_id, self._spawnSideFor(cosim_data)
+        self.visible_states[cosim_data["id"]] = self._tracking_record(
+            cosim_data, veh_id, self._spawn_side_for(cosim_data)
         )
 
-    def despawnVehicle(self, record):
+    def despawn_vehicle(self, record):
         try:
             self.conn.vehicle.remove(record["sumo_id"])
         except Exception:
             pass  # Already gone from SUMO's side.
 
-    def despawnVisibleVehicle(self, record):
-        self.despawnVehicle(record)
+    def despawn_visible_vehicle(self, record):
+        self.despawn_vehicle(record)
         self.visible_states.pop(record["cosim_data"]["id"], None)
         self.lead_controlled.pop(record["cosim_data"]["id"], None)
 
-    def resetVisibleStates(self):
+    def reset_visible_states(self):
         self.visible_states = {}
 
-    def spawnAndDespawnVisibleVehiclesFromCoSIM(self):
-        cosim_visible_vehicles = self.coupler.getVisibleData()
-        self.resetVisibleStates()
+    def spawn_and_despawn_visible_vehicles_from_co_sim(self):
+        cosim_visible_vehicles = self.coupler.get_visible_data()
+        self.reset_visible_states()
         for lane in cosim_visible_vehicles:
             for id in cosim_visible_vehicles[lane]:
-                self.spawnVisibleVehicle(cosim_visible_vehicles[lane][id])
+                self.spawn_visible_vehicle(cosim_visible_vehicles[lane][id])
 
-    def updateVisibleVehiclesFromCoSIM(self):
+    def update_visible_vehicles_from_co_sim(self):
         """Reconcile SUMO's population with the coupler's visible state."""
-        cosim_visible_ids = set(self.coupler.getVisibleIdsFlat())
+        cosim_visible_ids = set(self.coupler.get_visible_ids_flat())
         for cosim_id in list(self.visible_states.keys()):
             if cosim_id not in cosim_visible_ids:
-                self.despawnVisibleVehicle(self.visible_states[cosim_id])
-        cosim_visible_vehicles = self.coupler.getVisibleData()
+                self.despawn_visible_vehicle(self.visible_states[cosim_id])
+        cosim_visible_vehicles = self.coupler.get_visible_data()
         for lane in cosim_visible_vehicles:
             for cosim_id in cosim_visible_vehicles[lane]:
                 if cosim_id not in self.visible_states:
-                    self.spawnVisibleVehicle(cosim_visible_vehicles[lane][cosim_id])
+                    self.spawn_visible_vehicle(cosim_visible_vehicles[lane][cosim_id])
 
-    def updateSimulation(self):
-        self.updateVisibleVehiclesFromCoSIM()
+    def update_simulation(self):
+        self.update_visible_vehicles_from_co_sim()
 
     # ------------------------------------------------------------------
     # Boundary conditions
     # ------------------------------------------------------------------
 
-    def _defaultAheadSpeed(self, road_id) -> float:
+    def _default_ahead_speed(self, road_id) -> float:
         try:
-            return float(self.conn.lane.getMaxSpeed(self.laneID(road_id, -1)))
+            return float(self.conn.lane.getMaxSpeed(self.lane_id(road_id, -1)))
         except Exception:
             return 30.0
 
-    def applyLeadVehicleSpeeds(self):
+    def apply_lead_vehicle_speeds(self):
         """Push the downstream macroscopic velocity onto each lane's leader.
 
         This is the only channel by which the macro state ahead of the bubble
@@ -404,7 +404,7 @@ class I24MotionSumoSimulationCoupled:
         if not self.lead_speed_control:
             return
         road_id = str(self.coupler.hero_road)
-        leaders: Dict[int, Optional[dict]] = {lane: None for lane in self.coupler.getLanes()}
+        leaders: Dict[int, Optional[dict]] = {lane: None for lane in self.coupler.get_lanes()}
         for cosim_id, record in self.visible_states.items():
             lane = record["last_lane_id"]
             if lane not in leaders:
@@ -416,12 +416,12 @@ class I24MotionSumoSimulationCoupled:
         for lane, record in leaders.items():
             if record is None:
                 continue
-            ghost_lead = self.coupler.getLowestAheadGhostVehicle(lane)
+            ghost_lead = self.coupler.get_lowest_ahead_ghost_vehicle(lane)
             if ghost_lead is not None:
                 target_speed = float(ghost_lead["velocity"])
             else:
                 target_speed = float(
-                    self.coupler.getAheadLaneVelocityMacro(lane, self._defaultAheadSpeed(road_id))
+                    self.coupler.get_ahead_lane_velocity_macro(lane, self._default_ahead_speed(road_id))
                 )
             cosim_id = record["cosim_data"]["id"]
             new_lead_ids.add(cosim_id)
@@ -444,7 +444,7 @@ class I24MotionSumoSimulationCoupled:
             except Exception:
                 pass
 
-    def releaseSpawnHolds(self):
+    def release_spawn_holds(self):
         """Hand freshly inserted vehicles over to the car-following model."""
         for cosim_id, record in self.visible_states.items():
             if record["hold_substeps"] > 0:
@@ -466,7 +466,7 @@ class I24MotionSumoSimulationCoupled:
     # Hero control
     # ------------------------------------------------------------------
 
-    def buildHeroObservation(self) -> dict:
+    def build_hero_observation(self) -> dict:
         veh_id = self.hero_state["sumo_id"]
         lane_id = self.hero_state["last_lane_id"]
         leader = None
@@ -483,16 +483,16 @@ class I24MotionSumoSimulationCoupled:
             "s": self.hero_state["last_s"],
             "speed": float(self.hero_state["cosim_data"]["velocity"]),
             "lane_id": lane_id,
-            "lane_index": self.laneIndex(self.coupler.hero_road, lane_id),
+            "lane_index": self.lane_index(self.coupler.hero_road, lane_id),
             "leader": leader,
-            "macro_velocity_ahead": self.coupler.getAheadLaneVelocityMacro(
-                lane_id, self._defaultAheadSpeed(str(self.coupler.hero_road))
+            "macro_velocity_ahead": self.coupler.get_ahead_lane_velocity_macro(
+                lane_id, self._default_ahead_speed(str(self.coupler.hero_road))
             ),
-            "macro_density_ahead": self.coupler.getAheadLaneDensity(lane_id, 0.0),
-            "visible_window": self.coupler.getCurrentVisibleWindow(),
+            "macro_density_ahead": self.coupler.get_ahead_lane_density(lane_id, 0.0),
+            "visible_window": self.coupler.get_current_visible_window(),
         }
 
-    def applyHeroPolicy(self):
+    def apply_hero_policy(self):
         """Let an external policy override the hero, if one was supplied.
 
         With ``hero_policy=None`` the hero is an ordinary SUMO vehicle and the
@@ -500,7 +500,7 @@ class I24MotionSumoSimulationCoupled:
         """
         if self.hero_policy is None or self.hero_state is None:
             return
-        action = self.hero_policy.act(self.buildHeroObservation())
+        action = self.hero_policy.act(self.build_hero_observation())
         if not action:
             return
         veh_id = self.hero_state["sumo_id"]
@@ -522,7 +522,7 @@ class I24MotionSumoSimulationCoupled:
     # Readback
     # ------------------------------------------------------------------
 
-    def _refreshRecord(self, record) -> bool:
+    def _refresh_record(self, record) -> bool:
         """Pull one vehicle's state out of SUMO. False if it is no longer usable."""
         veh_id = record["sumo_id"]
         try:
@@ -532,13 +532,13 @@ class I24MotionSumoSimulationCoupled:
         if edge_id.startswith(":"):
             # On an internal junction lane; keep the previous sample for a step.
             return True
-        road_id = self.roadIDFromEdge(edge_id)
+        road_id = self.road_id_from_edge(edge_id)
         if road_id is None or road_id != str(self.coupler.hero_road):
             return False  # Left the coupled road.
         length = float(self.conn.vehicle.getLength(veh_id))
         lane_index = int(self.conn.vehicle.getLaneIndex(veh_id))
-        lane_id = self.openDriveLane(road_id, lane_index)
-        if lane_id not in self.coupler.getLanes():
+        lane_id = self.open_drive_lane(road_id, lane_index)
+        if lane_id not in self.coupler.get_lanes():
             return False  # Changed into a lane the macro side does not model.
         record["last_s"] = float(self.conn.vehicle.getLanePosition(veh_id)) - length
         record["last_lane_id"] = lane_id
@@ -547,7 +547,7 @@ class I24MotionSumoSimulationCoupled:
         record["cosim_data"]["width"] = float(self.conn.vehicle.getWidth(veh_id))
         return True
 
-    def rebuildCoSIMVehicleState(self, record) -> dict:
+    def rebuild_co_sim_vehicle_state(self, record) -> dict:
         cosim_data = record["cosim_data"]
         lane_id = record["last_lane_id"]
         return {
@@ -565,33 +565,33 @@ class I24MotionSumoSimulationCoupled:
             "road_id": self.coupler.hero_road,
         }
 
-    def rebuildCoSIMHeroState(self) -> dict:
-        return self.rebuildCoSIMVehicleState(self.hero_state)
+    def rebuild_co_sim_hero_state(self) -> dict:
+        return self.rebuild_co_sim_vehicle_state(self.hero_state)
 
-    def rebuildCoSIMVisibleState(self) -> dict:
-        cosim_visible_states = {lane: {} for lane in self.coupler.getLanes()}
+    def rebuild_co_sim_visible_state(self) -> dict:
+        cosim_visible_states = {lane: {} for lane in self.coupler.get_lanes()}
         for record in self.visible_states.values():
-            rebuilt = self.rebuildCoSIMVehicleState(record)
+            rebuilt = self.rebuild_co_sim_vehicle_state(record)
             # _refreshRecord drops anything that wandered into an unmodelled
             # lane, so every surviving record lands in a bucket here.
             cosim_visible_states[rebuilt["lane_id"]][rebuilt["id"]] = rebuilt
         return cosim_visible_states
 
-    def updateCoSIM(self):
-        return self.rebuildCoSIMHeroState(), self.rebuildCoSIMVisibleState()
+    def update_co_sim(self):
+        return self.rebuild_co_sim_hero_state(), self.rebuild_co_sim_visible_state()
 
     # ------------------------------------------------------------------
     # Vehicle loss accounting
     # ------------------------------------------------------------------
 
-    def _lossSideFor(self, record, arrived_ids) -> str:
+    def _loss_side_for(self, record, arrived_ids) -> str:
         if record["sumo_id"] in arrived_ids:
             return "front"  # Drove off the downstream end of the network.
-        window = self.coupler.getCurrentVisibleWindow()
+        window = self.coupler.get_current_visible_window()
         centre = 0.5 * (window[2] + window[3])
         return "rear" if record["last_s"] < centre else "front"
 
-    def _reapVanishedVehicles(self):
+    def _reap_vanished_vehicles(self):
         """Account for vehicles SUMO no longer has.
 
         A vehicle can leave the engine without crossing a bubble boundary: an
@@ -611,13 +611,13 @@ class I24MotionSumoSimulationCoupled:
             record["age_substeps"] += 1
             if record["sumo_id"] in live_ids:
                 record["seen"] = True
-                if self._refreshRecord(record):
+                if self._refresh_record(record):
                     continue
                 # Still in SUMO but off the coupled road: remove it deliberately.
-                self.despawnVehicle(record)
+                self.despawn_vehicle(record)
                 self.visible_states.pop(cosim_id, None)
                 self.lead_controlled.pop(cosim_id, None)
-                self.coupler.creditLostVehicle(record["last_lane_id"], "front")
+                self.coupler.credit_lost_vehicle(record["last_lane_id"], "front")
                 continue
 
             if not record["seen"]:
@@ -625,19 +625,19 @@ class I24MotionSumoSimulationCoupled:
                     continue  # Still pending departure.
                 side = record["spawn_side"]
             else:
-                side = self._lossSideFor(record, arrived_ids)
+                side = self._loss_side_for(record, arrived_ids)
             self.visible_states.pop(cosim_id, None)
             self.lead_controlled.pop(cosim_id, None)
-            self.coupler.creditLostVehicle(record["last_lane_id"], side)
+            self.coupler.credit_lost_vehicle(record["last_lane_id"], side)
 
-        self._ensureHeroPresent(live_ids)
+        self._ensure_hero_present(live_ids)
 
-    def _ensureHeroPresent(self, live_ids):
+    def _ensure_hero_present(self, live_ids):
         if self.hero_state is None:
             return
         if self.hero_state["sumo_id"] in live_ids:
             self.hero_state["seen"] = True
-            if self._refreshRecord(self.hero_state):
+            if self._refresh_record(self.hero_state):
                 return
         elif not self.hero_state["seen"]:
             self.hero_state["age_substeps"] += 1
@@ -649,27 +649,27 @@ class I24MotionSumoSimulationCoupled:
             f"WARNING: hero vehicle {self.hero_state['sumo_id']} left SUMO at "
             f"s={self.hero_state['last_s']:.1f}; reinserting at its last state."
         )
-        self.despawnVehicle(self.hero_state)
+        self.despawn_vehicle(self.hero_state)
         cosim_data = self.hero_state["cosim_data"]
         cosim_data["s"] = self.hero_state["last_s"]
         cosim_data["lane_id"] = self.hero_state["last_lane_id"]
-        veh_id = self.spawnVehicleFromCoSIM(cosim_data)
+        veh_id = self.spawn_vehicle_from_co_sim(cosim_data)
         if veh_id is None:
             raise RuntimeError("Lost the hero vehicle and could not reinsert it.")
-        self.hero_state = self._trackingRecord(cosim_data, veh_id, self.hero_state["spawn_side"])
+        self.hero_state = self._tracking_record(cosim_data, veh_id, self.hero_state["spawn_side"])
 
     # ------------------------------------------------------------------
     # Stepping
     # ------------------------------------------------------------------
 
-    def runSimulationOver(self, t=1.0, eps=1e-9):
+    def run_simulation_over(self, t=1.0, eps=1e-9):
         """Advance SUMO by ``t`` seconds in ``step_length`` substeps."""
         substeps = max(1, int(round(t / self.step_length)))
         for _ in range(substeps):
-            self.releaseSpawnHolds()
-            self.applyLeadVehicleSpeeds()
-            self.applyHeroPolicy()
+            self.release_spawn_holds()
+            self.apply_lead_vehicle_speeds()
+            self.apply_hero_policy()
             self.conn.simulationStep()
             self.current_timestamp += self.step_length
-            self._reapVanishedVehicles()
-        return self.updateCoSIM()
+            self._reap_vanished_vehicles()
+        return self.update_co_sim()

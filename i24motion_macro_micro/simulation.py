@@ -1464,11 +1464,11 @@ class ConservativeRemapper:
 
         for base_key, mass in base_mass_updates.items():
             cell = network.get_cell(*base_key)
-            covered_L = base_covered_lengths[base_key]
-            cell.mass = 0.0 if covered_L <= 1e-12 else mass
+            covered_l = base_covered_lengths[base_key]
+            cell.mass = 0.0 if covered_l <= 1e-12 else mass
             # Remember the length this mass was spread over so base_to_active can
             # recover the density even after the mask has moved.
-            cell.macro_length = covered_L if covered_L > 1e-12 else None
+            cell.macro_length = covered_l if covered_l > 1e-12 else None
 
         for base_key, mass in base_mask_mass_updates.items():
             cell = network.get_cell(*base_key)
@@ -2605,25 +2605,25 @@ class Simulation:
             for rs in self.rollout_results
         ]
         max_active = max((len(a) for a in active_per_step), default=0)
-        N_base = len(base_cells)
+        n_base = len(base_cells)
 
         # Trace layout (per quantity q_idx in 0,1,2):
-        #   base traces:   q_idx * N_base  ..  (q_idx+1) * N_base - 1
-        #   active traces: 3*N_base + q_idx * max_active  ..  3*N_base + (q_idx+1) * max_active - 1
-        #   colorbar:      3*N_base + 3*max_active + q_idx
+        #   base traces:   q_idx * n_base  ..  (q_idx+1) * n_base - 1
+        #   active traces: 3*n_base + q_idx * max_active  ..  3*n_base + (q_idx+1) * max_active - 1
+        #   colorbar:      3*n_base + 3*max_active + q_idx
         def base_start(q_idx: int) -> int:
-            return q_idx * N_base
+            return q_idx * n_base
         def active_start(q_idx: int) -> int:
-            return 3 * N_base + q_idx * max_active
+            return 3 * n_base + q_idx * max_active
         def colorbar_idx(q_idx: int) -> int:
-            return 3 * N_base + 3 * max_active + q_idx
+            return 3 * n_base + 3 * max_active + q_idx
 
-        N_total = 3 * N_base + 3 * max_active + 3
+        n_total = 3 * n_base + 3 * max_active + 3
 
         def _visibility(show_base: bool, q_idx: int) -> List[bool]:
-            vis = [False] * N_total
+            vis = [False] * n_total
             group_start = base_start(q_idx) if show_base else active_start(q_idx)
-            group_size = N_base if show_base else max_active
+            group_size = n_base if show_base else max_active
             for i in range(group_size):
                 vis[group_start + i] = True
             vis[colorbar_idx(q_idx)] = True
@@ -2699,10 +2699,10 @@ class Simulation:
         print("Basic cells added!")
 
         # ── Precompute all colors and active geometry ───────────────────────
-        N_frames = len(self.rollout_results)
+        n_frames = len(self.rollout_results)
 
         def _color_matrix(vals: np.ndarray, vmin: float, vmax: float) -> List[List[str]]:
-            """(N_frames, N_cells) values → (N_frames, N_cells) hex color strings via vectorized colormap."""
+            """(n_frames, N_cells) values → (n_frames, N_cells) hex color strings via vectorized colormap."""
             t = np.clip((vals - vmin) / max(vmax - vmin, 1e-12), 0.0, 1.0)
             rgb = (CMAP(t)[..., :3] * 255).astype(np.uint8)
             # Pack R,G,B into a single uint32 for fast hex formatting
@@ -2715,11 +2715,11 @@ class Simulation:
                 for i in range(nf)
             ]
 
-        # Base: density matrix (N_frames, N_base), then derive other quantities per cell
+        # Base: density matrix (n_frames, n_base), then derive other quantities per cell
         base_rho = np.array([
             [rs.network.get_cell(rid, cid).density_viz for rid, cid, _px, _py, _fd in base_cells]
             for rs in self.rollout_results
-        ])  # (N_frames, N_base)
+        ])  # (n_frames, n_base)
         # Model mean speed per frame, None where the model does not carry one.
         base_vel: List[List[Optional[float]]] = [
             [rs.network.get_cell(rid, cid).velocity for rid, cid, _px, _py, _fd in base_cells]
@@ -2794,7 +2794,7 @@ class Simulation:
         # Precompute fixed frame_traces list (same for every frame)
         frame_traces_template: List[int] = []
         for q_idx in range(len(QUANTITIES)):
-            for i in range(N_base):
+            for i in range(n_base):
                 frame_traces_template.append(base_start(q_idx) + i)
         for q_idx in range(len(QUANTITIES)):
             for i in range(max_active):

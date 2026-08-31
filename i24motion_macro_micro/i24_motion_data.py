@@ -95,10 +95,10 @@ class I24MotionData:
         self.s_min = s_min
         self.s_max = s_max
         self.conn = duckdb.connect(config={'memory_limit': '160GB', 'threads': 48})
-        self.preloadAllData()
-        self.preloadSubset()
+        self.preload_all_data()
+        self.preload_subset()
 
-    def preloadAllData(self):
+    def preload_all_data(self):
         for lane in self.road_lane_lookup[self.road_id]:
             lane_str = str(lane) if lane >= 0 else "neg"+str(abs(lane))
             ref = f"{self.trajectories_all_db_prefix}_{self.road_id}_{lane_str}"
@@ -108,14 +108,14 @@ class I24MotionData:
                 SELECT * FROM parquet_scan('{file_path}')             
             """)
 
-    def preloadSubset(self):
+    def preload_subset(self):
         for lane in self.road_lane_lookup[self.road_id]:
             lane_str = str(lane) if lane >= 0 else "neg"+str(abs(lane))
             source_ref = f"{self.trajectories_all_db_prefix}_{self.road_id}_{lane_str}"
             dest_ref = f"{self.trajectories_subset_db_prefix}_{self.road_id}_{lane_str}"
-            self.directQueryEdieBoxDB(source_ref, dest_ref, self.timestamp_min, self.timestamp_max, self.s_min, self.s_max)
+            self.direct_query_edie_box_db(source_ref, dest_ref, self.timestamp_min, self.timestamp_max, self.s_min, self.s_max)
 
-    def directQueryEdieBoxDF(self, source_ref, timestamp_min, timestamp_max, s_min, s_max):
+    def direct_query_edie_box_df(self, source_ref, timestamp_min, timestamp_max, s_min, s_max):
         q = f"""
         SELECT time, x, y, length, width, height, class, id, s, t
         FROM {source_ref}
@@ -124,7 +124,7 @@ class I24MotionData:
         """
         return self.conn.execute(q, [timestamp_min, timestamp_max, s_min, s_max]).fetch_df()
     
-    def directQueryEdieBoxDB(self, source_ref, dest_ref, timestamp_min, timestamp_max, s_min, s_max):
+    def direct_query_edie_box_db(self, source_ref, dest_ref, timestamp_min, timestamp_max, s_min, s_max):
         q = f"""
         CREATE TABLE {dest_ref} AS
         SELECT time, x, y, length, width, height, class, id, s, t
@@ -134,7 +134,7 @@ class I24MotionData:
         """
         return self.conn.execute(q, [timestamp_min, timestamp_max, s_min, s_max])
     
-    def getVehicleTrajectoryDF(self, source_ref, id, start_time=None):
+    def get_vehicle_trajectory_df(self, source_ref, id, start_time=None):
         if start_time is None:
             q = f"""
             SELECT time, x, y, length, width, height, class, id, s, t
@@ -153,17 +153,17 @@ class I24MotionData:
             """
             return self.conn.execute(q, [id, start_time]).fetch_df() 
     
-    def getVehicleTrajectory(self, lane, id, start_time=None):
+    def get_vehicle_trajectory(self, lane, id, start_time=None):
         lane_str = str(lane) if lane >= 0 else "neg"+str(abs(lane))
         source_ref = f"{self.trajectories_subset_db_prefix}_{self.road_id}_{lane_str}"
-        return self.getVehicleTrajectoryDF(source_ref, id, start_time=start_time)
+        return self.get_vehicle_trajectory_df(source_ref, id, start_time=start_time)
     
-    def queryEdieBoxSubset(self, timestamp_min, timestamp_max, s_min, s_max, ignore_ids = None):
+    def query_edie_box_subset(self, timestamp_min, timestamp_max, s_min, s_max, ignore_ids = None):
         result = {}
         for lane in self.road_lane_lookup[self.road_id]:
             lane_str = str(lane) if lane >= 0 else "neg"+str(abs(lane))
             source_ref = f"{self.trajectories_subset_db_prefix}_{self.road_id}_{lane_str}"
-            result[lane] = self.directQueryEdieBoxDF(source_ref, timestamp_min, timestamp_max, s_min, s_max)
+            result[lane] = self.direct_query_edie_box_df(source_ref, timestamp_min, timestamp_max, s_min, s_max)
             # Each unique id needs at least two rows corresponding to it so we can estimate velocity and justifiably say it's a reliable track
             unique_ids = list(result[lane]["id"].unique())
             for id in unique_ids:
@@ -176,7 +176,7 @@ class I24MotionData:
         return result
     
     @staticmethod
-    def uniformBoxGrid(timestamp_min, timestamp_max, s_min, s_max, tol=1e-6):
+    def uniform_box_grid(timestamp_min, timestamp_max, s_min, s_max, tol=1e-6):
         """Recognise a batch of Edie windows as a regular tiling of (time, s).
 
         The batches `I24MotionMacro.computeEdieBoxQueries` builds are always a
@@ -223,7 +223,7 @@ class I24MotionData:
         return float(t_vals[0]), dt, n_t, float(s_vals[0]), dx, n_x
 
     @staticmethod
-    def collectBoxRows(intermediate_result, result, lane):
+    def collect_box_rows(intermediate_result, result, lane):
         """Fan the one-row-per-box query result out into per-box DataFrames."""
         columns = ["time", "x", "y", "length", "width", "height", "class", "id", "s", "t"]
         query_ids = intermediate_result["query_id"].to_numpy()
@@ -232,7 +232,7 @@ class I24MotionData:
             local_dataframe = pandas.DataFrame({column: lists[column][i] for column in columns})
             result[int(query_ids[i])][lane] = local_dataframe
 
-    def queryEdieBoxGrid(self, grid):
+    def query_edie_box_grid(self, grid):
         """Batch Edie box query for a uniform tiling, binning instead of joining.
 
         Note the box bounds are half open here, [lo, hi), where the range join in
@@ -270,14 +270,14 @@ class I24MotionData:
             WHERE b.ti >= 0 AND b.ti < {n_t} AND b.xi >= 0 AND b.xi < {n_x}
             GROUP BY query_id
             """
-            self.collectBoxRows(self.conn.execute(q).fetch_df(), result, lane)
+            self.collect_box_rows(self.conn.execute(q).fetch_df(), result, lane)
         return result
 
-    def queryEdieBoxBatch(self, timestamp_min, timestamp_max, s_min, s_max, use_grid_fast_path=True):
+    def query_edie_box_batch(self, timestamp_min, timestamp_max, s_min, s_max, use_grid_fast_path=True):
         if use_grid_fast_path:
-            grid = self.uniformBoxGrid(timestamp_min, timestamp_max, s_min, s_max)
+            grid = self.uniform_box_grid(timestamp_min, timestamp_max, s_min, s_max)
             if grid is not None:
-                return self.queryEdieBoxGrid(grid)
+                return self.query_edie_box_grid(grid)
         query_ids = list(range(len(timestamp_min)))
         windows = pandas.DataFrame({
             "query_id": query_ids,
@@ -312,5 +312,5 @@ class I24MotionData:
             AND p.s BETWEEN w.s_min AND w.s_max
             GROUP BY w.query_id
             """
-            self.collectBoxRows(self.conn.execute(q).fetch_df(), result, lane)
+            self.collect_box_rows(self.conn.execute(q).fetch_df(), result, lane)
         return result

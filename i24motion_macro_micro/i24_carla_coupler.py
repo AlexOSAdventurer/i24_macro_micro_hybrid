@@ -58,9 +58,9 @@ class I24CarlaCoupler:
         self.ghost_state = None
         self.current_timestamp = None
         self.next_vehicle_id = 0
-        self.loadHero(int(hero_road), desired_time, desired_s)
-        self.loadVisible()
-        self.loadGhosts()
+        self.load_hero(int(hero_road), desired_time, desired_s)
+        self.load_visible()
+        self.load_ghosts()
         self.carla_sim = I24MotionCarlaSimulationCoupled("localhost", 2000, self, self.mapping["road_data"], bev_video_path, record_videos)
 
     def get_lane_dfs(self, timestamp_min, timestamp_max, s_min, s_max):
@@ -78,7 +78,7 @@ class I24CarlaCoupler:
         self.carla_sim.initializeSimulation()
         self.initialized = True
 
-    def generateNextVehicleID(self):
+    def generate_next_vehicle_id(self):
         new_id = self.next_vehicle_id
         self.next_vehicle_id += 1
         return new_id
@@ -97,17 +97,17 @@ class I24CarlaCoupler:
 
         This method is passed directly as bridge.update_micro_callback.
         """
-        hero = self.getHeroData()
+        hero = self.get_hero_data()
         anchor_speed = hero["velocity"]
         middle_s = hero["s"]
 
         if self.initialized:
-            self.visible_state = self.injectVehiclesFromMacro(self.getVisibleData())
+            self.visible_state = self.inject_vehicles_from_macro(self.get_visible_data())
             self.carla_sim.updateSimulation()
             new_hero_state, new_visible_states = self.carla_sim.runSimulationOver(self.dt)
-            self.updateHeroVehicleViaCARLA(new_hero_state)
-            self.updateVisibleVehiclesViaCARLA(new_visible_states)
-            vehicles = self.collateVisibleAndHeroVehicles(self.bridge)
+            self.update_hero_vehicle_via_carla(new_hero_state)
+            self.update_visible_vehicles_via_carla(new_visible_states)
+            vehicles = self.collate_visible_and_hero_vehicles(self.bridge)
 
             self.bridge.update_vehicles(vehicles)
             self.bridge.anchor_speed = anchor_speed
@@ -130,7 +130,7 @@ class I24CarlaCoupler:
             return middle_s
         return middle_s + anchor_speed * self.dt
     
-    def getAheadLaneVelocityMacro(self, lane_id, default_speed, min_cell_size=25.0):
+    def get_ahead_lane_velocity_macro(self, lane_id, default_speed, min_cell_size=25.0):
         mask_cell = self.bridge.sim.active.get_cell_with_mask(self.bridge._mask_id(lane_id))
         front_cell = self.bridge.sim.active.active_cells[mask_cell.outflow_neighbors[0]] if len(mask_cell.outflow_neighbors) > 0 else None
         if front_cell is None:
@@ -142,7 +142,7 @@ class I24CarlaCoupler:
             return default_speed # We currently don't bother connecting masks together.
         return fd.velocity_from_density(mass / cell_length)
     
-    def getBehindLaneVelocityMacro(self, lane_id, default_speed):
+    def get_behind_lane_velocity_macro(self, lane_id, default_speed):
         mask_cell = self.bridge.sim.active.get_cell_with_mask(self.bridge._mask_id(lane_id))
         behind_cell = self.bridge.sim.active.active_cells[mask_cell.inflow_neighbors[0]] if len(mask_cell.inflow_neighbors) > 0 else None
         if behind_cell is None:
@@ -154,27 +154,27 @@ class I24CarlaCoupler:
             return default_speed # We currently don't bother connecting masks together.
         return fd.velocity_from_density(mass / cell_length)
     
-    def getAheadLaneVelocityMicro(self, lane_id, default_speed, min_cell_size=25.0):
+    def get_ahead_lane_velocity_micro(self, lane_id, default_speed, min_cell_size=25.0):
         vehicles = self.visible_state[lane_id]
         front_most_vehicle = None
         for vehicle in vehicles:
             if (front_most_vehicle is None) or (vehicles[vehicle]["s"] > front_most_vehicle["s"]):
                 front_most_vehicle = vehicles[vehicle]
         if front_most_vehicle is None:
-            return self.getAheadLaneVelocityMacro(lane_id, default_speed, min_cell_size)
+            return self.get_ahead_lane_velocity_macro(lane_id, default_speed, min_cell_size)
         return front_most_vehicle["velocity"]
     
-    def getBehindLaneVelocityMicro(self, lane_id, default_speed, min_cell_size=25.0):
+    def get_behind_lane_velocity_micro(self, lane_id, default_speed, min_cell_size=25.0):
         vehicles = self.visible_state[lane_id]
         rear_most_vehicle = None
         for vehicle in vehicles:
             if (rear_most_vehicle is None) or (vehicles[vehicle]["s"] < rear_most_vehicle["s"]):
                 rear_most_vehicle = vehicles[vehicle]
         if rear_most_vehicle is None:
-            return self.getBehindLaneVelocityMacro(lane_id, default_speed)
+            return self.get_behind_lane_velocity_macro(lane_id, default_speed)
         return rear_most_vehicle["velocity"]
     
-    def getAheadLaneDensity(self, lane_id, default_density):
+    def get_ahead_lane_density(self, lane_id, default_density):
         mask_cell = self.bridge.sim.active.get_cell_with_mask(self.bridge._mask_id(lane_id))
         front_cell = self.bridge.sim.active.active_cells[mask_cell.outflow_neighbors[0]] if len(mask_cell.outflow_neighbors) > 0 else None
         if front_cell is None:
@@ -185,7 +185,7 @@ class I24CarlaCoupler:
             return default_density # We currently don't bother connecting masks together.
         return mass / cell_length
     
-    def getBehindLaneDensity(self, lane_id, default_density):
+    def get_behind_lane_density(self, lane_id, default_density):
         mask_cell = self.bridge.sim.active.get_cell_with_mask(self.bridge._mask_id(lane_id))
         behind_cell = self.bridge.sim.active.active_cells[mask_cell.inflow_neighbors[0]] if len(mask_cell.inflow_neighbors) > 0 else None
         if behind_cell is None:
@@ -199,13 +199,13 @@ class I24CarlaCoupler:
     def destroy(self):
         self.carla_sim.destroySimulation()
     
-    def generateVehicleStateFromRow(self, row, lane, current_timestamp=None):
+    def generate_vehicle_state_from_row(self, row, lane, current_timestamp=None):
         if current_timestamp is None:
             current_timestamp = self.current_timestamp
-        estimated_velocity = self.estimateVehicleVelocityFromReal(int(row["id"]), lane, float(row["time"]))
+        estimated_velocity = self.estimate_vehicle_velocity_from_real(int(row["id"]), lane, float(row["time"]))
         estimated_s = float(row["s"]) + ((current_timestamp - float(row["time"])) * estimated_velocity)
         return {
-            "id": self.generateNextVehicleID(),
+            "id": self.generate_next_vehicle_id(),
             "class": str(row["class"]),
             "length": float(row["length"]),
             "width": float(row["width"]),
@@ -218,14 +218,14 @@ class I24CarlaCoupler:
         }
     
     # behind_or_in_front is either "behind" or "front"
-    def generateVehicleStateFromSpawn(self, lane, s_min, s_max, behind_or_in_front="behind"):
+    def generate_vehicle_state_from_spawn(self, lane, s_min, s_max, behind_or_in_front="behind"):
         if (behind_or_in_front != "behind") and (behind_or_in_front != "front"):
             return None # Force failure upstream. Hacky but whatevs. We can improve all of this later.
         new_time = self.current_timestamp
-        estimated_velocity = self.getBehindLaneVelocityMicro(lane, 0.0) if (behind_or_in_front == "behind") else self.getAheadLaneVelocityMicro(lane, 0.0)
+        estimated_velocity = self.get_behind_lane_velocity_micro(lane, 0.0) if (behind_or_in_front == "behind") else self.get_ahead_lane_velocity_micro(lane, 0.0)
         estimated_width = 3.5 # We're hardcoding this for now. We'll need to add lane/road cross-referencing lookup later
         return {
-            "id": self.generateNextVehicleID(),
+            "id": self.generate_next_vehicle_id(),
             "class": "spawned",
             "length": float(s_max - s_min),
             "width": estimated_width,
@@ -237,9 +237,9 @@ class I24CarlaCoupler:
             "road_id": self.hero_road
         }
     
-    def generateUpdatedVehicleStateFromCARLA(self, vehicle_data):
+    def generate_updated_vehicle_state_from_carla(self, vehicle_data):
         new_time = self.current_timestamp
-        #estimated_velocity = self.estimateVehicleVelocityFromReal(int(vehicle_data["id"]), int(vehicle_data["lane_id"]), new_time)
+        #estimated_velocity = self.estimate_vehicle_velocity_from_real(int(vehicle_data["id"]), int(vehicle_data["lane_id"]), new_time)
         return {
             "id": int(vehicle_data["id"]),
             "class": str(vehicle_data["class"]),
@@ -253,13 +253,13 @@ class I24CarlaCoupler:
             "road_id": self.hero_road
         }
     
-    def getVehicleTrajectoryFromReal(self, id, lane):
+    def get_vehicle_trajectory_from_real(self, id, lane):
         df = self.motion_data.micro_df
         window = df[(df["id"] == id) & (df["lane_id"] == lane)]
         return window
     
-    def estimateVehicleVelocityFromReal(self, id, lane, current_time):
-        trajectory = self.getVehicleTrajectoryFromReal(id, lane)
+    def estimate_vehicle_velocity_from_real(self, id, lane, current_time):
+        trajectory = self.get_vehicle_trajectory_from_real(id, lane)
         trajectory_time_sorted = trajectory.sort_values(by=['time'], ascending=True)
         if len(trajectory_time_sorted) < 2:
             return 0.0
@@ -270,12 +270,12 @@ class I24CarlaCoupler:
             return float(trajectory_time_sorted.iloc[current_index]["s"] - trajectory_time_sorted.iloc[current_index - 1]["s"]) / float(trajectory_time_sorted.iloc[current_index]["time"] - trajectory_time_sorted.iloc[current_index - 1]["time"])
         return float(trajectory_time_sorted.iloc[current_index + 1]["s"] - trajectory_time_sorted.iloc[current_index]["s"]) / float(trajectory_time_sorted.iloc[current_index + 1]["time"] - trajectory_time_sorted.iloc[current_index]["time"])
     
-    def estimateGhostVehicleVelocity(self, vehicle_data):
+    def estimate_ghost_vehicle_velocity(self, vehicle_data):
         # Replay its velocity for as long as we have it from the trajectory data - when that expires, we will simply discard the ghost and assume whatever its replacement becomes
         # This keeps us as data driven as possible
-        return self.estimateVehicleVelocityFromReal(self, vehicle_data["id"], vehicle_data["lane_id"], self.current_timestamp)
+        return self.estimate_vehicle_velocity_from_real(self, vehicle_data["id"], vehicle_data["lane_id"], self.current_timestamp)
 
-    def loadHero(self, hero_road, desired_time, desired_s):
+    def load_hero(self, hero_road, desired_time, desired_s):
         potential_heroes = pandas.concat(list((self.get_lane_dfs(desired_time - self.visible_time_max_difference, desired_time + self.visible_time_max_difference, desired_s - self.desired_s_max_difference, desired_s + self.desired_s_max_difference)).values()))
         #potential_heroes = self.real_data.queryEdieBoxSubset(desired_time - self.visible_time_max_difference, desired_time + self.visible_time_max_difference, desired_s - self.desired_s_max_difference, desired_s + self.desired_s_max_difference)[hero_lane]
         if len(potential_heroes) == 0:
@@ -285,61 +285,61 @@ class I24CarlaCoupler:
         potential_heroes_sorted = potential_heroes.sort_values(by=['time_delta', 's_delta'], ascending=True)
         selected_hero = potential_heroes_sorted.iloc[0]
         hero_lane = selected_hero.lane_id
-        original_hero_state = self.generateVehicleStateFromRow(selected_hero, hero_lane, float(selected_hero["time"]))
+        original_hero_state = self.generate_vehicle_state_from_row(selected_hero, hero_lane, float(selected_hero["time"]))
         self.hero_state = original_hero_state
         self.hero_lane = hero_lane
         self.current_timestamp = original_hero_state["time"]
         self.anchor_speed = self.hero_state["velocity"]
 
-    def getCurrentVisibleWindow(self):
+    def get_current_visible_window(self):
         #print(self.hero_state["s"] - self.visible_window, self.hero_state["s"] + self.visible_window)
         return self.current_timestamp - self.visible_time_max_difference, self.current_timestamp + self.visible_time_max_difference, self.hero_state["s"] - self.visible_window, self.hero_state["s"] + self.visible_window
     
-    def getCurrentBehindGhostWindow(self):
+    def get_current_behind_ghost_window(self):
         return self.current_timestamp - self.ghost_time_max_difference, self.current_timestamp + self.ghost_time_max_difference, self.hero_state["s"] - self.visible_window - self.ghost_window, self.hero_state["s"] - self.visible_window
     
-    def getCurrentAheadGhostWindow(self):
+    def get_current_ahead_ghost_window(self):
         return self.current_timestamp - self.ghost_time_max_difference, self.current_timestamp + self.ghost_time_max_difference, self.hero_state["s"] + self.visible_window, self.hero_state["s"] + self.visible_window + self.ghost_window
     
-    def getLanes(self):
+    def get_lanes(self):
         return self.lanes
     
-    def getVisibleIds(self):
+    def get_visible_ids(self):
         result = {}
-        for lane in self.getLanes():
+        for lane in self.get_lanes():
             result[lane] = [id for id in self.visible_state[lane]]
         return result
     
-    def getVisibleIdsFlat(self):
-        visible_ids = self.getVisibleIds()
-        return sum([visible_ids[lane] for lane in self.getLanes()], [])
+    def get_visible_ids_flat(self):
+        visible_ids = self.get_visible_ids()
+        return sum([visible_ids[lane] for lane in self.get_lanes()], [])
     
-    def getGhostIds(self):
+    def get_ghost_ids(self):
         result = {
             "behind": {},
             "ahead": {}
         }
         for position in self.ghost_state:
-            for lane in self.getLanes():
+            for lane in self.get_lanes():
                 result[position][lane] = [id for id in self.ghost_state[position][lane]]
         return result
     
-    def getVisibleData(self):
+    def get_visible_data(self):
         return self.visible_state
     
-    def getGhostData(self):
+    def get_ghost_data(self):
         return self.ghost_state
     
-    def getHeroData(self):
+    def get_hero_data(self):
         return self.hero_state
     
     # This is meant for the upper level fluid simulator. Thus we have to convert road ids to strings and restructure it to play nice with that code.
     # Long story short, I have some tech debt here
-    def collateVisibleAndHeroVehicles(self, bridge):
+    def collate_visible_and_hero_vehicles(self, bridge):
         result = {}
-        visible_data = self.getVisibleData()
-        hero_data = self.getHeroData()
-        min_timestamp, max_timestamp, min_s, max_s = self.getCurrentVisibleWindow()
+        visible_data = self.get_visible_data()
+        hero_data = self.get_hero_data()
+        min_timestamp, max_timestamp, min_s, max_s = self.get_current_visible_window()
         for lane in visible_data:
             visible_data_copied = copy.deepcopy(visible_data[lane])
             for i in visible_data_copied:
@@ -350,7 +350,7 @@ class I24CarlaCoupler:
         result[str(hero_copied["id"])] = Vehicle(length=hero_copied["length"], width=hero_copied["width"], s=hero_copied["s"] - min_s, t=hero_copied["t"], lane=hero_copied["lane_id"], s_dt=hero_copied["velocity"])
         return result
     
-    def getLowestBehindGhostVehicle(self, lane):
+    def get_lowest_behind_ghost_vehicle(self, lane):
         lane_data = self.ghost_state["behind"][lane]
         vehicle_ids = list(lane_data.keys())
         if len(vehicle_ids) == 0:
@@ -362,7 +362,7 @@ class I24CarlaCoupler:
                 lowest_vehicle = current_entry
         return lowest_vehicle
     
-    def getHighestAheadGhostVehicle(self, lane):
+    def get_highest_ahead_ghost_vehicle(self, lane):
         lane_data = self.ghost_state["ahead"][lane]
         vehicle_ids = list(lane_data.keys())
         if len(vehicle_ids) == 0:
@@ -374,7 +374,7 @@ class I24CarlaCoupler:
                 highest_vehicle = current_entry
         return highest_vehicle
     
-    def getLowestAheadGhostVehicle(self, lane):
+    def get_lowest_ahead_ghost_vehicle(self, lane):
         lane_data = self.ghost_state["ahead"][lane]
         vehicle_ids = list(lane_data.keys())
         if len(vehicle_ids) == 0:
@@ -386,7 +386,7 @@ class I24CarlaCoupler:
                 lowest_vehicle = current_entry
         return lowest_vehicle
     
-    def getLowestBehindVisibleVehicle(self, lane):
+    def get_lowest_behind_visible_vehicle(self, lane):
         lane_data = self.visible_state[lane]
         vehicle_ids = list(lane_data.keys())
         if len(vehicle_ids) == 0:
@@ -398,7 +398,7 @@ class I24CarlaCoupler:
                 lowest_vehicle = current_entry
         return lowest_vehicle
     
-    def getHighestAheadVisibleVehicle(self, lane):
+    def get_highest_ahead_visible_vehicle(self, lane):
         lane_data = self.visible_state[lane]
         vehicle_ids = list(lane_data.keys())
         if len(vehicle_ids) == 0:
@@ -410,14 +410,14 @@ class I24CarlaCoupler:
                 highest_vehicle = current_entry
         return highest_vehicle
 
-    def loadVisible(self):
+    def load_visible(self):
         self.visible_state = {}
-        for lane in self.getLanes():
+        for lane in self.get_lanes():
             self.visible_state[lane] = {}
-        min_timestamp, max_timestamp, min_s, max_s = self.getCurrentVisibleWindow()
+        min_timestamp, max_timestamp, min_s, max_s = self.get_current_visible_window()
         potential_visibles = self.get_lane_dfs(min_timestamp, max_timestamp, min_s, max_s)
         #potential_visibles = self.real_data.queryEdieBoxSubset(min_timestamp, max_timestamp, min_s, max_s, [self.hero_state["id"]])
-        for lane in self.getLanes():
+        for lane in self.get_lanes():
             potential_visibles_lane_sorted = potential_visibles[lane].sort_values(by=["time"], ascending=True)
             uniques = list(potential_visibles_lane_sorted["id"].unique())
             for unique in uniques:
@@ -427,29 +427,29 @@ class I24CarlaCoupler:
                     unique_vehicle_data["time_delta"] = (unique_vehicle_data["time"] - self.current_timestamp).abs()
                     unique_vehicle_data_sorted = unique_vehicle_data.sort_values(by=["time_delta"], ascending=True)
                     unique_vehicle_data_row = unique_vehicle_data_sorted.iloc[0]
-                    #self.visible_state[lane][int(unique)] = self.generateVehicleStateFromRow(unique_vehicle_data_row, lane)
-                    candidate = self.generateVehicleStateFromRow(unique_vehicle_data_row, lane)
-                    self.registerNewVisibleVehicle(candidate)
+                    #self.visible_state[lane][int(unique)] = self.generate_vehicle_state_from_row(unique_vehicle_data_row, lane)
+                    candidate = self.generate_vehicle_state_from_row(unique_vehicle_data_row, lane)
+                    self.register_new_visible_vehicle(candidate)
     
-    def loadGhosts(self, ignore_ids=None):
+    def load_ghosts(self, ignore_ids=None):
         # In this version we have no ghost vehicles, and assume the ghost region size is 0 in front and behind.
         # Thus, lets just return an empty list!
         self.ghost_state = {
             "behind": {},
             "ahead": {}
         }
-        for lane in self.getLanes():
+        for lane in self.get_lanes():
             self.ghost_state["behind"][lane] = {}
             self.ghost_state["ahead"][lane] = {}
 
-    def updateHeroVehicleViaCARLA(self, new_hero_state):
-        hero_state_processed = self.generateUpdatedVehicleStateFromCARLA(new_hero_state)
+    def update_hero_vehicle_via_carla(self, new_hero_state):
+        hero_state_processed = self.generate_updated_vehicle_state_from_carla(new_hero_state)
         hero_state_processed["velocity"] = float(new_hero_state["velocity"])
         self.hero_state = hero_state_processed
 
     # behind_or_in_front is either "behind" or "front"
-    def _createVehicleSpawnsInSRange(self, new_visible_states, lane, vehicle_count, s_min, s_max, behind_or_in_front, toprint=False):
-        density = self.getBehindLaneDensity(lane, 0.001) if (behind_or_in_front == "behind") else self.getAheadLaneDensity(lane, 0.001)
+    def _create_vehicle_spawns_in_s_range(self, new_visible_states, lane, vehicle_count, s_min, s_max, behind_or_in_front, toprint=False):
+        density = self.get_behind_lane_density(lane, 0.001) if (behind_or_in_front == "behind") else self.get_ahead_lane_density(lane, 0.001)
         spawn_lengths = min(max(1.0 / density, self.min_spawn_length), max(s_max - s_min, self.min_spawn_length))
         vehicle_count = min(math.floor((s_max - s_min) / spawn_lengths), vehicle_count)
         if (behind_or_in_front == "behind"):
@@ -473,15 +473,15 @@ class I24CarlaCoupler:
                 start_position_calculated = start_position + self.min_spawn_distance
                 end_position_calculated = start_position + spawn_lengths
 
-            new_vehicle_data = self.generateVehicleStateFromSpawn(lane, start_position_calculated, end_position_calculated, behind_or_in_front)
+            new_vehicle_data = self.generate_vehicle_state_from_spawn(lane, start_position_calculated, end_position_calculated, behind_or_in_front)
             print("Spawned Vehicle Data ", new_vehicle_data)
             print("New states ", new_visible_states[lane])
             new_visible_states[lane][new_vehicle_data["id"]] = new_vehicle_data
         return new_visible_states, vehicle_count
 
-    def _spawnVehiclesInRear(self, new_visible_states, lane, s_availability):
+    def _spawn_vehicles_in_rear(self, new_visible_states, lane, s_availability):
         rear_flux_memory = self.bridge.flow_memory_rear[lane]
-        visible_window = self.getCurrentVisibleWindow()
+        visible_window = self.get_current_visible_window()
         if (rear_flux_memory > 0.0):
             # Perform a poisson draw to determine the number of vehicles to create
             vehicle_count = min(math.floor(rear_flux_memory), self.vehicle_spawn_limit) # min(numpy.random.poisson(rear_flux_memory), self.vehicle_spawn_limit)
@@ -489,24 +489,24 @@ class I24CarlaCoupler:
                 print("window: ", visible_window)
                 print("availability: ", s_availability)
                 print("spawn_length info: ")
-                new_visible_states, vehicle_count = self._createVehicleSpawnsInSRange(new_visible_states, lane, vehicle_count, visible_window[2], visible_window[2] + s_availability, "behind", True)
+                new_visible_states, vehicle_count = self._create_vehicle_spawns_in_s_range(new_visible_states, lane, vehicle_count, visible_window[2], visible_window[2] + s_availability, "behind", True)
                 self.bridge.flow_memory_rear[lane] -= vehicle_count
         return new_visible_states
 
-    def _spawnVehiclesInFront(self, new_visible_states, lane, s_availability):
+    def _spawn_vehicles_in_front(self, new_visible_states, lane, s_availability):
         front_flux_memory = self.bridge.flow_memory_front[lane]
-        visible_window = self.getCurrentVisibleWindow()
+        visible_window = self.get_current_visible_window()
         if (front_flux_memory < 0.0):
             # Perform a poisson draw to determine the number of vehicles to create
             vehicle_count = min(math.floor(-front_flux_memory), self.vehicle_spawn_limit) # min(numpy.random.poisson(-front_flux_memory), self.vehicle_spawn_limit)
             if (vehicle_count > 0):
-                new_visible_states, vehicle_count = self._createVehicleSpawnsInSRange(new_visible_states, lane, vehicle_count, visible_window[3] - s_availability, visible_window[3], "front")
+                new_visible_states, vehicle_count = self._create_vehicle_spawns_in_s_range(new_visible_states, lane, vehicle_count, visible_window[3] - s_availability, visible_window[3], "front")
                 self.bridge.flow_memory_front[lane] += vehicle_count
         return new_visible_states
 
-    def injectVehiclesFromMacro(self, new_visible_states):
-        visible_window = self.getCurrentVisibleWindow()
-        for lane in self.getLanes():
+    def inject_vehicles_from_macro(self, new_visible_states):
+        visible_window = self.get_current_visible_window()
+        for lane in self.get_lanes():
             # Spawn Rear Boundary Vehicles
             # Get rearmost s position
             rear_s = None
@@ -519,14 +519,14 @@ class I24CarlaCoupler:
             if rear_s is None:
                 s_availability = (visible_window[3] - visible_window[2])
             else:
-                desired_macro_velocity = self.getBehindLaneVelocityMacro(lane, 0.0)
+                desired_macro_velocity = self.get_behind_lane_velocity_macro(lane, 0.0)
                 closing_rate = desired_macro_velocity - rear_velocity
                 rear_s = min(rear_s, rear_s - (closing_rate * self.spawn_ttc))
                 s_availability = rear_s - visible_window[2]
             s_availability = min(s_availability, self.spawn_region)
             # Mandate a certain distance threshold of the rearmost vehicle for spawning in new stuff
             if (s_availability > self.spawn_threshold):
-                new_visible_states = self._spawnVehiclesInRear(new_visible_states, lane, s_availability)
+                new_visible_states = self._spawn_vehicles_in_rear(new_visible_states, lane, s_availability)
             # Spawn Front Boundary Vehicles
             front_s = None
             front_velocity = None
@@ -538,25 +538,25 @@ class I24CarlaCoupler:
             if front_s is None:
                 s_availability = (visible_window[3] - visible_window[2])
             else:
-                desired_macro_velocity = self.getAheadLaneVelocityMacro(lane, 0.0)
+                desired_macro_velocity = self.get_ahead_lane_velocity_macro(lane, 0.0)
                 closing_rate = front_velocity - desired_macro_velocity
                 front_s = max(front_s, front_s + (closing_rate * self.spawn_ttc))
                 s_availability = visible_window[3] - front_s
             s_availability = min(s_availability, self.spawn_region)
             # Mandate a certain distance threshold of the frontmost vehicle for spawning in new stuff
             if (s_availability > self.spawn_threshold):
-                new_visible_states = self._spawnVehiclesInFront(new_visible_states, lane, s_availability)
+                new_visible_states = self._spawn_vehicles_in_front(new_visible_states, lane, s_availability)
 
         return new_visible_states
 
-    def updateVisibleVehiclesViaCARLA(self, new_visible_states):
+    def update_visible_vehicles_via_carla(self, new_visible_states):
         self.visible_state = {}
-        for lane in self.getLanes():
+        for lane in self.get_lanes():
             self.visible_state[lane] = {}
-        for lane in self.getLanes():
+        for lane in self.get_lanes():
             for vehicle_id in new_visible_states[lane]:
                 vehicle_data = new_visible_states[lane][vehicle_id]
-                visible_window = self.getCurrentVisibleWindow()
+                visible_window = self.get_current_visible_window()
                 if (vehicle_data["s"] < visible_window[2]):
                     #print(f"WARNING: Threw away {vehicle_data} because it was visible but then slipped behind the visible cell!")
                     self.bridge.flow_memory_rear[lane] += 1
@@ -566,34 +566,34 @@ class I24CarlaCoupler:
                     #print(f"WARNING: Threw away {vehicle_data} because it was visible but then slipped ahead the visible cell!")
                     self.bridge.flow_memory_front[lane] -= 1
                 else:
-                    new_data = self.generateUpdatedVehicleStateFromCARLA(vehicle_data)
-                    self.registerNewVisibleVehicle(new_data, True)
+                    new_data = self.generate_updated_vehicle_state_from_carla(vehicle_data)
+                    self.register_new_visible_vehicle(new_data, True)
 
-    def updateVisibleVehiclesWithGhostSelection(self, ghost_data):
-        visible_window = self.getCurrentVisibleWindow()
-        for lane in self.getLanes():
+    def update_visible_vehicles_with_ghost_selection(self, ghost_data):
+        visible_window = self.get_current_visible_window()
+        for lane in self.get_lanes():
             for id in ghost_data[lane]:
                 candidate = ghost_data[lane][id]
                 candidate_new_s = candidate["s"] + (candidate["velocity"] * (self.current_timestamp - candidate["time"]))
                 #print(f"Candidate visible {candidate} which is a ghost has a projected {candidate_new_s} position with this window {visible_window}")
                 if (candidate_new_s > visible_window[2]) and (candidate_new_s < visible_window[3]):
-                    if (self.checkIfCandidateVisibleNoOverlapWithCurrentVisible(lane, candidate)):
+                    if (self.check_if_candidate_visible_no_overlap_with_current_visible(lane, candidate)):
                         candidate["s"] = candidate_new_s
-                        self.registerNewVisibleVehicle(candidate)
+                        self.register_new_visible_vehicle(candidate)
                     else:
                         pass
                         #print(f"WARNING: Threw away {candidate} visible vehicle because it overlapped with the other visible vehicles!")
                         # No need to remove. Will be dealt with when we reload the ghost data.
 
-    def updateVisibleVehiclesViaGhosts(self):
+    def update_visible_vehicles_via_ghosts(self):
         # For each ghost vehicle, we will estimate laneits projected future position with a simple change to s.
         # Then, we will see if they fall under the visible region. If so, attempt to admit them, as long as geometry permits it.
         # Check behind vehicles
-        self.updateVisibleVehiclesWithGhostSelection(self.ghost_state["behind"])
+        self.update_visible_vehicles_with_ghost_selection(self.ghost_state["behind"])
         # Check ahead vehicles
-        self.updateVisibleVehiclesWithGhostSelection(self.ghost_state["ahead"])
+        self.update_visible_vehicles_with_ghost_selection(self.ghost_state["ahead"])
 
-    def checkVehicleBoundingBoxNoOverlap(self, vehicle1, vehicle2):
+    def check_vehicle_bounding_box_no_overlap(self, vehicle1, vehicle2):
         vehicle_first = vehicle1 if (vehicle1["s"] < vehicle2["s"]) else vehicle2
         vehicle_second = vehicle1 if (vehicle1["s"] > vehicle2["s"]) else vehicle2 
         vehicle_first_min, vehicle_first_max = vehicle_first["s"], vehicle_first["s"] + vehicle_first["length"] + self.min_spawn_distance
@@ -601,22 +601,22 @@ class I24CarlaCoupler:
 
         return (vehicle_first_min < vehicle_second_min) and (vehicle_first_max < vehicle_second_min)
     
-    def checkIfCandidateGhostNoOverlapWithCurrentGhosts(self, ghost_data, candidate):
+    def check_if_candidate_ghost_no_overlap_with_current_ghosts(self, ghost_data, candidate):
         for id in ghost_data:
-            if not self.checkVehicleBoundingBoxNoOverlap(ghost_data[id], candidate):
+            if not self.check_vehicle_bounding_box_no_overlap(ghost_data[id], candidate):
                 return False
         return True
     
-    def checkIfInitVisibleNoOverlapWithCurrentVisible(self, lane, candidate):
+    def check_if_init_visible_no_overlap_with_current_visible(self, lane, candidate):
         for id in self.visible_state[lane]:
-            if not self.checkVehicleBoundingBoxNoOverlap(self.visible_state[lane][id], candidate):
+            if not self.check_vehicle_bounding_box_no_overlap(self.visible_state[lane][id], candidate):
                 return False
         return True
     
-    def checkIfCandidateVisibleNoOverlapWithCurrentVisible(self, lane, candidate):
+    def check_if_candidate_visible_no_overlap_with_current_visible(self, lane, candidate):
         # Create a 1d bounding box for the lane that covers the backmost visible vehicle to the frontmost one. We cannot breach this.
-        lowest_vehicle = self.getLowestBehindVisibleVehicle(lane)
-        highest_vehicle = self.getHighestAheadVisibleVehicle(lane)
+        lowest_vehicle = self.get_lowest_behind_visible_vehicle(lane)
+        highest_vehicle = self.get_highest_ahead_visible_vehicle(lane)
         if lowest_vehicle is None:
             return True
         result = ((candidate["s"] + candidate["length"]) < lowest_vehicle["s"]) or (candidate["s"] > (highest_vehicle["s"] + highest_vehicle["length"]))
@@ -625,14 +625,14 @@ class I24CarlaCoupler:
             #print(f"WARNING: Threw away {candidate} because it was in an invalid visible position with respect to {lowest_vehicle} and {highest_vehicle}.\n")
         return result
     
-    def registerNewVisibleVehicle(self, vehicle_data, ignore_invalid_visible_cell_position=False):
+    def register_new_visible_vehicle(self, vehicle_data, ignore_invalid_visible_cell_position=False):
         if vehicle_data["id"] in self.vehicles_to_completely_ignore:
             print(f"WARNING: Threw away visible {vehicle_data} because it was marked as a vehicle to ignore.")
             return
-        visible_window = self.getCurrentVisibleWindow()
+        visible_window = self.get_current_visible_window()
         # Are we inside?
         if (vehicle_data["s"] > visible_window[2]) and (vehicle_data["s"] < visible_window[3]):
-            if ignore_invalid_visible_cell_position or self.checkIfInitVisibleNoOverlapWithCurrentVisible(vehicle_data["lane_id"], vehicle_data):
+            if ignore_invalid_visible_cell_position or self.check_if_init_visible_no_overlap_with_current_visible(vehicle_data["lane_id"], vehicle_data):
                 self.visible_state[vehicle_data["lane_id"]][vehicle_data["id"]] = vehicle_data
             else:
                 pass
@@ -643,7 +643,7 @@ class I24CarlaCoupler:
             #print(f"WARNING: Threw away {vehicle_data} because it wasn't in a valid visible position")
             #self.vehicles_to_completely_ignore.append(vehicle_data["id"]) # Permanently throw away
 
-    def registerNewGhostVehicle(self, vehicle_data, ignore_invalid_ghost_cell_position=False):
+    def register_new_ghost_vehicle(self, vehicle_data, ignore_invalid_ghost_cell_position=False):
         # When we get ghost vehicles in our case, it is solely from cars slipping out.
         # And we have the ghost region be 0 on each side. Thus, we simply destroy any vehicles that come in here.
         # We might have ghost vehicles later though - just so you know.

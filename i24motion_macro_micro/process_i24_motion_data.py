@@ -6,7 +6,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import gc
 
-def processData(trajectory_file: str, config_file: str):
+def process_data(trajectory_file: str, config_file: str):
     current_dir = os.getcwd()
     with open(trajectory_file, "r") as f:
         full_data = json.load(f)
@@ -31,27 +31,27 @@ def processData(trajectory_file: str, config_file: str):
     }
 
     # We assume all the lanes are on the right of the reference line
-    def tConversionFunction(y_position):
+    def t_conversion_function(y_position):
         return ((abs(y_position) - 12.0) * feet_to_meters) * -1
 
-    def convertXPositionToMarker(x_position):
+    def convert_x_position_to_marker(x_position):
         return x_position / mile_to_feet
 
-    def westboundMarkerToS(marker):
+    def westbound_marker_to_s(marker):
         return (((mapping_data["2"]["origin_marker"] - marker) * mile_to_feet) * feet_to_meters) + mapping_data["2"]["origin_meter"]
 
-    def eastboundMarkerToS(marker):
+    def eastbound_marker_to_s(marker):
         return (((marker - mapping_data["1"]["origin_marker"]) * mile_to_feet) * feet_to_meters) + mapping_data["1"]["origin_meter"]
 
-    def convertYPositionToRoadAndLaneAndT(y_position):
-        t_position = tConversionFunction(y_position)
+    def convert_y_position_to_road_and_lane_and_t(y_position):
+        t_position = t_conversion_function(y_position)
         for road in road_lane_data:
             for lane in road_lane_data[road]:
                 bounds = road_lane_data[road][lane]
                 if (y_position > bounds[0]) and (y_position < bounds[1]):
                     return t_position, road, lane
 
-    def processDataIntoDicts(source_data, roads, lanes, unique_id_count=1):
+    def process_data_into_dicts(source_data, roads, lanes, unique_id_count=1):
         road_lane_trajectory_data = {}
         for road in roads:
             road_lane_trajectory_data[road] = {}
@@ -80,18 +80,18 @@ def processData(trajectory_file: str, config_file: str):
                 new_obj_height = entry["height"]
                 new_obj_class = entry["coarse_vehicle_class"]
 
-                marker = convertXPositionToMarker(new_obj_x)
-                res = convertYPositionToRoadAndLaneAndT(new_obj_y)
+                marker = convert_x_position_to_marker(new_obj_x)
+                res = convert_y_position_to_road_and_lane_and_t(new_obj_y)
                 if (res == None):
                     continue
                 new_obj_t, new_obj_road, new_obj_lane = res
                 new_obj_s = None
                 #Eastbound
                 if new_obj_road == 1:
-                    new_obj_s = eastboundMarkerToS(marker)
+                    new_obj_s = eastbound_marker_to_s(marker)
                 # Westbound
                 elif new_obj_road == 2:
-                    new_obj_s = westboundMarkerToS(marker)
+                    new_obj_s = westbound_marker_to_s(marker)
 
                 new_obj_id = unique_id_count
                 road_lane_trajectory_data[new_obj_road][new_obj_lane]["time"].append(new_obj_time)
@@ -107,7 +107,7 @@ def processData(trajectory_file: str, config_file: str):
             unique_id_count += 1
         return road_lane_trajectory_data
 
-    road_lane_trajectory_data = processDataIntoDicts(full_data, roads, lanes)
+    road_lane_trajectory_data = process_data_into_dicts(full_data, roads, lanes)
 
     def generator_function(road_and_lane_data):
         print(len(road_and_lane_data["id"]))
@@ -162,13 +162,13 @@ def processData(trajectory_file: str, config_file: str):
 
     os.chdir(current_dir)
 
-processData("i24_motion_source_data/2022-11-21.json", "config/2022-11-21.json")
-processData("i24_motion_source_data/2022-11-22.json", "config/2022-11-22.json")
-processData("i24_motion_source_data/2022-11-23.json", "config/2022-11-23.json")
-processData("i24_motion_source_data/2022-11-24.json", "config/2022-11-24.json")
-processData("i24_motion_source_data/2022-11-25.json", "config/2022-11-25.json")
-processData("i24_motion_source_data/2022-11-28.json", "config/2022-11-28.json")
-processData("i24_motion_source_data/2022-11-29.json", "config/2022-11-29.json")
-processData("i24_motion_source_data/2022-11-30.json", "config/2022-11-30.json")
-processData("i24_motion_source_data/2022-12-01.json", "config/2022-12-01.json")
-processData("i24_motion_source_data/2022-12-02.json", "config/2022-12-02.json")
+process_data("i24_motion_source_data/2022-11-21.json", "config/2022-11-21.json")
+process_data("i24_motion_source_data/2022-11-22.json", "config/2022-11-22.json")
+process_data("i24_motion_source_data/2022-11-23.json", "config/2022-11-23.json")
+process_data("i24_motion_source_data/2022-11-24.json", "config/2022-11-24.json")
+process_data("i24_motion_source_data/2022-11-25.json", "config/2022-11-25.json")
+process_data("i24_motion_source_data/2022-11-28.json", "config/2022-11-28.json")
+process_data("i24_motion_source_data/2022-11-29.json", "config/2022-11-29.json")
+process_data("i24_motion_source_data/2022-11-30.json", "config/2022-11-30.json")
+process_data("i24_motion_source_data/2022-12-01.json", "config/2022-12-01.json")
+process_data("i24_motion_source_data/2022-12-02.json", "config/2022-12-02.json")

@@ -73,25 +73,25 @@ class I24MicroCouplerBase:
         self.ghost_state = None
         self.current_timestamp = None
         self.next_vehicle_id = 0
-        self.loadHero(int(hero_road), desired_time, desired_s)
-        self.loadVisible()
-        self.loadGhosts()
+        self.load_hero(int(hero_road), desired_time, desired_s)
+        self.load_visible()
+        self.load_ghosts()
 
     # ------------------------------------------------------------------
     # Engine interface — implemented by the concrete coupler
     # ------------------------------------------------------------------
 
-    def initializeEngine(self):
+    def initialize_engine(self):
         """Bring the microscopic engine up and populate it from the seeded
         hero/visible state.  Called once, lazily, on the first step()."""
         raise NotImplementedError
 
-    def syncEngineWithVisibleState(self):
+    def sync_engine_with_visible_state(self):
         """Reconcile the engine's vehicle population with self.visible_state:
         insert whatever the macro flux just spawned, remove whatever left."""
         raise NotImplementedError
 
-    def advanceEngine(self, dt):
+    def advance_engine(self, dt):
         """Run the engine forward by dt seconds.
 
         Returns (hero_state, visible_states) where hero_state is a
@@ -101,16 +101,16 @@ class I24MicroCouplerBase:
         """
         raise NotImplementedError
 
-    def destroyEngine(self):
+    def destroy_engine(self):
         """Tear the engine down.  Called by the bridge when the bubble retires."""
         raise NotImplementedError
 
     def initialize(self):
-        self.initializeEngine()
+        self.initialize_engine()
         self.initialized = True
 
     def destroy(self):
-        self.destroyEngine()
+        self.destroy_engine()
 
     # ------------------------------------------------------------------
     # Bridge callback
@@ -123,7 +123,7 @@ class I24MicroCouplerBase:
         The first call only stands the engine up; the window does not move
         until the engine is live, which matches the CARLA coupler's behaviour.
         """
-        hero = self.getHeroData()
+        hero = self.get_hero_data()
         anchor_speed = hero["velocity"]
         middle_s = hero["s"]
 
@@ -131,12 +131,12 @@ class I24MicroCouplerBase:
             self.initialize()
             return middle_s
 
-        self.visible_state = self.injectVehiclesFromMacro(self.getVisibleData())
-        self.syncEngineWithVisibleState()
-        new_hero_state, new_visible_states = self.advanceEngine(self.dt)
-        self.updateHeroVehicleFromEngine(new_hero_state)
-        self.updateVisibleVehiclesFromEngine(new_visible_states)
-        vehicles = self.collateVisibleAndHeroVehicles(self.bridge)
+        self.visible_state = self.inject_vehicles_from_macro(self.get_visible_data())
+        self.sync_engine_with_visible_state()
+        new_hero_state, new_visible_states = self.advance_engine(self.dt)
+        self.update_hero_vehicle_from_engine(new_hero_state)
+        self.update_visible_vehicles_from_engine(new_visible_states)
+        vehicles = self.collate_visible_and_hero_vehicles(self.bridge)
 
         self.bridge.update_vehicles(vehicles)
         self.bridge.anchor_speed = anchor_speed
@@ -169,13 +169,13 @@ class I24MicroCouplerBase:
         ]
         return {lane: window[window["lane_id"] == lane] for lane in self.lanes}
 
-    def getVehicleTrajectoryFromReal(self, id, lane):
+    def get_vehicle_trajectory_from_real(self, id, lane):
         df = self.motion_data.micro_df
         window = df[(df["id"] == id) & (df["lane_id"] == lane)]
         return window
 
-    def estimateVehicleVelocityFromReal(self, id, lane, current_time):
-        trajectory = self.getVehicleTrajectoryFromReal(id, lane)
+    def estimate_vehicle_velocity_from_real(self, id, lane, current_time):
+        trajectory = self.get_vehicle_trajectory_from_real(id, lane)
         trajectory_time_sorted = trajectory.sort_values(by=["time"], ascending=True)
         if len(trajectory_time_sorted) < 2:
             return 0.0
@@ -198,10 +198,10 @@ class I24MicroCouplerBase:
             - trajectory_time_sorted.iloc[current_index]["time"]
         )
 
-    def estimateGhostVehicleVelocity(self, vehicle_data):
+    def estimate_ghost_vehicle_velocity(self, vehicle_data):
         # Replay its velocity for as long as the trajectory data lasts; once that
         # expires the ghost is discarded and whatever replaces it is used instead.
-        return self.estimateVehicleVelocityFromReal(
+        return self.estimate_vehicle_velocity_from_real(
             vehicle_data["id"], vehicle_data["lane_id"], self.current_timestamp
         )
 
@@ -209,20 +209,20 @@ class I24MicroCouplerBase:
     # Vehicle state construction
     # ------------------------------------------------------------------
 
-    def generateNextVehicleID(self):
+    def generate_next_vehicle_id(self):
         new_id = self.next_vehicle_id
         self.next_vehicle_id += 1
         return new_id
 
-    def generateVehicleStateFromRow(self, row, lane, current_timestamp=None):
+    def generate_vehicle_state_from_row(self, row, lane, current_timestamp=None):
         if current_timestamp is None:
             current_timestamp = self.current_timestamp
-        estimated_velocity = self.estimateVehicleVelocityFromReal(
+        estimated_velocity = self.estimate_vehicle_velocity_from_real(
             int(row["id"]), lane, float(row["time"])
         )
         estimated_s = float(row["s"]) + ((current_timestamp - float(row["time"])) * estimated_velocity)
         return {
-            "id": self.generateNextVehicleID(),
+            "id": self.generate_next_vehicle_id(),
             "class": str(row["class"]),
             "length": float(row["length"]),
             "width": float(row["width"]),
@@ -235,18 +235,18 @@ class I24MicroCouplerBase:
         }
 
     # behind_or_in_front is either "behind" or "front"
-    def generateVehicleStateFromSpawn(self, lane, s_min, s_max, behind_or_in_front="behind"):
+    def generate_vehicle_state_from_spawn(self, lane, s_min, s_max, behind_or_in_front="behind"):
         if (behind_or_in_front != "behind") and (behind_or_in_front != "front"):
             return None  # Force failure upstream.
         new_time = self.current_timestamp
         estimated_velocity = (
-            self.getBehindLaneVelocityMicro(lane, 0.0)
+            self.get_behind_lane_velocity_micro(lane, 0.0)
             if (behind_or_in_front == "behind")
-            else self.getAheadLaneVelocityMicro(lane, 0.0)
+            else self.get_ahead_lane_velocity_micro(lane, 0.0)
         )
         estimated_width = 3.5  # Hardcoded pending a lane/road cross-reference lookup.
         return {
-            "id": self.generateNextVehicleID(),
+            "id": self.generate_next_vehicle_id(),
             "class": "spawned",
             "length": float(s_max - s_min),
             "width": estimated_width,
@@ -258,7 +258,7 @@ class I24MicroCouplerBase:
             "road_id": self.hero_road,
         }
 
-    def generateUpdatedVehicleStateFromEngine(self, vehicle_data):
+    def generate_updated_vehicle_state_from_engine(self, vehicle_data):
         new_time = self.current_timestamp
         return {
             "id": int(vehicle_data["id"]),
@@ -277,7 +277,7 @@ class I24MicroCouplerBase:
     # Seeding
     # ------------------------------------------------------------------
 
-    def loadHero(self, hero_road, desired_time, desired_s):
+    def load_hero(self, hero_road, desired_time, desired_s):
         potential_heroes = pandas.concat(
             list(
                 (
@@ -299,7 +299,7 @@ class I24MicroCouplerBase:
         )
         selected_hero = potential_heroes_sorted.iloc[0]
         hero_lane = selected_hero.lane_id
-        original_hero_state = self.generateVehicleStateFromRow(
+        original_hero_state = self.generate_vehicle_state_from_row(
             selected_hero, hero_lane, float(selected_hero["time"])
         )
         self.hero_state = original_hero_state
@@ -307,13 +307,13 @@ class I24MicroCouplerBase:
         self.current_timestamp = original_hero_state["time"]
         self.anchor_speed = self.hero_state["velocity"]
 
-    def loadVisible(self):
+    def load_visible(self):
         self.visible_state = {}
-        for lane in self.getLanes():
+        for lane in self.get_lanes():
             self.visible_state[lane] = {}
-        min_timestamp, max_timestamp, min_s, max_s = self.getCurrentVisibleWindow()
+        min_timestamp, max_timestamp, min_s, max_s = self.get_current_visible_window()
         potential_visibles = self.get_lane_dfs(min_timestamp, max_timestamp, min_s, max_s)
-        for lane in self.getLanes():
+        for lane in self.get_lanes():
             potential_visibles_lane_sorted = potential_visibles[lane].sort_values(
                 by=["time"], ascending=True
             )
@@ -330,14 +330,14 @@ class I24MicroCouplerBase:
                         by=["time_delta"], ascending=True
                     )
                     unique_vehicle_data_row = unique_vehicle_data_sorted.iloc[0]
-                    candidate = self.generateVehicleStateFromRow(unique_vehicle_data_row, lane)
-                    self.registerNewVisibleVehicle(candidate)
+                    candidate = self.generate_vehicle_state_from_row(unique_vehicle_data_row, lane)
+                    self.register_new_visible_vehicle(candidate)
 
-    def loadGhosts(self, ignore_ids=None):
+    def load_ghosts(self, ignore_ids=None):
         # The ghost region is 0 m on each side in the current configuration, so
         # there is nothing to load. Kept for symmetry with the visible state.
         self.ghost_state = {"behind": {}, "ahead": {}}
-        for lane in self.getLanes():
+        for lane in self.get_lanes():
             self.ghost_state["behind"][lane] = {}
             self.ghost_state["ahead"][lane] = {}
 
@@ -345,7 +345,7 @@ class I24MicroCouplerBase:
     # Windows and accessors
     # ------------------------------------------------------------------
 
-    def getCurrentVisibleWindow(self):
+    def get_current_visible_window(self):
         return (
             self.current_timestamp - self.visible_time_max_difference,
             self.current_timestamp + self.visible_time_max_difference,
@@ -353,7 +353,7 @@ class I24MicroCouplerBase:
             self.hero_state["s"] + self.visible_window,
         )
 
-    def getCurrentBehindGhostWindow(self):
+    def get_current_behind_ghost_window(self):
         return (
             self.current_timestamp - self.ghost_time_max_difference,
             self.current_timestamp + self.ghost_time_max_difference,
@@ -361,7 +361,7 @@ class I24MicroCouplerBase:
             self.hero_state["s"] - self.visible_window,
         )
 
-    def getCurrentAheadGhostWindow(self):
+    def get_current_ahead_ghost_window(self):
         return (
             self.current_timestamp - self.ghost_time_max_difference,
             self.current_timestamp + self.ghost_time_max_difference,
@@ -369,42 +369,42 @@ class I24MicroCouplerBase:
             self.hero_state["s"] + self.visible_window + self.ghost_window,
         )
 
-    def getLanes(self):
+    def get_lanes(self):
         return self.lanes
 
-    def getVisibleIds(self):
+    def get_visible_ids(self):
         result = {}
-        for lane in self.getLanes():
+        for lane in self.get_lanes():
             result[lane] = [id for id in self.visible_state[lane]]
         return result
 
-    def getVisibleIdsFlat(self):
-        visible_ids = self.getVisibleIds()
-        return sum([visible_ids[lane] for lane in self.getLanes()], [])
+    def get_visible_ids_flat(self):
+        visible_ids = self.get_visible_ids()
+        return sum([visible_ids[lane] for lane in self.get_lanes()], [])
 
-    def getGhostIds(self):
+    def get_ghost_ids(self):
         result = {"behind": {}, "ahead": {}}
         for position in self.ghost_state:
-            for lane in self.getLanes():
+            for lane in self.get_lanes():
                 result[position][lane] = [id for id in self.ghost_state[position][lane]]
         return result
 
-    def getVisibleData(self):
+    def get_visible_data(self):
         return self.visible_state
 
-    def getGhostData(self):
+    def get_ghost_data(self):
         return self.ghost_state
 
-    def getHeroData(self):
+    def get_hero_data(self):
         return self.hero_state
 
     # This is meant for the upper level fluid simulator, which wants string road
     # ids and bubble-relative positions.
-    def collateVisibleAndHeroVehicles(self, bridge):
+    def collate_visible_and_hero_vehicles(self, bridge):
         result = {}
-        visible_data = self.getVisibleData()
-        hero_data = self.getHeroData()
-        min_timestamp, max_timestamp, min_s, max_s = self.getCurrentVisibleWindow()
+        visible_data = self.get_visible_data()
+        hero_data = self.get_hero_data()
+        min_timestamp, max_timestamp, min_s, max_s = self.get_current_visible_window()
         for lane in visible_data:
             visible_data_copied = copy.deepcopy(visible_data[lane])
             for i in visible_data_copied:
@@ -429,19 +429,19 @@ class I24MicroCouplerBase:
         )
         return result
 
-    def getLowestBehindGhostVehicle(self, lane):
+    def get_lowest_behind_ghost_vehicle(self, lane):
         return self._extremum(self.ghost_state["behind"][lane], lowest=True)
 
-    def getHighestAheadGhostVehicle(self, lane):
+    def get_highest_ahead_ghost_vehicle(self, lane):
         return self._extremum(self.ghost_state["ahead"][lane], lowest=False)
 
-    def getLowestAheadGhostVehicle(self, lane):
+    def get_lowest_ahead_ghost_vehicle(self, lane):
         return self._extremum(self.ghost_state["ahead"][lane], lowest=True)
 
-    def getLowestBehindVisibleVehicle(self, lane):
+    def get_lowest_behind_visible_vehicle(self, lane):
         return self._extremum(self.visible_state[lane], lowest=True)
 
-    def getHighestAheadVisibleVehicle(self, lane):
+    def get_highest_ahead_visible_vehicle(self, lane):
         return self._extremum(self.visible_state[lane], lowest=False)
 
     @staticmethod
@@ -470,40 +470,40 @@ class I24MicroCouplerBase:
             return None  # Masks are not connected to one another.
         return cell
 
-    def getAheadLaneVelocityMacro(self, lane_id, default_speed, min_cell_size=25.0):
+    def get_ahead_lane_velocity_macro(self, lane_id, default_speed, min_cell_size=25.0):
         cell = self._neighbor_cell(lane_id, "ahead")
         if cell is None:
             return default_speed
         return cell.fd.velocity_from_density(cell.mass / (cell.end_s - cell.start_s))
 
-    def getBehindLaneVelocityMacro(self, lane_id, default_speed):
+    def get_behind_lane_velocity_macro(self, lane_id, default_speed):
         cell = self._neighbor_cell(lane_id, "behind")
         if cell is None:
             return default_speed
         return cell.fd.velocity_from_density(cell.mass / (cell.end_s - cell.start_s))
 
-    def getAheadLaneDensity(self, lane_id, default_density):
+    def get_ahead_lane_density(self, lane_id, default_density):
         cell = self._neighbor_cell(lane_id, "ahead")
         if cell is None:
             return default_density
         return cell.mass / (cell.end_s - cell.start_s)
 
-    def getBehindLaneDensity(self, lane_id, default_density):
+    def get_behind_lane_density(self, lane_id, default_density):
         cell = self._neighbor_cell(lane_id, "behind")
         if cell is None:
             return default_density
         return cell.mass / (cell.end_s - cell.start_s)
 
-    def getAheadLaneVelocityMicro(self, lane_id, default_speed, min_cell_size=25.0):
-        front_most_vehicle = self.getHighestAheadVisibleVehicle(lane_id)
+    def get_ahead_lane_velocity_micro(self, lane_id, default_speed, min_cell_size=25.0):
+        front_most_vehicle = self.get_highest_ahead_visible_vehicle(lane_id)
         if front_most_vehicle is None:
-            return self.getAheadLaneVelocityMacro(lane_id, default_speed, min_cell_size)
+            return self.get_ahead_lane_velocity_macro(lane_id, default_speed, min_cell_size)
         return front_most_vehicle["velocity"]
 
-    def getBehindLaneVelocityMicro(self, lane_id, default_speed, min_cell_size=25.0):
-        rear_most_vehicle = self.getLowestBehindVisibleVehicle(lane_id)
+    def get_behind_lane_velocity_micro(self, lane_id, default_speed, min_cell_size=25.0):
+        rear_most_vehicle = self.get_lowest_behind_visible_vehicle(lane_id)
         if rear_most_vehicle is None:
-            return self.getBehindLaneVelocityMacro(lane_id, default_speed)
+            return self.get_behind_lane_velocity_macro(lane_id, default_speed)
         return rear_most_vehicle["velocity"]
 
     # ------------------------------------------------------------------
@@ -511,13 +511,13 @@ class I24MicroCouplerBase:
     # ------------------------------------------------------------------
 
     # behind_or_in_front is either "behind" or "front"
-    def _createVehicleSpawnsInSRange(
+    def _create_vehicle_spawns_in_s_range(
         self, new_visible_states, lane, vehicle_count, s_min, s_max, behind_or_in_front, toprint=False
     ):
         density = (
-            self.getBehindLaneDensity(lane, 0.001)
+            self.get_behind_lane_density(lane, 0.001)
             if (behind_or_in_front == "behind")
-            else self.getAheadLaneDensity(lane, 0.001)
+            else self.get_ahead_lane_density(lane, 0.001)
         )
         spawn_lengths = min(
             max(1.0 / density, self.min_spawn_length), max(s_max - s_min, self.min_spawn_length)
@@ -541,19 +541,19 @@ class I24MicroCouplerBase:
                 start_position_calculated = start_position + self.min_spawn_distance
                 end_position_calculated = start_position + spawn_lengths
 
-            new_vehicle_data = self.generateVehicleStateFromSpawn(
+            new_vehicle_data = self.generate_vehicle_state_from_spawn(
                 lane, start_position_calculated, end_position_calculated, behind_or_in_front
             )
             new_visible_states[lane][new_vehicle_data["id"]] = new_vehicle_data
         return new_visible_states, vehicle_count
 
-    def _spawnVehiclesInRear(self, new_visible_states, lane, s_availability):
+    def _spawn_vehicles_in_rear(self, new_visible_states, lane, s_availability):
         rear_flux_memory = self.bridge.flow_memory_rear[lane]
-        visible_window = self.getCurrentVisibleWindow()
+        visible_window = self.get_current_visible_window()
         if rear_flux_memory > 0.0:
             vehicle_count = min(math.floor(rear_flux_memory), self.vehicle_spawn_limit)
             if vehicle_count > 0:
-                new_visible_states, vehicle_count = self._createVehicleSpawnsInSRange(
+                new_visible_states, vehicle_count = self._create_vehicle_spawns_in_s_range(
                     new_visible_states,
                     lane,
                     vehicle_count,
@@ -564,13 +564,13 @@ class I24MicroCouplerBase:
                 self.bridge.flow_memory_rear[lane] -= vehicle_count
         return new_visible_states
 
-    def _spawnVehiclesInFront(self, new_visible_states, lane, s_availability):
+    def _spawn_vehicles_in_front(self, new_visible_states, lane, s_availability):
         front_flux_memory = self.bridge.flow_memory_front[lane]
-        visible_window = self.getCurrentVisibleWindow()
+        visible_window = self.get_current_visible_window()
         if front_flux_memory < 0.0:
             vehicle_count = min(math.floor(-front_flux_memory), self.vehicle_spawn_limit)
             if vehicle_count > 0:
-                new_visible_states, vehicle_count = self._createVehicleSpawnsInSRange(
+                new_visible_states, vehicle_count = self._create_vehicle_spawns_in_s_range(
                     new_visible_states,
                     lane,
                     vehicle_count,
@@ -581,9 +581,9 @@ class I24MicroCouplerBase:
                 self.bridge.flow_memory_front[lane] += vehicle_count
         return new_visible_states
 
-    def injectVehiclesFromMacro(self, new_visible_states):
-        visible_window = self.getCurrentVisibleWindow()
-        for lane in self.getLanes():
+    def inject_vehicles_from_macro(self, new_visible_states):
+        visible_window = self.get_current_visible_window()
+        for lane in self.get_lanes():
             # Rear boundary: how much clear road is there behind the rearmost car?
             rear_s = None
             rear_velocity = None
@@ -595,13 +595,13 @@ class I24MicroCouplerBase:
             if rear_s is None:
                 s_availability = visible_window[3] - visible_window[2]
             else:
-                desired_macro_velocity = self.getBehindLaneVelocityMacro(lane, 0.0)
+                desired_macro_velocity = self.get_behind_lane_velocity_macro(lane, 0.0)
                 closing_rate = desired_macro_velocity - rear_velocity
                 rear_s = min(rear_s, rear_s - (closing_rate * self.spawn_ttc))
                 s_availability = rear_s - visible_window[2]
             s_availability = min(s_availability, self.spawn_region)
             if s_availability > self.spawn_threshold:
-                new_visible_states = self._spawnVehiclesInRear(new_visible_states, lane, s_availability)
+                new_visible_states = self._spawn_vehicles_in_rear(new_visible_states, lane, s_availability)
 
             # Front boundary: same, ahead of the frontmost car.
             front_s = None
@@ -614,13 +614,13 @@ class I24MicroCouplerBase:
             if front_s is None:
                 s_availability = visible_window[3] - visible_window[2]
             else:
-                desired_macro_velocity = self.getAheadLaneVelocityMacro(lane, 0.0)
+                desired_macro_velocity = self.get_ahead_lane_velocity_macro(lane, 0.0)
                 closing_rate = front_velocity - desired_macro_velocity
                 front_s = max(front_s, front_s + (closing_rate * self.spawn_ttc))
                 s_availability = visible_window[3] - front_s
             s_availability = min(s_availability, self.spawn_region)
             if s_availability > self.spawn_threshold:
-                new_visible_states = self._spawnVehiclesInFront(new_visible_states, lane, s_availability)
+                new_visible_states = self._spawn_vehicles_in_front(new_visible_states, lane, s_availability)
 
         return new_visible_states
 
@@ -628,12 +628,12 @@ class I24MicroCouplerBase:
     # Micro -> macro readback
     # ------------------------------------------------------------------
 
-    def updateHeroVehicleFromEngine(self, new_hero_state):
-        hero_state_processed = self.generateUpdatedVehicleStateFromEngine(new_hero_state)
+    def update_hero_vehicle_from_engine(self, new_hero_state):
+        hero_state_processed = self.generate_updated_vehicle_state_from_engine(new_hero_state)
         hero_state_processed["velocity"] = float(new_hero_state["velocity"])
         self.hero_state = hero_state_processed
 
-    def updateVisibleVehiclesFromEngine(self, new_visible_states):
+    def update_visible_vehicles_from_engine(self, new_visible_states):
         """Rebuild ``visible_state`` from what the engine reports.
 
         ``new_visible_states`` is keyed by each vehicle's *current* lane, so a
@@ -643,21 +643,21 @@ class I24MicroCouplerBase:
         over all lanes still balances.
         """
         self.visible_state = {}
-        for lane in self.getLanes():
+        for lane in self.get_lanes():
             self.visible_state[lane] = {}
-        for lane in self.getLanes():
+        for lane in self.get_lanes():
             for vehicle_id in new_visible_states[lane]:
                 vehicle_data = new_visible_states[lane][vehicle_id]
-                visible_window = self.getCurrentVisibleWindow()
+                visible_window = self.get_current_visible_window()
                 if vehicle_data["s"] < visible_window[2]:
                     self.bridge.flow_memory_rear[lane] += 1
                 elif vehicle_data["s"] > visible_window[3]:
                     self.bridge.flow_memory_front[lane] -= 1
                 else:
-                    new_data = self.generateUpdatedVehicleStateFromEngine(vehicle_data)
-                    self.registerNewVisibleVehicle(new_data, True)
+                    new_data = self.generate_updated_vehicle_state_from_engine(vehicle_data)
+                    self.register_new_visible_vehicle(new_data, True)
 
-    def creditLostVehicle(self, lane_id, side):
+    def credit_lost_vehicle(self, lane_id, side):
         """Return a vanished vehicle's mass to the macro flux memory.
 
         The engine calls this when a vehicle it was tracking disappears for a
@@ -677,28 +677,28 @@ class I24MicroCouplerBase:
     # Ghost promotion (inactive while ghost_window == 0)
     # ------------------------------------------------------------------
 
-    def updateVisibleVehiclesWithGhostSelection(self, ghost_data):
-        visible_window = self.getCurrentVisibleWindow()
-        for lane in self.getLanes():
+    def update_visible_vehicles_with_ghost_selection(self, ghost_data):
+        visible_window = self.get_current_visible_window()
+        for lane in self.get_lanes():
             for id in ghost_data[lane]:
                 candidate = ghost_data[lane][id]
                 candidate_new_s = candidate["s"] + (
                     candidate["velocity"] * (self.current_timestamp - candidate["time"])
                 )
                 if (candidate_new_s > visible_window[2]) and (candidate_new_s < visible_window[3]):
-                    if self.checkIfCandidateVisibleNoOverlapWithCurrentVisible(lane, candidate):
+                    if self.check_if_candidate_visible_no_overlap_with_current_visible(lane, candidate):
                         candidate["s"] = candidate_new_s
-                        self.registerNewVisibleVehicle(candidate)
+                        self.register_new_visible_vehicle(candidate)
 
-    def updateVisibleVehiclesViaGhosts(self):
-        self.updateVisibleVehiclesWithGhostSelection(self.ghost_state["behind"])
-        self.updateVisibleVehiclesWithGhostSelection(self.ghost_state["ahead"])
+    def update_visible_vehicles_via_ghosts(self):
+        self.update_visible_vehicles_with_ghost_selection(self.ghost_state["behind"])
+        self.update_visible_vehicles_with_ghost_selection(self.ghost_state["ahead"])
 
     # ------------------------------------------------------------------
     # Geometry checks and registration
     # ------------------------------------------------------------------
 
-    def checkVehicleBoundingBoxNoOverlap(self, vehicle1, vehicle2):
+    def check_vehicle_bounding_box_no_overlap(self, vehicle1, vehicle2):
         vehicle_first = vehicle1 if (vehicle1["s"] < vehicle2["s"]) else vehicle2
         vehicle_second = vehicle1 if (vehicle1["s"] > vehicle2["s"]) else vehicle2
         vehicle_first_min = vehicle_first["s"]
@@ -707,41 +707,41 @@ class I24MicroCouplerBase:
 
         return (vehicle_first_min < vehicle_second_min) and (vehicle_first_max < vehicle_second_min)
 
-    def checkIfCandidateGhostNoOverlapWithCurrentGhosts(self, ghost_data, candidate):
+    def check_if_candidate_ghost_no_overlap_with_current_ghosts(self, ghost_data, candidate):
         for id in ghost_data:
-            if not self.checkVehicleBoundingBoxNoOverlap(ghost_data[id], candidate):
+            if not self.check_vehicle_bounding_box_no_overlap(ghost_data[id], candidate):
                 return False
         return True
 
-    def checkIfInitVisibleNoOverlapWithCurrentVisible(self, lane, candidate):
+    def check_if_init_visible_no_overlap_with_current_visible(self, lane, candidate):
         for id in self.visible_state[lane]:
-            if not self.checkVehicleBoundingBoxNoOverlap(self.visible_state[lane][id], candidate):
+            if not self.check_vehicle_bounding_box_no_overlap(self.visible_state[lane][id], candidate):
                 return False
         return True
 
-    def checkIfCandidateVisibleNoOverlapWithCurrentVisible(self, lane, candidate):
+    def check_if_candidate_visible_no_overlap_with_current_visible(self, lane, candidate):
         # 1d bounding box over the lane, from the backmost visible vehicle to the
         # frontmost one. A candidate may not breach it.
-        lowest_vehicle = self.getLowestBehindVisibleVehicle(lane)
-        highest_vehicle = self.getHighestAheadVisibleVehicle(lane)
+        lowest_vehicle = self.get_lowest_behind_visible_vehicle(lane)
+        highest_vehicle = self.get_highest_ahead_visible_vehicle(lane)
         if lowest_vehicle is None:
             return True
         return ((candidate["s"] + candidate["length"]) < lowest_vehicle["s"]) or (
             candidate["s"] > (highest_vehicle["s"] + highest_vehicle["length"])
         )
 
-    def registerNewVisibleVehicle(self, vehicle_data, ignore_invalid_visible_cell_position=False):
+    def register_new_visible_vehicle(self, vehicle_data, ignore_invalid_visible_cell_position=False):
         if vehicle_data["id"] in self.vehicles_to_completely_ignore:
             print(f"WARNING: Threw away visible {vehicle_data} because it was marked as a vehicle to ignore.")
             return
-        visible_window = self.getCurrentVisibleWindow()
+        visible_window = self.get_current_visible_window()
         if (vehicle_data["s"] > visible_window[2]) and (vehicle_data["s"] < visible_window[3]):
-            if ignore_invalid_visible_cell_position or self.checkIfInitVisibleNoOverlapWithCurrentVisible(
+            if ignore_invalid_visible_cell_position or self.check_if_init_visible_no_overlap_with_current_visible(
                 vehicle_data["lane_id"], vehicle_data
             ):
                 self.visible_state[vehicle_data["lane_id"]][vehicle_data["id"]] = vehicle_data
 
-    def registerNewGhostVehicle(self, vehicle_data, ignore_invalid_ghost_cell_position=False):
+    def register_new_ghost_vehicle(self, vehicle_data, ignore_invalid_ghost_cell_position=False):
         # With a 0 m ghost region on each side there is nothing to hold onto, so
         # vehicles that slip out are simply dropped here.
         pass

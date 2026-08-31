@@ -95,14 +95,14 @@ class I24SumoCoupler(I24MicroCouplerBase):
     # Engine interface
     # ------------------------------------------------------------------
 
-    def initializeEngine(self):
-        self.sumo_sim.initializeSimulation()
+    def initialize_engine(self):
+        self.sumo_sim.initialize_simulation()
 
-    def syncEngineWithVisibleState(self):
-        self.sumo_sim.updateSimulation()
+    def sync_engine_with_visible_state(self):
+        self.sumo_sim.update_simulation()
 
-    def advanceEngine(self, dt):
-        return self.sumo_sim.runSimulationOver(dt)
+    def advance_engine(self, dt):
+        return self.sumo_sim.run_simulation_over(dt)
 
-    def destroyEngine(self):
-        self.sumo_sim.destroySimulation()
+    def destroy_engine(self):
+        self.sumo_sim.destroy_simulation()

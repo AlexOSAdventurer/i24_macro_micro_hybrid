@@ -78,7 +78,7 @@ class I24SimulationData:
             print(f"Generating micro data for road {road}")
             road_str = str(road)
             road_config = self.config["road_data"][road_str]
-            all_vehicles = self.micro_source_data[road].queryEdieBoxBatch([road_config["time_origin"]], [road_config["time_origin"] + road_config["time_length"]], [0.0], [road_config["road_length"]])[0]
+            all_vehicles = self.micro_source_data[road].query_edie_box_batch([road_config["time_origin"]], [road_config["time_origin"] + road_config["time_length"]], [0.0], [road_config["road_length"]])[0]
             for lane in all_vehicles:
                 all_vehicles_selected_columns = all_vehicles[lane][["id", "time", "class", "s", "t", "length", "width", "height"]].copy()
                 all_vehicles_selected_columns["length"] *= feet_to_meters
@@ -106,7 +106,7 @@ class I24SimulationData:
             time_origin = road_config["time_origin"]
             time_length = road_config["time_length"]
             time_step = road_config["time_step"]
-            macro_data = self.macro_source_data[road].loadProcessedMacroData()
+            macro_data = self.macro_source_data[road].load_processed_macro_data()
 
             time_list = []
             timelength_list = []
@@ -167,7 +167,7 @@ class I24SimulationData:
             road_config = self.config["road_data"][road_str]
             time_origin = road_config["time_origin"]
             time_step = road_config["time_step"]
-            macro_data = self.macro_source_data[road].loadProcessedMacroData()
+            macro_data = self.macro_source_data[road].load_processed_macro_data()
 
             density_total = None
             flow_total = None
