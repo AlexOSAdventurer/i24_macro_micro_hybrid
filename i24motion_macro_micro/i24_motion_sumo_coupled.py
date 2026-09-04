@@ -313,6 +313,7 @@ class I24MotionSumoSimulationCoupled:
 
         # Honour the empirical geometry exactly rather than quantising it to a
         # fixed vehicle model, which the CARLA path has to do.
+
         try:
             self.conn.vehicle.setLength(veh_id, length)
             self.conn.vehicle.setWidth(veh_id, width)
@@ -321,6 +322,11 @@ class I24MotionSumoSimulationCoupled:
             # the gap looks tight, which the spawn geometry has already sized.
             self.conn.vehicle.moveTo(veh_id, lane_id, front_pos)
             self.conn.vehicle.setSpeed(veh_id, speed)
+            self.conn.vehicle.setMinGap(veh_id, self.coupler.min_spawn_distance)
+            self.conn.vehicle.setMaxSpeed(veh_id, self.coupler.fd.v_f)
+            self.conn.vehicle.setAccel(veh_id, 1.5)
+            self.conn.vehicle.setDecel(veh_id, 2.0)
+            self.conn.vehicle.setTau(veh_id, 1.0 / (self.coupler.fd.w * self.coupler.fd.rho_j))
         except Exception as exc:
             print(f"WARNING: could not place {veh_id} at {lane_id}@{front_pos:.2f}: {exc}")
         return veh_id
@@ -392,6 +398,9 @@ class I24MotionSumoSimulationCoupled:
         except Exception:
             return 30.0
 
+    def get_current_visible_window_substep(self):
+        return self.hero_state["last_s"] - self.coupler.visible_window, self.hero_state["last_s"] + self.coupler.visible_window, 
+
     def apply_lead_vehicle_speeds(self):
         """Push the downstream macroscopic velocity onto each lane's leader.
 
@@ -405,11 +414,12 @@ class I24MotionSumoSimulationCoupled:
             return
         road_id = str(self.coupler.hero_road)
         leaders: Dict[int, Optional[dict]] = {lane: None for lane in self.coupler.get_lanes()}
+        rear_edge, front_edge = self.get_current_visible_window_substep()
         for cosim_id, record in self.visible_states.items():
             lane = record["last_lane_id"]
             if lane not in leaders:
                 continue
-            if (leaders[lane] is None) or (record["last_s"] > leaders[lane]["last_s"]):
+            elif (record["last_s"] >= (front_edge - self.coupler.transition_region_size)) and ((leaders[lane] is None) or (record["last_s"] > leaders[lane]["last_s"])):
                 leaders[lane] = record
 
         new_lead_ids = set()
@@ -587,8 +597,7 @@ class I24MotionSumoSimulationCoupled:
     def _loss_side_for(self, record, arrived_ids) -> str:
         if record["sumo_id"] in arrived_ids:
             return "front"  # Drove off the downstream end of the network.
-        window = self.coupler.get_current_visible_window()
-        centre = 0.5 * (window[2] + window[3])
+        centre = self.hero_state["last_s"]
         return "rear" if record["last_s"] < centre else "front"
 
     def _reap_vanished_vehicles(self):
@@ -666,6 +675,7 @@ class I24MotionSumoSimulationCoupled:
         """Advance SUMO by ``t`` seconds in ``step_length`` substeps."""
         substeps = max(1, int(round(t / self.step_length)))
         for _ in range(substeps):
+            self._ensure_hero_present(set(self.conn.vehicle.getIDList()))
             self.release_spawn_holds()
             self.apply_lead_vehicle_speeds()
             self.apply_hero_policy()

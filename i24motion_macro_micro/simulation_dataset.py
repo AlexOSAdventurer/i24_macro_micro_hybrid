@@ -33,7 +33,8 @@ class I24SimulationData:
     def create_network_file(self):
         # For now both roads have the same length, so just grab one of them for config.
         config = self.config["road_data"]["2"]
-        params = {'v_f': 30.019341712559083, 'rho_j': 0.09411385875052518, 'lambda_lc': 0.16914326352090997, 'w': 4.573064692495487} #. Best is trial 71 with value: -1.6869119514065773.
+        params = {'v_f': 25.02031797294094, 'rho_j': 0.07719493079089293, 'lambda_lc': 0.13384902076274044, 'w': 5.728460762748048}
+        #params = {'v_f': 30.019341712559083, 'rho_j': 0.09411385875052518, 'lambda_lc': 0.16914326352090997, 'w': 4.573064692495487} #. Best is trial 71 with value: -1.6869119514065773.
         #params = {'v_f': 44.628171971976364, 'rho_j': 0.10161810757336569, 'lambda_lc': 0.12233207260740411, 'w': 4.939175703300891}
         #params = {'v_f': 43.906521944351404, 'rho_j': 0.13154571531898504, 'lambda_lc': 0.0789091812007707, 'w': 6.054218545965104}
         #params_original = {'v_f': 49.73562026160161, "rho_j": 0.1304577157114563, "lambda_lc": 0.13951724538021434, 'w': 5.697835695812354}

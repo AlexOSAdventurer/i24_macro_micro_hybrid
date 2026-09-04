@@ -21,7 +21,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
 
-from simulation import Simulation, GroundTruthStore  # noqa: E402
+from simulation import Simulation, GroundTruthStore, TriangularFD  # noqa: E402
 from i24_micro_bridge import I24MicroSimBridge  # noqa: E402
 from i24_sumo_coupler import I24SumoCoupler  # noqa: E402
 
@@ -46,7 +46,7 @@ def total_system_mass(sim):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--steps", type=int, default=60)
-    parser.add_argument("--config", default=os.path.join(ROOT, "i24_motion_to_dataset.json"))
+    parser.add_argument("--config", default=os.path.join(ROOT, "config/2022-11-30.json"))
     parser.add_argument("--road", default="2")
     parser.add_argument("--initial-middle-s", type=float, default=350.0)
     parser.add_argument("--max-middle-s", type=float, default=1300.0)
@@ -67,7 +67,7 @@ def main():
     sim = Simulation.from_json(
         json_path=os.path.join(dataset, "network.json"),
         time_resolution=config["time_step"],
-        origin_time=config["time_origin"],
+        origin_time=config["time_origin"]+3600,
         min_cell_length=100.0,
     )
     gt = GroundTruthStore.from_parquet(
@@ -75,13 +75,17 @@ def main():
     )
     sim.initialize_from_ground_truth(gt, time_value=config["time_origin"])
 
+    params = {'v_f': 30.019341712559083, 'rho_j': 0.09411385875052518, 'lambda_lc': 0.16914326352090997, 'w': 4.573064692495487} #. Best is trial 71 with value: -1.6869119514065773.
+    triangular_fd = TriangularFD(v_f=params['v_f'], w=params['w'], rho_j=params['rho_j'])
+
     coupler = I24SumoCoupler(
         gt,
         dt=config["time_step"],
+        fd=triangular_fd,
         lanes=LANES,
         mapping=config,
         hero_road=args.road,
-        desired_time=config["time_origin"],
+        desired_time=config["time_origin"]+3600,
         desired_s=args.initial_middle_s,
         visible_window=args.visible_window,
         ghost_window=0.0,

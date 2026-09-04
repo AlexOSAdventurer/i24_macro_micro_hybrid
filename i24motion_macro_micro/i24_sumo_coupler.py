@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from simulation import GroundTruthStore
+from simulation import FundamentalDiagram, GroundTruthStore
 from i24_micro_coupler_base import I24MicroCouplerBase
 from i24_motion_sumo_coupled import (
     DEFAULT_ADDITIONAL_FILE,
@@ -43,6 +43,7 @@ class I24SumoCoupler(I24MicroCouplerBase):
         self,
         motion_data: GroundTruthStore,
         dt: float,
+        fd: FundamentalDiagram,
         lanes: List[int],
         mapping,
         hero_road: str,
@@ -66,6 +67,7 @@ class I24SumoCoupler(I24MicroCouplerBase):
         super().__init__(
             motion_data=motion_data,
             dt=dt,
+            fd=fd,
             lanes=lanes,
             mapping=mapping,
             hero_road=hero_road,

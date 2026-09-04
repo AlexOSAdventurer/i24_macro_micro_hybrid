@@ -12,10 +12,14 @@ Usage
     )
     sim.run(duration=3600.0)
 
-The bridge registers itself as a step callback on construction.  Each step it:
-  1. Advances the window position (placeholder — implement _compute_next_middle_s).
-  2. Rebuilds one I24MicroMask per lane with the new position.
+The bridge registers a step and a poststep callback on construction, splitting
+each macroscopic step around the fluid solve.  Before it:
+  1. Asks the coupler for the window position (micro_coupler.step()).
+  2. Rebuilds one I24MicroMask per lane with that position.
   3. Replaces the masks in sim.masking_cells in-place.
+After it:
+  4. Reads each mask's flux memories and totals back off the fluid step.
+  5. Advances the micro engine (micro_coupler.poststep()).
 """
 from __future__ import annotations
 
@@ -60,11 +64,19 @@ class I24MicroSimBridge:
         self.flow_memory_front = {
             lane: 0.0 for lane in lanes
         }
+        # Pure cumulative flux, never debited by spawn/despawn. See I24MicroMask.
+        self.flow_total_rear = {
+            lane: 0.0 for lane in lanes
+        }
+        self.flow_total_front = {
+            lane: 0.0 for lane in lanes
+        }
         self.vehicles: Dict[str, Vehicle] = {}
         self.anchor_speed = 0.0
 
         self.bridge_callback_name = bridge_callback_name
         sim.register_step_callback(partial(I24MicroSimBridge._step, self), bridge_callback_name)
+        sim.register_poststep_callback(partial(I24MicroSimBridge._poststep, self), bridge_callback_name)
         self.micro_coupler = micro_coupler
         self.micro_coupler.bridge = self
 
@@ -78,26 +90,21 @@ class I24MicroSimBridge:
     def _step(self, sim_time: float, dt: float) -> None:
         """Called by Simulation.step() before _update_masks().
 
-        Advances the window and rebuilds all four lane masks in-place.
+        The pre-fluid half: the coupler settles its bubble and hands over a
+        vehicle set, then all four lane masks are rebuilt around it.  The micro
+        engine is advanced afterwards, in _poststep, so everything the mask is
+        built from comes from a single hero snapshot.
         """
         if not self.running:
             return
-        if self.initialized:
-            lane_cells = {
-                lane: self.sim.masking_cells[self._mask_id(lane)] for lane in self.lanes
-            }
-            for lane in lane_cells:
-                self.flow_memory_rear[lane] = lane_cells[lane].rear_flux_memory
-                self.flow_memory_front[lane] = lane_cells[lane].front_flux_memory
-        else:
-            self.initialized = True
 
         self.middle_s = self.micro_coupler.step()
+        self.initialized = True
         if self.middle_s >= self.max_middle_s:
             print("bridge memories: ", self.flow_memory_front, self.flow_memory_rear)
             self.destroy()
             return
-                    
+
         for lane in self.lanes:
             new_mask = I24MicroMask(
                 mask_id=self._mask_id(lane),
@@ -108,10 +115,36 @@ class I24MicroSimBridge:
                 margin_s=self.margin_s,
                 anchor_speed=self.anchor_speed,
                 rear_flux_memory=self.flow_memory_rear[lane],
-                front_flux_memory=self.flow_memory_front[lane]
+                front_flux_memory=self.flow_memory_front[lane],
+                rear_flux_total=self.flow_total_rear[lane],
+                front_flux_total=self.flow_total_front[lane]
             )
             new_mask.vehicles = {vehicle: self.vehicles[vehicle] for vehicle in self.vehicles if self.vehicles[vehicle].lane == lane}
             self.sim.masking_cells[self._mask_id(lane)] = new_mask
+
+    def _poststep(self, sim_time: float, dt: float) -> None:
+        """Called by Simulation.step() after the fluid step has run.
+
+        Reads back what the fluid step did to each mask, then advances the micro
+        engine.  That order is load-bearing: the coupler's engine can lose
+        vehicles during its advance and hands their mass straight back via
+        credit_lost_vehicle, so the read has to happen first or those credits are
+        overwritten by it and the mass is destroyed.
+        """
+        if not self.running:
+            return
+        for lane in self.lanes:
+            lane_cell = self.sim.masking_cells[self._mask_id(lane)]
+            self.flow_memory_rear[lane] = lane_cell.rear_flux_memory
+            self.flow_memory_front[lane] = lane_cell.front_flux_memory
+            self.flow_total_rear[lane] = lane_cell.rear_flux_total
+            self.flow_total_front[lane] = lane_cell.front_flux_total
+
+        # I24CarlaCoupler and I24TrajectoryReplayer are standalone couplers that
+        # still run the whole cycle inside step(); they have no poststep half.
+        poststep = getattr(self.micro_coupler, "poststep", None)
+        if poststep is not None:
+            poststep()
 
     def update_vehicles(self, vehicles: Dict[str, Vehicle]):
         self.vehicles = vehicles
@@ -133,4 +166,8 @@ class I24MicroSimBridge:
                 # that mass for real, since active_to_base writes it back).
                 cell.macro_length = None
             self.sim.unregister_step_callback(self.bridge_callback_name)
+            # Both halves have to go: _step can destroy the bridge mid-step, and a
+            # surviving _poststep would then index masking_cells for a mask that
+            # was just deleted.
+            self.sim.unregister_poststep_callback(self.bridge_callback_name)
             self.micro_coupler.destroy()
