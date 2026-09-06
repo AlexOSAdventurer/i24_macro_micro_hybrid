@@ -324,7 +324,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--episodes", type=int, default=3, help="episode specs, replayed by every controller")
     parser.add_argument("--seed", type=int, default=12345, help="seeds the episode sampling, so runs are repeatable")
-    parser.add_argument("--datasets", nargs="+", default=None, help="override the run's datasets (e.g. a held-out day)")
+    parser.add_argument("--datasets", nargs="+", default=["2022-11-29.json", "2022-11-30.json"], help="override the run's datasets (e.g. a held-out day)")
     parser.add_argument("--roads", nargs="+", default=None)
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--out", default=None, help="output directory (default: <run>/demo, else run_data/rl/demo)")

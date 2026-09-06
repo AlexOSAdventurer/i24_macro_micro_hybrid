@@ -74,7 +74,7 @@ import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 
-from simulation import Simulation, GroundTruthStore, TriangularFD
+from simulation import I24MicroMask, Simulation, GroundTruthStore, TriangularFD
 from i24_micro_bridge import I24MicroSimBridge
 from i24_sumo_coupler import I24SumoCoupler
 from i24_motion_sumo_coupled import HeroPolicy
@@ -167,7 +167,10 @@ class EnvConfig:
 
     # Observation: how many macroscopic cells downstream of the bubble the hero
     # is allowed to see.  This is the part no on-board sensor could supply.
-    macro_lookahead_cells: int = 4
+    macro_lookahead_cells: int = 1
+    # Metrics: How many macroscopic cells upstream of the bubble do we evaluate our
+    # macro rewards against. 
+    macro_lookbehind_cells: int = 6
     # Vehicles within this distance behind the hero, in its own lane, are the
     # platoon whose smoothness the controller is judged on.
     platoon_window: float = 150.0
@@ -207,14 +210,14 @@ class RewardConfig:
     ignored it did to, say, energy.
     """
 
-    platoon_speed: float = 0.1     # mean speed of the hero and its followers
+    platoon_speed: float = 0.5     # mean speed of the hero and its followers
     hero_speed: float = 0.0        # the hero alone; usually subsumed by the above
     speed_variance: float = 0.5    # penalise stop-and-go within the platoon
-    acceleration: float = 0.10     # penalise realised |a|, a comfort/energy proxy
-    jerk: float = 0.05             # penalise changes in realised a
-    headway: float = 0.50          # penalise time headways below target_headway
+    acceleration: float = 0.0     # penalise realised |a|, a comfort/energy proxy
+    jerk: float = 0.00             # penalise changes in realised a
+    headway: float = 0.0          # penalise time headways below target_headway
     energy: float = 0.0            # penalise tractive energy (always reported)
-    stopped: float = 0.10          # penalise standing still
+    stopped: float = 0.0          # penalise standing still
     collision: float = 10.0        # one-off penalty, terminates the episode
 
     target_headway: float = 1.5    # seconds
@@ -469,6 +472,7 @@ class I24SumoHeroEnv(gym.Env):
         self.bridge: Optional[I24MicroSimBridge] = None
         self.policy_shim: Optional[RLHeroPolicy] = None
         self.spec: Optional[EpisodeSpec] = None
+        self.gt: Optional[GroundTruthStore] = None
 
         self._episode_counter = 0
         self._band: Optional[Tuple[str, str, float, float]] = None
@@ -596,7 +600,7 @@ class I24SumoHeroEnv(gym.Env):
             micro_coupler=coupler,
             bridge_callback_name="bridge_step",
         )
-        self.sim, self.coupler, self.bridge, self.spec = sim, coupler, bridge, spec
+        self.sim, self.coupler, self.bridge, self.spec, self.gt = sim, coupler, bridge, spec, gt
 
     def reset(
         self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None
@@ -677,6 +681,13 @@ class I24SumoHeroEnv(gym.Env):
     def _hero(self) -> Dict[str, Any]:
         return self.coupler.hero_state
 
+    def _rear_fluxes(self) -> Dict[int, float]:
+        result = {}
+        for lane in self.env_config.lanes:
+            mask: I24MicroMask = self.sim.masking_cells[self.bridge._mask_id(lane)]
+            result[lane] = mask.current_rear_flux
+        return result
+
     def _neighbours_in_lane(self, lane: int) -> List[Dict[str, Any]]:
         return list(self.coupler.visible_state.get(lane, {}).values())
 
@@ -736,6 +747,70 @@ class I24SumoHeroEnv(gym.Env):
         while (len(profile) < count):
             profile.append(profile[-1])
         return profile[:count]
+
+    def _macro_lookbehind(self, lane: int) -> List[Tuple[float, float]]:
+        """Density and velocity of the cells upstream of the mask, in order.
+
+        This is the hero's behind-the-horizon view: the CTM cells behind of
+        the bubble, which no microscopic sensor could reach.  Short chains are
+        padded with their last entry so the observation keeps a fixed width.
+        """
+        count = self.env_config.macro_lookbehind_cells
+        profile: List[Tuple[float, float]] = []
+        try:
+            cell = self.sim.active.get_cell_with_mask(self.bridge._mask_id(lane))
+            while ((cell is not None) and (len(profile) < count)):
+                neighbours = cell.inflow_neighbors
+                if (len(neighbours) == 0):
+                    break
+                cell = self.sim.active.active_cells[neighbours[0]]
+                if (cell.kind == "mask"):
+                    break
+                density = float(cell.density)
+                velocity = (
+                    float(cell.velocity)
+                    if (cell.velocity is not None)
+                    else float(cell.fd.velocity_from_density(density))
+                )
+                profile.append((density, velocity))
+        except Exception as e:
+            print(e)
+            raise e
+        if (len(profile) <= 1):
+            return None
+        return (profile[:count])[::-1]
+
+    def _macro_lookbehind_empirical(self, lane: int) -> List[Tuple[float, float]]:
+        """Density and velocity of the *empirical* cells upstream of the mask, in order.
+           Velocity is derived from the density-based FD for simplicity.
+        """
+        count = self.env_config.macro_lookbehind_cells
+        profile: List[Tuple[float, float]] = []
+        empirical_snapshot = self.gt.get_empirical_densities_at_time(self.sim.current_time)
+        try:
+            cell = self.sim.active.get_cell_with_mask(self.bridge._mask_id(lane))
+            while ((cell is not None) and (len(profile) < count)):
+                neighbours = cell.inflow_neighbors
+                if (len(neighbours) == 0):
+                    break
+                cell = self.sim.active.active_cells[neighbours[0]]
+                if (cell.kind == "mask"):
+                    break
+
+                for ((road_id, cell_id), a, b) in cell.base_segments[::-1]:
+                    density = float(empirical_snapshot[(road_id, cell_id)])
+                    velocity = (
+                        float(cell.velocity)
+                        if (cell.velocity is not None)
+                        else float(cell.fd.velocity_from_density(density))
+                    )
+                    profile.append((density, velocity))
+        except Exception as e:
+            print(e)
+            raise e
+        if (len(profile) <= 1):
+            return None
+        return (profile[:count])[::-1]
 
     def _macro_behind(self, lane: int) -> Tuple[float, float]:
         try:
@@ -1658,7 +1733,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-name", default=time.strftime("ppo_%Y%m%d_%H%M%S"))
     parser.add_argument("--output-root", default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--config-folder", default=DEFAULT_CONFIG_FOLDER)
-    parser.add_argument("--datasets", nargs="+", default=["2022-11-30.json"], help="dataset json files to train on")
+    parser.add_argument("--datasets", nargs="+", default=["2022-11-21.json", "2022-11-22.json", "2022-11-23.json", "2022-11-24.json", "2022-11-25.json", "2022-11-28.json", "2022-12-01.json", "2022-12-02.json"], help="dataset json files to train on")
     parser.add_argument("--roads", nargs="+", default=["2"])
     parser.add_argument(
         "--algorithm", default="recurrent_ppo", choices=["recurrent_ppo", "ppo"],
@@ -1674,18 +1749,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--no-critic-lstm", dest="enable_critic_lstm", action="store_false",
         help="give the critic no recurrence of its own",
     )
-    parser.add_argument("--envs", type=int, default=4, help="parallel environments; 1 runs in-process")
+    parser.add_argument("--envs", type=int, default=32, help="parallel environments; 1 runs in-process")
     parser.add_argument("--no-subprocess", action="store_true", help="use DummyVecEnv even with several environments")
-    parser.add_argument("--total-timesteps", type=int, default=100_000)
+    parser.add_argument("--total-timesteps", type=int, default=1_000_000)
     parser.add_argument("--n-steps", type=int, default=128)
     parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--n-epochs", type=int, default=10)
+    parser.add_argument("--n-epochs", type=int, default=5)
     parser.add_argument("--learning-rate", type=float, default=3.0e-4)
-    parser.add_argument("--gamma", type=float, default=0.95)
+    parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--gae-lambda", type=float, default=0.95)
     parser.add_argument("--clip-range", type=float, default=0.2)
-    parser.add_argument("--ent-coef", type=float, default=0.003)
-    parser.add_argument("--target-kl", type=float, default=0.05, help="0 disables the KL early stop")
+    parser.add_argument("--ent-coef", type=float, default=0.0)
+    parser.add_argument("--target-kl", type=float, default=0.0, help="0 disables the KL early stop")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-steps", type=int, default=120)
     parser.add_argument("--macro-lookahead-cells", type=int, default=4)

@@ -909,6 +909,7 @@ class GroundTruthStore:
                 }
                 for t, grp in self.macro_df.groupby("time")
             }
+
             self._macro_times: np.ndarray = np.sort(np.array(list(self._macro_density_lookup.keys())))
 
     @staticmethod
@@ -953,6 +954,10 @@ class GroundTruthStore:
         if abs(chosen - time_value) > tolerance:
             raise KeyError(f"No ground-truth snapshot near time={time_value}. Closest: {chosen}.")
         return chosen
+
+    def get_empirical_densities_at_time(self, time_value: float, tolerance: float = 1e-1):
+        density_map = self._macro_density_lookup[self._nearest_time(time_value, tolerance)]
+        return density_map
 
     def apply_density_snapshot_to_network(
         self, network: Network, time_value: float, tolerance: float = 1e-1
@@ -3553,6 +3558,8 @@ class I24MicroMask(ArbitraryMaskingCell):
         # exchanged, and can be reconciled against the discrete vehicle count.
         self.rear_flux_total = rear_flux_total
         self.front_flux_total = front_flux_total
+        self.current_rear_flux = None
+        self.current_front_flux = None
 
     @property
     def mass(self):
@@ -3662,6 +3669,7 @@ class I24MicroMask(ArbitraryMaskingCell):
 
         self.rear_flux_memory += (net_flux * dt)
         self.rear_flux_total += (net_flux * dt)
+        self.current_rear_flux = net_flux
         return net_flux
         #return 0.0
 
@@ -3724,6 +3732,7 @@ class I24MicroMask(ArbitraryMaskingCell):
         #net_flux = (fd_exterior._flow(p_star) - (self.anchor_speed * p_star))
         self.front_flux_memory += (net_flux * dt)
         self.front_flux_total += (net_flux * dt)
+        self.current_front_flux = net_flux
         return net_flux
         #return 0.0
 
