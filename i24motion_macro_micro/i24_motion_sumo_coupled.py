@@ -117,6 +117,20 @@ class I24MotionSumoSimulationCoupled:
 
         self._traci = None
         self._sumolib = None
+        self._tc = None
+
+        # TraCI is a request/response protocol over TCP, so per-vehicle getters
+        # cost a socket round-trip each and the substep loop is latency-bound
+        # rather than compute-bound.  Reading the same variables through a
+        # subscription collapses the whole population into one round-trip per
+        # substep, which is the difference between ~600 round-trips per macro
+        # step and a handful.
+        self._subscribed: set = set()
+        self._sub_results: Dict[str, dict] = {}
+        # Geometry is written once at spawn and never changes, so it is cached
+        # rather than re-read every substep for every vehicle.
+        self._vehicle_geometry: Dict[str, tuple] = {}
+        self._lane_max_speed: Dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # Identifiers and geometry
@@ -159,6 +173,12 @@ class I24MotionSumoSimulationCoupled:
             import traci
 
             self._traci = traci
+        try:
+            self._tc = self._traci.constants
+        except AttributeError:  # older libsumo exposes the constants separately
+            import traci.constants as tc
+
+            self._tc = tc
         import sumolib
 
         self._sumolib = sumolib
@@ -329,6 +349,15 @@ class I24MotionSumoSimulationCoupled:
             self.conn.vehicle.setTau(veh_id, 1.0 / (self.coupler.fd.w * self.coupler.fd.rho_j))
         except Exception as exc:
             print(f"WARNING: could not place {veh_id} at {lane_id}@{front_pos:.2f}: {exc}")
+        # The clamped values actually written, not the raw empirical ones, so the
+        # cache reads back exactly what getLength/getWidth would have returned.
+        self._vehicle_geometry[veh_id] = (length, width)
+        # Deliberately NOT subscribed here.  vehicle.add() only queues a
+        # departure: SUMO does not insert until the next step, and the insertion
+        # can fail outright (hence insertion_grace_substeps).  Subscribing to an
+        # id SUMO does not yet know makes it answer every variable with an error
+        # on every step, forever.  _refresh_record subscribes instead, once the
+        # vehicle has actually been read back.
         return veh_id
 
     def spawn_hero_vehicle(self):
@@ -357,6 +386,7 @@ class I24MotionSumoSimulationCoupled:
             self.conn.vehicle.remove(record["sumo_id"])
         except Exception:
             pass  # Already gone from SUMO's side.
+        self._forget_vehicle(record["sumo_id"])
 
     def despawn_visible_vehicle(self, record):
         self.despawn_vehicle(record)
@@ -393,10 +423,18 @@ class I24MotionSumoSimulationCoupled:
     # ------------------------------------------------------------------
 
     def _default_ahead_speed(self, road_id) -> float:
+        # A lane's speed limit is network geometry: fixed for the whole run, but
+        # this was being fetched twice per substep.
+        key = str(road_id)
+        cached = self._lane_max_speed.get(key)
+        if (cached is not None):
+            return cached
         try:
-            return float(self.conn.lane.getMaxSpeed(self.lane_id(road_id, -1)))
+            value = float(self.conn.lane.getMaxSpeed(self.lane_id(road_id, -1)))
         except Exception:
-            return 30.0
+            value = 30.0
+        self._lane_max_speed[key] = value
+        return value
 
     def get_current_visible_window_substep(self):
         return self.hero_state["last_s"] - self.coupler.visible_window, self.hero_state["last_s"] + self.coupler.visible_window, 
@@ -484,7 +522,11 @@ class I24MotionSumoSimulationCoupled:
             leader_result = self.conn.vehicle.getLeader(veh_id, 200.0)
             if leader_result is not None and leader_result[0] != "":
                 leader = {"sumo_id": leader_result[0], "gap": float(leader_result[1])}
-                leader["speed"] = float(self.conn.vehicle.getSpeed(leader_result[0]))
+                leader_sample = self._vehicle_sample(leader_result[0])
+                leader["speed"] = (
+                    float(leader_sample[self._tc.VAR_SPEED]) if (leader_sample is not None)
+                    else float(self.conn.vehicle.getSpeed(leader_result[0]))
+                )
         except Exception:
             leader = None
         return {
@@ -518,7 +560,13 @@ class I24MotionSumoSimulationCoupled:
             if "speed" in action:
                 self.conn.vehicle.setSpeed(veh_id, float(action["speed"]))
             if "acceleration" in action:
-                current = float(self.conn.vehicle.getSpeed(veh_id))
+                # The subscription was refreshed after the last simulationStep,
+                # so this is the same value getSpeed would return right now.
+                sample = self._vehicle_sample(veh_id)
+                current = (
+                    float(sample[self._tc.VAR_SPEED]) if (sample is not None)
+                    else float(self.conn.vehicle.getSpeed(veh_id))
+                )
                 target = max(0.0, current + float(action["acceleration"]) * self.step_length)
                 self.conn.vehicle.setSpeed(veh_id, target)
             if "lane" in action:
@@ -532,29 +580,105 @@ class I24MotionSumoSimulationCoupled:
     # Readback
     # ------------------------------------------------------------------
 
+    def _subscribe_vehicle(self, veh_id: str) -> None:
+        """Register the variables ``_refresh_record`` needs, once per vehicle.
+
+        Everything read per substep goes through this; geometry is deliberately
+        excluded because it is set at spawn and cached in ``_vehicle_geometry``.
+        """
+        if (self._tc is None) or (veh_id in self._subscribed):
+            return
+        try:
+            self.conn.vehicle.subscribe(
+                veh_id,
+                [
+                    self._tc.VAR_ROAD_ID,
+                    self._tc.VAR_LANE_INDEX,
+                    self._tc.VAR_LANEPOSITION,
+                    self._tc.VAR_SPEED,
+                ],
+            )
+            self._subscribed.add(veh_id)
+        except Exception:
+            pass  # Fall back to direct getters for this vehicle.
+
+    def _forget_vehicle(self, veh_id: str) -> None:
+        if (veh_id in self._subscribed):
+            try:
+                # Without this the subscription outlives the vehicle and SUMO
+                # answers every subscribed variable with an error, every step.
+                self.conn.vehicle.unsubscribe(veh_id)
+            except Exception:
+                pass
+        self._subscribed.discard(veh_id)
+        self._vehicle_geometry.pop(veh_id, None)
+        self._sub_results.pop(veh_id, None)
+
+    def _refresh_subscriptions(self) -> None:
+        """One round-trip for the whole population, straight after a step."""
+        try:
+            self._sub_results = self.conn.vehicle.getAllSubscriptionResults()
+        except Exception:
+            self._sub_results = {}
+
+    def _vehicle_sample(self, veh_id: str) -> Optional[dict]:
+        """Subscribed values for one vehicle, or None to fall back to getters.
+
+        A vehicle inserted this substep has no results until the next step, and
+        a subscription can fail outright, so every caller must cope with None.
+        """
+        sample = self._sub_results.get(veh_id)
+        if (sample is None) or (self._tc is None):
+            return None
+        if (self._tc.VAR_ROAD_ID not in sample) or (self._tc.VAR_SPEED not in sample):
+            return None
+        return sample
+
     def _refresh_record(self, record) -> bool:
         """Pull one vehicle's state out of SUMO. False if it is no longer usable."""
         veh_id = record["sumo_id"]
+        sample = self._vehicle_sample(veh_id)
         try:
-            edge_id = self.conn.vehicle.getRoadID(veh_id)
+            if sample is not None:
+                edge_id = sample[self._tc.VAR_ROAD_ID]
+            else:
+                edge_id = self.conn.vehicle.getRoadID(veh_id)
         except Exception:
             return False
+        # Reaching here means SUMO answered for this id, so it exists and can
+        # safely carry a subscription.  This is the only place that subscribes:
+        # a vehicle is registered exactly once, after it has been read back.
+        self._subscribe_vehicle(veh_id)
         if edge_id.startswith(":"):
             # On an internal junction lane; keep the previous sample for a step.
             return True
         road_id = self.road_id_from_edge(edge_id)
         if road_id is None or road_id != str(self.coupler.hero_road):
             return False  # Left the coupled road.
-        length = float(self.conn.vehicle.getLength(veh_id))
-        lane_index = int(self.conn.vehicle.getLaneIndex(veh_id))
+        # Geometry is whatever was written at spawn, so it is read back from the
+        # cache rather than fetched; SUMO cannot have changed it.
+        geometry = self._vehicle_geometry.get(veh_id)
+        if (geometry is not None):
+            length, width = geometry
+        else:
+            length = float(self.conn.vehicle.getLength(veh_id))
+            width = float(self.conn.vehicle.getWidth(veh_id))
+        if sample is not None:
+            lane_index = int(sample[self._tc.VAR_LANE_INDEX])
+            lane_position = float(sample[self._tc.VAR_LANEPOSITION])
+            speed = float(sample[self._tc.VAR_SPEED])
+        else:
+            lane_index = int(self.conn.vehicle.getLaneIndex(veh_id))
+            lane_position = float(self.conn.vehicle.getLanePosition(veh_id))
+            speed = float(self.conn.vehicle.getSpeed(veh_id))
         lane_id = self.open_drive_lane(road_id, lane_index)
         if lane_id not in self.coupler.get_lanes():
             return False  # Changed into a lane the macro side does not model.
-        record["last_s"] = float(self.conn.vehicle.getLanePosition(veh_id)) - length
+        record["last_s"] = lane_position - length
         record["last_lane_id"] = lane_id
-        record["cosim_data"]["velocity"] = float(self.conn.vehicle.getSpeed(veh_id))
+        record["cosim_data"]["velocity"] = speed
         record["cosim_data"]["length"] = length
-        record["cosim_data"]["width"] = float(self.conn.vehicle.getWidth(veh_id))
+        record["cosim_data"]["width"] = width
         return True
 
     def rebuild_co_sim_vehicle_state(self, record) -> dict:
@@ -637,6 +761,7 @@ class I24MotionSumoSimulationCoupled:
                 side = self._loss_side_for(record, arrived_ids)
             self.visible_states.pop(cosim_id, None)
             self.lead_controlled.pop(cosim_id, None)
+            self._forget_vehicle(record["sumo_id"])
             self.coupler.credit_lost_vehicle(record["last_lane_id"], side)
 
         self._ensure_hero_present(live_ids)
@@ -681,5 +806,7 @@ class I24MotionSumoSimulationCoupled:
             self.apply_hero_policy()
             self.conn.simulationStep()
             self.current_timestamp += self.step_length
+            # One round-trip for the whole population, before anything reads it.
+            self._refresh_subscriptions()
             self._reap_vanished_vehicles()
         return self.update_co_sim()

@@ -66,15 +66,18 @@ import json
 import math
 import os
 import random
+import re
 import time
+import zipfile
+from collections import deque
 from dataclasses import asdict, dataclass, field, replace
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
 import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 
-from simulation import I24MicroMask, Simulation, GroundTruthStore, TriangularFD
+from simulation import FundamentalDiagram, I24MicroMask, Simulation, GroundTruthStore, TriangularFD
 from i24_micro_bridge import I24MicroSimBridge
 from i24_sumo_coupler import I24SumoCoupler
 from i24_motion_sumo_coupled import HeroPolicy
@@ -140,6 +143,13 @@ class EnvConfig:
     # SUMO's lane-change model would otherwise move the hero sideways, which a
     # longitudinal controller has no say over and cannot be credited for.
     lock_hero_lane: bool = True
+    # SUMO vType every vehicle is inserted as.  "car" is deterministic IDM (the
+    # control condition); "car_eidm" is Extended IDM with driver imperfection, so
+    # the platoon is string unstable and stop-and-go waves form on their own.
+    # Under "car" a wave-damping controller has nothing to damp -- measured:
+    # FollowerStopper scores identically to plain IDM, and the reward's ceiling
+    # over the do-nothing counterfactual is +0.0006/step.
+    vehicle_type: str = "car_eidm"
     # SUMO speed mode for the hero, or None to leave its default (31, every
     # check on).  The default is the right setting for a wave-damping
     # controller: the commanded speed is clipped to the safe speed, so the hero
@@ -163,7 +173,7 @@ class EnvConfig:
     # 0.1 s substeps.  SUMO clips it to its own safe speed and bounds, so the
     # realised acceleration is what the reward is computed from.
     max_acceleration: float = 1.5
-    max_deceleration: float = 3.0
+    max_deceleration: float = 2.0
 
     # Observation: how many macroscopic cells downstream of the bubble the hero
     # is allowed to see.  This is the part no on-board sensor could supply.
@@ -210,9 +220,9 @@ class RewardConfig:
     ignored it did to, say, energy.
     """
 
-    platoon_speed: float = 0.5     # mean speed of the hero and its followers
-    hero_speed: float = 0.0        # the hero alone; usually subsumed by the above
-    speed_variance: float = 0.5    # penalise stop-and-go within the platoon
+    platoon_speed: float = 0.0     # mean speed of the hero and its followers
+    progress: float = 0.02         # one-sided floor: penalise *stalling* only
+    speed_variance: float = 0.0    # penalise stop-and-go within the platoon
     acceleration: float = 0.0     # penalise realised |a|, a comfort/energy proxy
     jerk: float = 0.00             # penalise changes in realised a
     headway: float = 0.0          # penalise time headways below target_headway
@@ -222,11 +232,46 @@ class RewardConfig:
 
     target_headway: float = 1.5    # seconds
     stopped_speed: float = 0.5     # m/s
+    # Fraction of the prevailing speed the hero may drop to before the progress
+    # term starts charging it.  A wave-damping controller works *by* slowing, so
+    # this is a guardrail against the degenerate "stop dead" policy rather than
+    # an objective: above the floor the term is flat and contributes no gradient
+    # at all.  Keep it low -- a hero that stalls hard builds its own queue, which
+    # crosses rho_c upstream and shows up in the macroscopic terms anyway.
+    progress_floor: float = 0.02    # fraction of the reference speed
+    # What "the prevailing speed" means for that floor.  "leader" is the vehicle
+    # ahead in the hero's own lane, "macro_lookahead" the first CTM cell past the
+    # front of the bubble, "follow_speed" SUMO's getFollowSpeed (an ablation --
+    # see _reference_speed for why it is the wrong reference for a floor).
+    progress_reference: str = "leader"
+    # Seconds of reference speed to average over.  The instantaneous leader speed
+    # is the phase of the wave one vehicle ahead, not the prevailing speed: in
+    # stop-and-go the leader pulls out of a jam seconds before the hero can, so an
+    # unsmoothed floor fires continuously on a hero that is doing nothing wrong.
+    # 0.0 disables the smoothing.
+    progress_reference_window: float = 10.0
     # Tractive energy per metre travelled that scores -1 before weighting.
     energy_scale: float = 2000.0   # J/m
     # "lane_behind" (the hero's own followers -- the only vehicles a longitudinal
     # controller actually influences), "all_behind", or "bubble".
     platoon_scope: str = "lane_behind"
+
+    # What the upstream terms are scored against.  "baseline" replays the same
+    # episode with the hero on SUMO's own car-following model and differences
+    # against that, which asks "is this controller better than doing nothing".
+    # "empirical" differences against the measured road instead, which asks "is
+    # the simulation better than the road was" -- a question about the CTM, not
+    # the policy, and one whose answer is dominated by model error the controller
+    # cannot move.  Scoring against "empirical" is what left both upstream terms
+    # reading simulator bias: a free positive on oscillation from the first-order
+    # scheme's numerical diffusion, and a persistent negative on delay.
+    # "baseline" costs one extra environment pass per episode.
+    upstream_reference: str = "baseline"
+
+    # Macroscopic Objectives
+    rear_flux_smoothness: float = 0.00
+    upstream_oscillation: float = 0.02
+    upstream_delay: float = 0.98
 
 
 @dataclass
@@ -292,12 +337,31 @@ class GroundTruthCache:
             ("time", ">=", float(band_start) - self.pad_s),
             ("time", "<=", float(band_end) + self.pad_s),
         ]
+        macro_filters = None
         if (road is not None):
             filters.append(("road_id", "==", str(road)))
+            # The macro read used to take the whole file while the micro read was
+            # filtered, which is 310 MB per worker for rows no episode on this road
+            # can query -- _macro_density_lookup is keyed by (road_id, cell_id), so
+            # the other road's entries are simply never looked up.
+            macro_filters = [("road_id", "==", str(road))]
         micro_df = pd.read_parquet(os.path.join(dataset_dir, "micro.parquet"), filters=filters)
-        macro_df = pd.read_parquet(os.path.join(dataset_dir, "macro.parquet"))
+        macro_df = pd.read_parquet(os.path.join(dataset_dir, "macro.parquet"), filters=macro_filters)
         self._store = GroundTruthStore(micro_df, macro_df)
         self._key = key
+
+        # Reading the band costs about three times the resident size of the frame
+        # it produces, and pyarrow's pool keeps the difference: measured 2,470 MB
+        # resident falling to 1,914 MB on release_unused() after five bands. The
+        # frames above are already materialised into pandas, so nothing live is
+        # being handed back.
+        del micro_df, macro_df
+        try:
+            import pyarrow
+
+            pyarrow.default_memory_pool().release_unused()
+        except Exception:
+            pass
         return self._store
 
 
@@ -367,6 +431,18 @@ class RLHeroPolicy(HeroPolicy):
         except Exception:
             pass
 
+    def _get_follow_speed(self, fd: TriangularFD, eps_v = 1.0):
+        if ((self.engine is None) or (self.engine.hero_state is None)):
+            return None
+        leader = self.engine.conn.vehicle.getLeader(self._configured_id)
+        if (leader is None) or (leader[0] == ""):
+            return fd.v_f
+        leader_id, gap = leader
+        ego_speed = self.engine.conn.vehicle.getSpeed(self._configured_id)
+        leader_speed = self.engine.conn.vehicle.getSpeed(leader_id)
+        leader_decel = self.engine.conn.vehicle.getDecel(leader_id)
+        return max(self.engine.conn.vehicle.getFollowSpeed(self._configured_id, ego_speed, gap, leader_speed, leader_decel, leader_id), eps_v)
+
     def act(self, observation: dict) -> Optional[dict]:
         self._configure_hero()
         leader = observation.get("leader")
@@ -406,9 +482,10 @@ class EpisodeSpec:
 # monitor_*.csv next to its return and length with no extra plumbing.
 EPISODE_INFO_KEYS = (
     "dataset", "road", "start_time", "terminal_reason", "hero_mean_speed",
+    "mean_progress_reward", "mean_rear_flux_smoothness", "mean_upstream_oscillation", "mean_upstream_delay",
     "hero_speed_std", "platoon_mean_speed", "platoon_speed_std",
     "acceleration_rms", "jerk_rms", "min_headway", "distance", "energy",
-    "energy_per_metre",
+    "energy_per_metre", 
 )
 
 
@@ -480,6 +557,19 @@ class I24SumoHeroEnv(gym.Env):
         self._step_index = 0
         self._previous_action = 0.0
         self._previous_acceleration = 0.0
+        # Macro information.  Two steps of history: the flux term differences twice.
+        self._previous_rear_flux: Optional[Dict[int, float]] = None
+        self._previous_rear_flux_2: Optional[Dict[int, float]] = None
+        self._macro_dt = 1.0
+        self._reference_speed_history: Deque[float] = deque()
+        # Base-cell densities, one snapshot per macro step, from the do-nothing
+        # replay of the current episode.  Indexed by step, so the policy pass
+        # compares against the counterfactual at the same *wall-clock time* --
+        # the two runs diverge in position but advance in lockstep in time, and
+        # the snapshot is keyed by cell so the lookup follows the bubble wherever
+        # the policy has taken it.
+        self._baseline_density_maps: List[Dict[Tuple[str, str], float]] = []
+        self._baseline_rear_fluxes: List[Dict[int, float]] = []
         self._last_observation = np.zeros(self.observation_size, dtype=np.float32)
         self._episode_records: List[Dict[str, float]] = []
         self._terminal_reason: str = ""
@@ -555,6 +645,7 @@ class I24SumoHeroEnv(gym.Env):
         # the controller.
         random.seed(spec.sumo_seed)
         dataset_dir, config = env_config.dataset_paths(spec.dataset)
+        self._macro_dt = float(config["time_step"])
         gt = self.gt_cache.get(dataset_dir, spec.road, spec.band_start, spec.band_end)
 
         sim = Simulation.from_json(
@@ -583,6 +674,7 @@ class I24SumoHeroEnv(gym.Env):
             desired_s=env_config.initial_middle_s,
             visible_window=env_config.visible_window,
             ghost_window=env_config.ghost_window,
+            vehicle_type=env_config.vehicle_type,
             step_length=env_config.step_length,
             seed=spec.sumo_seed,
             gui=env_config.gui,
@@ -623,10 +715,18 @@ class I24SumoHeroEnv(gym.Env):
         for _ in range(self.env_config.max_reset_attempts):
             spec = pinned if (pinned is not None) else self._sample_spec()
             try:
+                # The counterfactual has to be recorded before the pass that is
+                # scored against it, and it builds and tears down its own episode.
+                self._baseline_density_maps, self._baseline_rear_fluxes = (
+                    self._baseline_pass(spec)
+                    if (self.reward_config.upstream_reference == "baseline") else ([], [])
+                )
                 self._build_episode(spec)
                 self._step_index = 0
                 self._previous_action = 0.0
                 self._previous_acceleration = 0.0
+                self._previous_rear_flux = None
+                self._previous_rear_flux_2 = None
                 self._episode_records = []
                 self._terminal_reason = ""
                 self.policy_shim.set_acceleration(None)
@@ -645,6 +745,13 @@ class I24SumoHeroEnv(gym.Env):
                     self.policy_shim.drain_samples(), float(self.coupler.hero_state["velocity"])
                 )
                 self._previous_acceleration = warmup["acceleration"]
+                self._previous_rear_flux = self._rear_fluxes()
+                # Seed the reference history from the warm-up step for the same
+                # reason as the acceleration above: an empty window on step 1 would
+                # score the floor against a single instantaneous reading, which is
+                # exactly the jumpy quantity the smoothing exists to remove.
+                self._reference_speed_history = deque(maxlen=self._reference_speed_window())
+                self._reference_speed_history.append(self._instantaneous_reference_speed())
                 self._last_observation = self._observation()
                 return self._last_observation, {"spec": asdict(spec)}
             except Exception as exc:  # a minute with no usable hero, or a SUMO failure
@@ -680,6 +787,128 @@ class I24SumoHeroEnv(gym.Env):
 
     def _hero(self) -> Dict[str, Any]:
         return self.coupler.hero_state
+
+    def _get_follow_speed(self) -> float:
+        return self.policy_shim._get_follow_speed(self.fd)
+
+    def _instantaneous_reference_speed(self) -> float:
+        """The speed of the traffic the hero is measured against, right now.
+
+        Deliberately *exogenous* to the hero.  ``getFollowSpeed`` is the obvious
+        choice and the wrong one: it is computed from the current gap, so opening
+        a gap raises it, and a floor measured against it therefore gets *harder*
+        to satisfy the more room the hero makes -- it would charge the controller
+        for the gap-opening that wave damping consists of.
+
+        ``leader`` is the vehicle ahead in the hero's own lane.  Longitudinal
+        control cannot influence it (only which vehicle it is, if a neighbour
+        cuts into the gap), and it is local to the hero.  ``macro_lookahead`` is
+        exogenous too, but the first cell past the front of the bubble sits at
+        least ``margin_s`` ahead, so in stop-and-go it can describe traffic the
+        hero is nowhere near.  ``follow_speed`` keeps the contaminated reference
+        available as an ablation.
+        """
+        v_min = 0.1
+        reference = self.reward_config.progress_reference
+        if (reference == "follow_speed"):
+            return max(v_min, float(self._get_follow_speed()))
+        if (reference == "macro_lookahead"):
+            return max(v_min, float(self._macro_lookahead(self._hero()["lane_id"])[0][1]))
+        leader, _ = self._leader_and_follower()
+        if (leader is None):
+            return max(v_min, float(self.fd.v_f))
+        return max(v_min, float(leader["velocity"]))
+
+    def _reference_speed(self) -> float:
+        """``_instantaneous_reference_speed`` averaged over the recent past.
+
+        Read-only: the history is appended once per step by ``step``, so calling
+        this twice in a step -- or from a diagnostic -- cannot shift the value.
+        The averaging is what makes the floor mean "am I keeping up with the
+        traffic around here" rather than "am I matching the vehicle in front at
+        this instant", which in stop-and-go is a different and much jumpier
+        question: a leader accelerating out of a wave leaves the hero at a small
+        fraction of its speed for several seconds through no fault of its own.
+        """
+        if (len(self._reference_speed_history) == 0):
+            return self._instantaneous_reference_speed()
+        return max(0.1, float(np.mean(self._reference_speed_history)))
+
+    def _reference_speed_window(self) -> int:
+        """Length of the reference-speed history, in macro steps."""
+        window = self.reward_config.progress_reference_window
+        if (window <= 0.0):
+            return 1
+        return max(1, int(round(window / max(1e-9, self._macro_dt))))
+
+    def _density_snapshot(self) -> Dict[Tuple[str, str], float]:
+        """Every base cell's macroscopic density, keyed the way the mask's
+        ``base_segments`` and the empirical snapshot are keyed."""
+        snapshot: Dict[Tuple[str, str], float] = {}
+        for road in self.sim.network.roads.values():
+            for cell_id, cell in road.cells.items():
+                length = cell.length if (cell.macro_length is None) else cell.macro_length
+                if (length > 1e-9):
+                    snapshot[(road.road_id, cell_id)] = float(cell.mass / length)
+        return snapshot
+
+    def _flux_curvature(
+        self,
+        current: Optional[Dict[int, float]],
+        previous: Optional[Dict[int, float]],
+        previous_2: Optional[Dict[int, float]],
+    ) -> Optional[float]:
+        """Mean |second difference| of the per-lane rear flux, in units of capacity.
+
+        Clamped to [0, 1] so that differencing two of these stays in [-1, 1] like
+        every other component.  ``None`` when there is not enough history.
+        """
+        if ((current is None) or (previous is None) or (previous_2 is None)):
+            return None
+        total = 0.0
+        for lane in current:
+            second_difference = current[lane] - (2.0 * previous[lane]) + previous_2[lane]
+            total += abs(second_difference / self.fd.capacity)
+        return min(1.0, (total / float(len(current))))
+
+    def _baseline_pass(
+        self, spec: EpisodeSpec
+    ) -> Tuple[List[Dict[Tuple[str, str], float]], List[Dict[int, float]]]:
+        """Replay this episode with the hero left to SUMO's car-following model.
+
+        This is the counterfactual the upstream terms are scored against: what
+        the road would have done over this exact episode had the controller not
+        acted.  It is deterministic given the spec -- ``_build_episode`` reseeds
+        the global RNG the spawn stream draws from -- so the policy pass sees the
+        same traffic the baseline did, and the difference is attributable.
+
+        Builds and tears down its own episode, so it must run before the pass
+        that will be scored.  That is one extra environment pass per episode; on
+        a distribution where specs essentially never repeat, it is a flat 2x on
+        environment time.
+
+        Returns base-cell densities and per-lane rear fluxes.  Element 0 of each
+        is the warm-up step, so element ``k`` is the state after ``k`` scored
+        steps -- which lines the fluxes up with the scored pass, whose own
+        ``_previous_rear_flux`` is likewise seeded from its warm-up.
+        """
+        maps: List[Dict[Tuple[str, str], float]] = []
+        fluxes: List[Dict[int, float]] = []
+        self._build_episode(spec)
+        try:
+            self.sim.step()                      # the warm-up step the scored pass also takes
+            maps.append(self._density_snapshot())
+            fluxes.append(self._rear_fluxes())
+            while (len(maps) <= self.env_config.max_steps):
+                if ((not self.bridge.running) or self._retires_next_step()):
+                    break
+                self.policy_shim.set_acceleration(None)   # None == hand back to SUMO
+                self.sim.step()
+                maps.append(self._density_snapshot())
+                fluxes.append(self._rear_fluxes())
+        finally:
+            self.close()
+        return maps, fluxes
 
     def _rear_fluxes(self) -> Dict[int, float]:
         result = {}
@@ -748,69 +977,102 @@ class I24SumoHeroEnv(gym.Env):
             profile.append(profile[-1])
         return profile[:count]
 
-    def _macro_lookbehind(self, lane: int) -> List[Tuple[float, float]]:
-        """Density and velocity of the cells upstream of the mask, in order.
+    def _upstream_profiles(
+        self, lane: int
+    ) -> Optional[Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]]:
+        """Simulated and empirical upstream state over *identical* base cells.
 
-        This is the hero's behind-the-horizon view: the CTM cells behind of
-        the bubble, which no microscopic sensor could reach.  Short chains are
-        padded with their last entry so the observation keeps a fixed width.
+        This is the hero's behind-the-horizon view: the CTM cells upstream of
+        the bubble, which no microscopic sensor could reach.  The simulated and
+        empirical profiles are built in a single walk, entry for entry over the
+        same ``(road_id, cell_id)`` keys, so the two cannot drift apart.  Built
+        separately they did: one enumerated per *active* cell and the other per
+        *base segment*, so the reward differenced two different stretches of
+        road and scored a penalty even where the simulation matched the data.
+
+        Base cells the mask covers only partially are skipped.  Their
+        macroscopic mass is spread over ``macro_length`` rather than the whole
+        cell -- the rest of it is held by the mask -- so their density is not
+        comparable with the empirical snapshot, which is always a whole-cell
+        value.
+
+        Velocity comes from the fundamental diagram on both sides, since the
+        empirical snapshot carries density only.  Under the first-order CTM
+        ``ActiveCell.velocity`` is ``None`` anyway.  Note the consequence: the
+        triangular FD is flat at ``v_f`` below ``rho_c``, so both profiles read
+        exactly ``v_f`` in free flow and every velocity-based term differences
+        to zero there.  That is deliberate -- there is no wave to damp -- but it
+        means these profiles say nothing about free-flowing traffic, and a term
+        that should stay live there has to use the densities instead.
         """
         count = self.env_config.macro_lookbehind_cells
-        profile: List[Tuple[float, float]] = []
-        try:
-            cell = self.sim.active.get_cell_with_mask(self.bridge._mask_id(lane))
-            while ((cell is not None) and (len(profile) < count)):
-                neighbours = cell.inflow_neighbors
-                if (len(neighbours) == 0):
+        if (self.reward_config.upstream_reference == "baseline"):
+            # ``step`` increments _step_index immediately after sim.step(), before
+            # scoring, so the snapshot for the step being scored is one back.
+            # Element 0 of the counterfactual is its warm-up, so the state after
+            # the scored step (_step_index having already been incremented) is
+            # element _step_index.
+            if (self._step_index >= len(self._baseline_density_maps)):
+                # The policy outlasted the counterfactual, so there is nothing to
+                # compare against.  Score neutral rather than inventing a reference.
+                return None
+            empirical_snapshot = self._baseline_density_maps[self._step_index]
+        else:
+            empirical_snapshot = self.gt.get_empirical_densities_at_time(self.sim.current_time)
+        sim_profile: List[Tuple[float, float]] = []
+        empirical_profile: List[Tuple[float, float]] = []
+        cell = self.sim.active.get_cell_with_mask(self.bridge._mask_id(lane))
+        while ((cell is not None) and (len(sim_profile) < count)):
+            neighbours = cell.inflow_neighbors
+            if (len(neighbours) == 0):
+                break
+            cell = self.sim.active.active_cells[neighbours[0]]
+            if (cell.kind == "mask"):
+                break
+            fd = cell.fd if (cell.fd is not None) else self.fd
+            for ((road_id, cell_id), _, _) in cell.base_segments[::-1]:
+                if (len(sim_profile) >= count):
                     break
-                cell = self.sim.active.active_cells[neighbours[0]]
-                if (cell.kind == "mask"):
-                    break
-                density = float(cell.density)
-                velocity = (
-                    float(cell.velocity)
-                    if (cell.velocity is not None)
-                    else float(cell.fd.velocity_from_density(density))
+                base_cell = self.sim.network.get_cell(road_id, cell_id)
+                # None means "never masked", so the mass covers the whole cell.
+                macro_length = (
+                    base_cell.length if (base_cell.macro_length is None) else base_cell.macro_length
                 )
-                profile.append((density, velocity))
-        except Exception as e:
-            print(e)
-            raise e
-        if (len(profile) <= 1):
+                if (macro_length < (base_cell.length - 1e-9)):
+                    continue
+                empirical_density = empirical_snapshot.get((road_id, cell_id))
+                if (empirical_density is None):
+                    continue
+                sim_density = float(base_cell.mass / macro_length)
+                empirical_density = float(empirical_density)
+                sim_profile.append((sim_density, float(fd.velocity_from_density(sim_density))))
+                empirical_profile.append(
+                    (empirical_density, float(fd.velocity_from_density(empirical_density)))
+                )
+        if (len(sim_profile) <= 1):
             return None
-        return (profile[:count])[::-1]
+        return sim_profile[::-1], empirical_profile[::-1]
 
-    def _macro_lookbehind_empirical(self, lane: int) -> List[Tuple[float, float]]:
-        """Density and velocity of the *empirical* cells upstream of the mask, in order.
-           Velocity is derived from the density-based FD for simplicity.
+    @staticmethod
+    def _profile_oscillation(profile: List[Tuple[float, float]], v_f: float) -> float:
+        """Mean absolute velocity step between neighbouring cells, in units of v_f."""
+        if (len(profile) < 2):
+            return 0.0
+        return sum(
+            abs((profile[i + 1][1] - profile[i][1]) / v_f) for i in range(len(profile) - 1)
+        ) / (len(profile) - 1)
+
+    @staticmethod
+    def _profile_delay(profile: List[Tuple[float, float]], v_f: float) -> float:
+        """Mean shortfall below free flow, in units of v_f.
+
+        One-sided: a cell running above ``v_f`` is not delayed, and scoring it
+        as though it were (which ``abs`` did) charges free-flowing traffic for
+        the gap between the environment's ``v_f`` and the cell's own.
         """
-        count = self.env_config.macro_lookbehind_cells
-        profile: List[Tuple[float, float]] = []
-        empirical_snapshot = self.gt.get_empirical_densities_at_time(self.sim.current_time)
-        try:
-            cell = self.sim.active.get_cell_with_mask(self.bridge._mask_id(lane))
-            while ((cell is not None) and (len(profile) < count)):
-                neighbours = cell.inflow_neighbors
-                if (len(neighbours) == 0):
-                    break
-                cell = self.sim.active.active_cells[neighbours[0]]
-                if (cell.kind == "mask"):
-                    break
-
-                for ((road_id, cell_id), a, b) in cell.base_segments[::-1]:
-                    density = float(empirical_snapshot[(road_id, cell_id)])
-                    velocity = (
-                        float(cell.velocity)
-                        if (cell.velocity is not None)
-                        else float(cell.fd.velocity_from_density(density))
-                    )
-                    profile.append((density, velocity))
-        except Exception as e:
-            print(e)
-            raise e
-        if (len(profile) <= 1):
-            return None
-        return (profile[:count])[::-1]
+        if (len(profile) == 0):
+            return 0.0
+        return sum(max(0.0, (1.0 - (velocity / v_f))) for _, velocity in profile) / len(profile)
 
     def _macro_behind(self, lane: int) -> Tuple[float, float]:
         try:
@@ -938,9 +1200,104 @@ class I24SumoHeroEnv(gym.Env):
         shortfall = max(0.0, 1.0 - (metrics["min_headway"] / weights.target_headway))
         energy_per_metre = metrics["energy"] / max(1.0, metrics["distance"])
 
+        # Rear-boundary flux, scored on the *second* difference rather than the
+        # first.  The mask's rear boundary is anchored on the hero, so a hero that
+        # decelerates at a constant rate ramps the flux through it at a constant
+        # rate too: measured through a hard braking ramp, |dq| held at ~0.0175 per
+        # step while |d2q| stayed near 0.0003, and the ramp alone accounted for
+        # half the episode's total variation.  Charging |dq| therefore charges the
+        # controller for decelerating -- the very thing wave damping consists of --
+        # under the name of smoothness.  The second difference is blind to that
+        # ramp and still sees the reversals a stop-and-go wave crossing the
+        # boundary actually makes.
+        #
+        # Scored as a penalty rather than as ``1 - penalty``: the constant did
+        # nothing for the gradient and was the largest single source of the
+        # unconditional per-step reward, which gave the agent a stake in dragging
+        # episodes out.  Zero now means "the flux was smooth", not "a step happened".
+        # Under "baseline" the curvature is differenced against the same episode
+        # driven by SUMO's own model, so the term reads "smoother than doing
+        # nothing" rather than "smooth in absolute terms".  Absolute smoothness is
+        # minimised by driving smoothly at the prevailing speed -- which is what
+        # IDM does, and is exactly what the policy collapsed onto when this term
+        # carried 62% of the cost with no counterfactual to beat.
+        rear_fluxes = self._rear_fluxes()
+        policy_curvature = self._flux_curvature(
+            rear_fluxes, self._previous_rear_flux, self._previous_rear_flux_2
+        )
+        if (self.reward_config.upstream_reference != "baseline"):
+            rear_flux_smoothness = 0.0 if (policy_curvature is None) else -policy_curvature
+        else:
+            index = self._step_index - 1
+            baseline_fluxes = self._baseline_rear_fluxes
+            baseline_curvature = (
+                self._flux_curvature(
+                    baseline_fluxes[index + 1], baseline_fluxes[index], baseline_fluxes[index - 1]
+                )
+                if ((index >= 1) and ((index + 1) < len(baseline_fluxes))) else None
+            )
+            rear_flux_smoothness = (
+                0.0 if ((policy_curvature is None) or (baseline_curvature is None))
+                else (baseline_curvature - policy_curvature)
+            )
+
+        # Upstream Calculations
+        upstream_sim_oscillation = {}
+        upstream_empirical_oscillation = {}
+        upstream_sim_delay = {}
+        upstream_empirical_delay = {}
+        for lane in self.env_config.lanes:
+            profiles = self._upstream_profiles(lane)
+            if (profiles is None):
+                # Not enough comparable upstream road yet -- near the start of the
+                # corridor there may be only a cell or two behind the mask.  Score
+                # both sides identically so the difference is exactly zero rather
+                # than a bias in either direction.
+                upstream_sim_oscillation[lane] = 1.0
+                upstream_sim_delay[lane] = 1.0
+                upstream_empirical_oscillation[lane] = 1.0
+                upstream_empirical_delay[lane] = 1.0
+                continue
+            sim_profile, empirical_profile = profiles
+            # v_f is only a scale here, and the same one on both sides, so it
+            # cancels in the sim-minus-empirical difference below.
+            upstream_sim_oscillation[lane] = self._profile_oscillation(sim_profile, self.fd.v_f)
+            upstream_empirical_oscillation[lane] = self._profile_oscillation(
+                empirical_profile, self.fd.v_f
+            )
+            upstream_sim_delay[lane] = self._profile_delay(sim_profile, self.fd.v_f)
+            upstream_empirical_delay[lane] = self._profile_delay(empirical_profile, self.fd.v_f)
+
+        upstream_oscillation_sim_reward = (1.0 - (sum([upstream_sim_oscillation[lane] for lane in upstream_sim_oscillation]) / len(upstream_sim_oscillation)))
+        upstream_oscillation_empirical_reward = (1.0 - (sum([upstream_empirical_oscillation[lane] for lane in upstream_empirical_oscillation]) / len(upstream_empirical_oscillation))) 
+        upstream_oscillation_reward = upstream_oscillation_sim_reward - upstream_oscillation_empirical_reward
+
+        upstream_delay_sim_reward = (1.0 - (sum([upstream_sim_delay[lane] for lane in upstream_sim_delay]) / len(upstream_sim_delay)))
+        upstream_delay_empirical_reward = (1.0 - (sum([upstream_empirical_delay[lane] for lane in upstream_empirical_delay]) / len(upstream_empirical_delay)))
+        upstream_delay_reward = upstream_delay_sim_reward - upstream_delay_empirical_reward
+        #print(f"Oscillation {upstream_oscillation_reward}, Delay {upstream_delay_reward}")
+
+        # Progress, as a one-sided constraint rather than an objective.  Rewarding
+        # speed/reference directly is identically "constant minus a penalty on
+        # slowing", so it opposes wave damping at every step -- and since the hero
+        # cannot exceed the safe speed, the term can only ever be spent, never
+        # earned.  The floor form is flat wherever the hero is keeping up.
+        floor = weights.progress_floor
+        reference_speed = self._reference_speed()
+        # If the traffic the hero is measured against has itself stopped, the floor
+        # is vacuous: the hero being slow is not the hero stalling.  Scoring a ratio
+        # of 1.0 leaves the term at exactly zero.
+        progress_ratio = (
+            (speed / reference_speed) if (reference_speed > weights.stopped_speed) else 1.0
+        )
+        progress = -((max(0.0, (floor - progress_ratio)) / floor))
+
         components = {
+            "progress": progress,
+            "rear_flux_smoothness": rear_flux_smoothness,
+            "upstream_oscillation": upstream_oscillation_reward,
+            "upstream_delay": upstream_delay_reward,
             "platoon_speed": float(np.mean(platoon_speeds)) / v_f,
-            "hero_speed": speed / v_f,
             "speed_variance": -float(np.std(platoon_speeds)) / v_f,
             "acceleration": -((metrics["acceleration_rms"] / self.env_config.max_acceleration) ** 2),
             "jerk": -((jerk / self.env_config.max_acceleration) ** 2),
@@ -1039,12 +1396,17 @@ class I24SumoHeroEnv(gym.Env):
         hero = self._hero()
         metrics = self._substep_metrics(samples, float(hero["velocity"]))
         collided = self._detect_collision()
+        # Append before scoring so this step's traffic is inside the window the
+        # progress floor averages over.
+        self._reference_speed_history.append(self._instantaneous_reference_speed())
         reward, components = self._reward(metrics)
         if (collided):
             components["collision"] = -1.0
             reward -= self.reward_config.collision
 
         self._previous_acceleration = metrics["acceleration"]
+        self._previous_rear_flux_2 = self._previous_rear_flux
+        self._previous_rear_flux = self._rear_fluxes()
         self._previous_action = 0.0 if (passthrough) else float(np.clip(action_value, -1.0, 1.0))
         lookahead = self._macro_lookahead(hero["lane_id"])
         record = {
@@ -1067,6 +1429,10 @@ class I24SumoHeroEnv(gym.Env):
             "platoon_speed_std": -components["speed_variance"] * self.fd.v_f,
             "macro_density_ahead": lookahead[0][0],
             "macro_velocity_ahead": lookahead[0][1],
+            "progress_reward": components["progress"],
+            "rear_flux_smoothness": components["rear_flux_smoothness"],
+            "upstream_oscillation": components["upstream_oscillation"],
+            "upstream_delay": components["upstream_delay"],
             "reward": reward,
         }
         self._episode_records.append(record)
@@ -1113,6 +1479,10 @@ class I24SumoHeroEnv(gym.Env):
             "steps": len(records),
             "return": 0.0,
             "mean_reward": 0.0,
+            "mean_progress_reward": 0.0,
+            "mean_rear_flux_smoothness": 0.0,
+            "mean_upstream_oscillation": 0.0,
+            "mean_upstream_delay": 0.0,
             "hero_mean_speed": 0.0,
             "hero_speed_std": 0.0,
             "platoon_mean_speed": 0.0,
@@ -1133,6 +1503,10 @@ class I24SumoHeroEnv(gym.Env):
         summary.update({
             "return": float(np.sum([r["reward"] for r in records])),
             "mean_reward": float(np.mean([r["reward"] for r in records])),
+            "mean_progress_reward": float(np.mean([r["progress_reward"] for r in records])),
+            "mean_rear_flux_smoothness": float(np.mean([r["rear_flux_smoothness"] for r in records])),
+            "mean_upstream_oscillation": float(np.mean([r["upstream_oscillation"] for r in records])),
+            "mean_upstream_delay": float(np.mean([r["upstream_delay"] for r in records])),
             "hero_mean_speed": float(np.mean(speeds)),
             "hero_speed_std": float(np.std(speeds)),
             "platoon_mean_speed": float(np.mean(platoon)),
@@ -1349,24 +1723,37 @@ class TrainConfig:
     """
 
     algorithm: str = "recurrent_ppo"  # "recurrent_ppo" or "ppo"
-    total_timesteps: int = 100_000
-    envs: int = 4
+    total_timesteps: int = 1_000_000
+    envs: int = 24
     # Steps per environment per update.  An episode is about 40 steps, so 128
     # keeps two or three episodes' worth of experience per environment in each
     # batch without letting the policy go stale.
     n_steps: int = 128
-    batch_size: int = 128
+    batch_size: int = 128*3
     n_epochs: int = 10
     learning_rate: float = 3.0e-4
     gamma: float = 0.99
-    gae_lambda: float = 0.95
+    gae_lambda: float = 0.97
     clip_range: float = 0.2
-    ent_coef: float = 0.003
+    ent_coef: float = 0.005
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
     target_kl: Optional[float] = 0.05
     net_arch: Tuple[int, ...] = (64, 64)
     log_std_init: float = -0.5
+    # Generalised State-Dependent Exploration.  Default PPO perturbs the action
+    # with fresh iid noise every step, which integrates to a random walk in speed
+    # and averages out over a trajectory -- it explores jitter, not manoeuvres.
+    # Wave damping is a manoeuvre: brake, hold, release, timed against an
+    # approaching shock, and it has to be held long enough to pay off.  gSDE
+    # draws the perturbation as a function of state and holds it for
+    # sde_sample_freq steps, so exploration is temporally correlated and whole
+    # manoeuvres get tried.  That matters here because the counterfactual reward
+    # scores baseline imitation at exactly 0 while any deviation costs
+    # immediately, so the useful behaviour is on the far side of a moat that iid
+    # noise will not cross.
+    use_sde: bool = True
+    sde_sample_freq: int = 8      # -1 samples once per rollout; 8-16 is a good range
     # Recurrent policy only. A separate critic LSTM (shared_lstm=False,
     # enable_critic_lstm=True) is sb3-contrib's default and the right one here:
     # the value function has to track the platoon's state over time, which is a
@@ -1445,6 +1832,7 @@ def _episode_metrics_callback():
         tracked = (
             "hero_mean_speed", "platoon_mean_speed", "platoon_speed_std",
             "acceleration_rms", "jerk_rms", "min_headway", "energy_per_metre",
+            "mean_progress_reward", "mean_rear_flux_smoothness", "mean_upstream_oscillation", "mean_upstream_delay"
         )
 
         def __init__(self, window: int = 20) -> None:
@@ -1477,9 +1865,20 @@ def _episode_metrics_callback():
 
 
 def write_run_config(
-    output_dir: str, env_config: EnvConfig, reward_config: RewardConfig, train_config: TrainConfig
+    output_dir: str,
+    env_config: EnvConfig,
+    reward_config: RewardConfig,
+    train_config: TrainConfig,
+    resumed_from: Optional[str] = None,
+    resumed_at_step: int = 0,
 ) -> None:
-    """Record what this run was, so the demo and the analysis can rebuild it."""
+    """Record what this run was, so the demo and the analysis can rebuild it.
+
+    ``resumed_from`` matters for more than provenance: a resumed run's
+    ``monitor_*.csv`` restart their ``t`` at zero, so any analysis that pools
+    episodes across both directories has to concatenate by run rather than sort
+    by ``t``, and the step axis of this directory starts at ``resumed_at_step``.
+    """
     with open(os.path.join(output_dir, "run_config.json"), "w") as handle:
         json.dump(
             {
@@ -1488,6 +1887,8 @@ def write_run_config(
                 "train": asdict(train_config),
                 "observation_size": env_config.observation_size,
                 "created_at": time.time(),
+                "resumed_from": resumed_from,
+                "resumed_at_step": int(resumed_at_step),
             },
             handle,
             indent=2,
@@ -1501,8 +1902,21 @@ def train(
     train_config: TrainConfig,
     output_dir: str,
     subprocess: bool = True,
+    resume_from: Optional[str] = None,
 ):
-    """Run PPO (recurrent by default) over the environment; returns the model."""
+    """Run PPO (recurrent by default) over the environment; returns the model.
+
+    ``resume_from`` continues a stopped run from one of its checkpoints. The
+    checkpoint carries ``policy.optimizer.pth`` as well as the weights, so the
+    Adam moments survive and this is a continuation rather than a warm restart.
+    ``total_timesteps`` stays the *total* for the run: the remaining budget is
+    computed from the checkpoint's own step count.
+
+    Resuming always writes into a fresh ``output_dir``. Sharing the original
+    would overwrite its ``monitor_*.csv`` and its ``progress.csv``, and the two
+    cannot be pooled by sorting on ``t`` anyway because a new Monitor restarts
+    that clock at zero.
+    """
     import torch.nn as nn
     from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
     from stable_baselines3.common.logger import configure
@@ -1510,7 +1924,25 @@ def train(
 
     checkpoint_dir = os.path.join(output_dir, "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
-    write_run_config(output_dir, env_config, reward_config, train_config)
+
+    resume_checkpoint = None
+    resume_step = 0
+    if (resume_from is not None):
+        resume_checkpoint = resolve_checkpoint(resume_from)
+        resume_step = checkpoint_step_count(resume_checkpoint)
+        if (os.path.abspath(os.path.dirname(resume_checkpoint)) == os.path.abspath(checkpoint_dir)):
+            raise ValueError(
+                "refusing to resume into the run being resumed from: pass a new --run-name, "
+                "or the original run's monitor and progress files are overwritten"
+            )
+        # The spec stream is drawn from `seed + rank`, so reusing the original
+        # seed would replay the exact episodes the run already trained on.
+        train_config = replace(train_config, seed=train_config.seed + resume_step)
+
+    write_run_config(
+        output_dir, env_config, reward_config, train_config,
+        resumed_from=resume_checkpoint, resumed_at_step=resume_step,
+    )
 
     vec_env = build_vec_env(env_config, reward_config, train_config, output_dir, subprocess)
     if (train_config.normalize):
@@ -1544,24 +1976,36 @@ def train(
             "enable_critic_lstm": train_config.enable_critic_lstm,
         })
 
-    model = algorithm(
-        policy_name,
-        vec_env,
-        learning_rate=train_config.learning_rate,
-        n_steps=train_config.n_steps,
-        batch_size=train_config.batch_size,
-        n_epochs=train_config.n_epochs,
-        gamma=train_config.gamma,
-        gae_lambda=train_config.gae_lambda,
-        clip_range=train_config.clip_range,
-        ent_coef=train_config.ent_coef,
-        vf_coef=train_config.vf_coef,
-        max_grad_norm=train_config.max_grad_norm,
-        target_kl=train_config.target_kl,
-        seed=train_config.seed,
-        policy_kwargs=policy_kwargs,
-        verbose=0,
-    )
+    if (resume_checkpoint is not None):
+        # Hyperparameters come from the checkpoint, not from train_config: the
+        # saved optimizer state belongs to the network the checkpoint holds, and
+        # silently rebuilding it under different settings would not be a resume.
+        model = algorithm.load(resume_checkpoint, env=vec_env, device="auto")
+        print(
+            f"resumed {train_config.algorithm} from {resume_checkpoint} "
+            f"at {model.num_timesteps} steps (env seed offset to {train_config.seed})"
+        )
+    else:
+        model = algorithm(
+            policy_name,
+            vec_env,
+            learning_rate=train_config.learning_rate,
+            n_steps=train_config.n_steps,
+            batch_size=train_config.batch_size,
+            n_epochs=train_config.n_epochs,
+            gamma=train_config.gamma,
+            gae_lambda=train_config.gae_lambda,
+            clip_range=train_config.clip_range,
+            ent_coef=train_config.ent_coef,
+            vf_coef=train_config.vf_coef,
+            max_grad_norm=train_config.max_grad_norm,
+            target_kl=train_config.target_kl,
+            use_sde=train_config.use_sde,
+            sde_sample_freq=train_config.sde_sample_freq,
+            seed=train_config.seed,
+            policy_kwargs=policy_kwargs,
+            verbose=0,
+        )
     model.set_logger(logger)
     print(f"{train_config.algorithm} / {policy_name} over {max(1, train_config.envs)} environment(s)")
 
@@ -1592,8 +2036,26 @@ def train(
             )
         )
 
+    # With reset_num_timesteps=False, SB3 adds the argument to the counter it
+    # already holds, so this has to be the *remaining* budget rather than the
+    # total (base_class._setup_learn: `total_timesteps += self.num_timesteps`).
+    remaining = train_config.total_timesteps
+    if (resume_checkpoint is not None):
+        remaining = train_config.total_timesteps - model.num_timesteps
+        if (remaining <= 0):
+            raise ValueError(
+                f"checkpoint is already at {model.num_timesteps} steps of a "
+                f"{train_config.total_timesteps} budget; raise --total-timesteps to continue"
+            )
+        print(f"running {remaining} more steps to reach {train_config.total_timesteps}")
+
     try:
-        model.learn(total_timesteps=train_config.total_timesteps, callback=callbacks, progress_bar=False)
+        model.learn(
+            total_timesteps=remaining,
+            callback=callbacks,
+            progress_bar=False,
+            reset_num_timesteps=(resume_checkpoint is None),
+        )
     finally:
         model.save(os.path.join(checkpoint_dir, "policy_final"))
         if (train_config.normalize):
@@ -1609,9 +2071,38 @@ def train(
 # ---------------------------------------------------------------------------
 
 
+def find_run_config(path: str) -> Optional[str]:
+    """The run directory governing ``path``, or None if there is no config above it.
+
+    ``path`` may be the run directory itself or anything inside it -- most
+    usefully a checkpoint under ``checkpoints/``, so that evaluating one
+    specific checkpoint still picks up the configuration it was trained under.
+    Getting this wrong is not a small error: ``EnvConfig`` defaults differ from
+    any real run's (``macro_lookahead_cells`` alone changes the observation
+    width), so a caller that quietly falls back to defaults is evaluating the
+    policy in an environment it never saw.
+    """
+    candidate = os.path.abspath(path)
+    if (os.path.isfile(candidate)):
+        candidate = os.path.dirname(candidate)
+    while True:
+        if (os.path.isfile(os.path.join(candidate, "run_config.json"))):
+            return candidate
+        parent = os.path.dirname(candidate)
+        if (parent == candidate):
+            return None
+        candidate = parent
+
+
 def load_run_config(run_dir: str) -> Tuple[EnvConfig, RewardConfig, Dict[str, Any]]:
-    """Rebuild the configs a run was trained with from its run_config.json."""
-    with open(os.path.join(run_dir, "run_config.json"), "r") as handle:
+    """Rebuild the configs a run was trained with from its run_config.json.
+
+    Accepts the run directory or any path inside it; see ``find_run_config``.
+    """
+    resolved = find_run_config(run_dir)
+    if (resolved is None):
+        raise FileNotFoundError(f"no run_config.json at or above {run_dir}")
+    with open(os.path.join(resolved, "run_config.json"), "r") as handle:
         payload = json.load(handle)
     return (
         env_config_from_dict(payload.get("env", {})),
@@ -1630,6 +2121,14 @@ def env_config_from_dict(stored: Dict[str, Any], **overrides) -> EnvConfig:
 
 
 def reward_config_from_dict(stored: Dict[str, Any]) -> RewardConfig:
+    stored = dict(stored)
+    # ``hero_speed`` was the weight on speed/getFollowSpeed before that term became
+    # the one-sided ``progress`` floor.  Carry the weight across so a run_config
+    # written by an older checkpoint keeps the term switched on or off as it was --
+    # but note the term itself now computes something different, so an old
+    # checkpoint replayed under it is not being scored on the reward it trained on.
+    if (("progress" not in stored) and ("hero_speed" in stored)):
+        stored["progress"] = stored["hero_speed"]
     return RewardConfig(**{k: v for k, v in stored.items() if (k in RewardConfig.__dataclass_fields__)})
 
 
@@ -1645,17 +2144,45 @@ def resolve_checkpoint(path: str) -> str:
     ):
         if (os.path.isfile(candidate)):
             return candidate
-    # Otherwise take the highest-numbered periodic checkpoint.
+    # Otherwise take the highest-numbered periodic checkpoint.  Sorted by step
+    # count, not by name: a plain sort is lexicographic, so "policy_9984_steps"
+    # beats "policy_129792_steps" and a run without a policy_final would resume
+    # from its *first* checkpoint.
     checkpoint_dir = path
     if (os.path.isdir(os.path.join(path, "checkpoints"))):
         checkpoint_dir = os.path.join(path, "checkpoints")
-    candidates = sorted(
+    candidates = [
         name for name in os.listdir(checkpoint_dir)
         if (name.startswith("policy") and name.endswith(".zip"))
-    )
+    ]
     if (len(candidates) == 0):
         raise FileNotFoundError(f"no stable-baselines3 checkpoint under {path}")
-    return os.path.join(checkpoint_dir, candidates[-1])
+    return max(
+        (os.path.join(checkpoint_dir, name) for name in candidates),
+        key=checkpoint_step_count,
+    )
+
+
+def checkpoint_step_count(name: str) -> int:
+    """How many steps a checkpoint was saved at.
+
+    Read out of the archive's own ``data`` blob rather than the filename, because
+    ``policy_final.zip`` and ``best_model.zip`` carry no number and would
+    otherwise report zero -- which would silently defeat the seed offset that
+    stops a resumed run replaying the episodes it already trained on. Falls back
+    to the ``policy_<n>_steps`` name for a path that is not a readable archive.
+    """
+    if (os.path.isfile(name)):
+        try:
+            with zipfile.ZipFile(name) as archive:
+                stored = json.loads(archive.read("data").decode("utf-8"))
+            steps = stored.get("num_timesteps")
+            if (steps is not None):
+                return int(steps)
+        except Exception:
+            pass
+    match = re.search(r"policy_(\d+)_steps", os.path.basename(name))
+    return int(match.group(1)) if (match is not None) else 0
 
 
 RECURRENT_ALGORITHMS = ("recurrent_ppo", "ppo_lstm", "recurrentppo")
@@ -1721,8 +2248,9 @@ def load_model(path: str, device: str = "cpu", algorithm: Optional[str] = None):
 
 
 REWARD_WEIGHT_NAMES = (
-    "platoon_speed", "hero_speed", "speed_variance", "acceleration", "jerk",
-    "headway", "energy", "stopped", "collision",
+    "platoon_speed", "progress", "speed_variance", "acceleration", "jerk",
+    "headway", "energy", "stopped", "collision", 
+    "rear_flux_smoothness", "upstream_oscillation", "upstream_delay"
 )
 
 
@@ -1732,6 +2260,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--run-name", default=time.strftime("ppo_%Y%m%d_%H%M%S"))
     parser.add_argument("--output-root", default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument(
+        "--resume", default=None,
+        help="continue a stopped run from a checkpoint or run directory. Weights AND "
+             "optimizer state are restored, so this is a continuation, not a warm restart. "
+             "--total-timesteps stays the total for the whole run; the remainder is computed "
+             "from the checkpoint. Writes to a new --run-name (the original's monitor and "
+             "progress files are not touched) and offsets the env seed so the resumed half "
+             "does not replay the same episode specs.",
+    )
     parser.add_argument("--config-folder", default=DEFAULT_CONFIG_FOLDER)
     parser.add_argument("--datasets", nargs="+", default=["2022-11-21.json", "2022-11-22.json", "2022-11-23.json", "2022-11-24.json", "2022-11-25.json", "2022-11-28.json", "2022-12-01.json", "2022-12-02.json"], help="dataset json files to train on")
     parser.add_argument("--roads", nargs="+", default=["2"])
@@ -1749,23 +2286,36 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--no-critic-lstm", dest="enable_critic_lstm", action="store_false",
         help="give the critic no recurrence of its own",
     )
-    parser.add_argument("--envs", type=int, default=32, help="parallel environments; 1 runs in-process")
+    parser.add_argument("--envs", type=int, default=24, help="parallel environments; 1 runs in-process")
     parser.add_argument("--no-subprocess", action="store_true", help="use DummyVecEnv even with several environments")
     parser.add_argument("--total-timesteps", type=int, default=1_000_000)
     parser.add_argument("--n-steps", type=int, default=128)
-    parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--n-epochs", type=int, default=5)
+    parser.add_argument("--batch-size", type=int, default=3*128)
+    parser.add_argument("--n-epochs", type=int, default=10)
     parser.add_argument("--learning-rate", type=float, default=3.0e-4)
     parser.add_argument("--gamma", type=float, default=0.99)
-    parser.add_argument("--gae-lambda", type=float, default=0.95)
+    parser.add_argument("--gae-lambda", type=float, default=0.97)
     parser.add_argument("--clip-range", type=float, default=0.2)
-    parser.add_argument("--ent-coef", type=float, default=0.0)
+    parser.add_argument("--ent-coef", type=float, default=TrainConfig.ent_coef)
     parser.add_argument("--target-kl", type=float, default=0.0, help="0 disables the KL early stop")
+    parser.add_argument(
+        # BooleanOptionalAction, not store_true: store_true's default is always
+        # False, which silently overrides TrainConfig's value on every CLI launch
+        # and makes the dataclass default dead code.  This form defaults to the
+        # dataclass and gives an explicit --no-use-sde to turn it off.
+        "--use-sde", action=argparse.BooleanOptionalAction, default=TrainConfig.use_sde,
+        help="state-dependent exploration: temporally correlated noise, so whole "
+             "manoeuvres get explored rather than per-step jitter",
+    )
+    parser.add_argument(
+        "--sde-sample-freq", type=int, default=TrainConfig.sde_sample_freq,
+        help="steps a gSDE perturbation is held for (-1 = once per rollout; 8-16 is a good range)",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-steps", type=int, default=120)
     parser.add_argument("--macro-lookahead-cells", type=int, default=4)
     parser.add_argument("--max-acceleration", type=float, default=1.5)
-    parser.add_argument("--max-deceleration", type=float, default=3.0)
+    parser.add_argument("--max-deceleration", type=float, default=2.0)
     parser.add_argument(
         "--hero-speed-mode", type=int, default=None,
         help="SUMO speed mode for the hero (default: SUMO's 31, safe-speed clipped; 30 drops the safe-speed check, 0 gives full authority)",
@@ -1826,6 +2376,8 @@ def configs_from_args(args) -> Tuple[EnvConfig, RewardConfig, TrainConfig]:
         clip_range=args.clip_range,
         ent_coef=args.ent_coef,
         target_kl=(args.target_kl if (args.target_kl > 0.0) else None),
+        use_sde=args.use_sde,
+        sde_sample_freq=args.sde_sample_freq,
         seed=args.seed,
         checkpoint_freq=args.checkpoint_freq,
         eval_freq=args.eval_freq,
@@ -1862,6 +2414,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         train_config=train_config,
         output_dir=output_dir,
         subprocess=(not args.no_subprocess),
+        resume_from=args.resume,
     )
     print(f"done in {(time.time() - started) / 60.0:.1f} min; checkpoints in {output_dir}/checkpoints")
 

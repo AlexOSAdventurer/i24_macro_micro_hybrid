@@ -50,6 +50,7 @@ from sim_rl_sumo_training import (
     RewardConfig,
     detect_algorithm,
     env_config_from_dict,
+    find_run_config,
     load_model,
     load_run_config,
     resolve_checkpoint,
@@ -153,7 +154,16 @@ def build_env(args) -> Tuple[I24SumoHeroEnv, RewardConfig]:
     """
     env_config = EnvConfig()
     reward_config = RewardConfig()
-    if (args.run is not None) and (os.path.isfile(os.path.join(args.run, "run_config.json"))):
+    if (args.run is not None):
+        # Fail loudly rather than falling back to EnvConfig(): the defaults give
+        # a different observation width than any real run, so a silent fallback
+        # replays the policy in an environment it was never trained in and every
+        # episode dies inside predict() with a shape error.
+        if (find_run_config(args.run) is None):
+            raise FileNotFoundError(
+                f"no run_config.json at or above {args.run}; refusing to evaluate "
+                "the policy under default environment settings"
+            )
         env_config, reward_config, _ = load_run_config(args.run)
     overrides: Dict[str, Any] = {"gui": args.gui, "verbose": args.verbose}
     if (args.datasets):

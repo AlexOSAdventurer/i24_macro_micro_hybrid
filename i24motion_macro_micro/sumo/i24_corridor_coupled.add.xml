@@ -14,10 +14,62 @@
 <additional xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
             xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/additional_file.xsd">
 
+    <!-- NOTE: sigma is the Krauss dawdling parameter and is IGNORED by IDM.
+         Verified directly: IDM with sigma=0.0 and sigma=0.5 produce identical
+         trajectories under the same seed, while Krauss does not.  This type is
+         therefore deterministic in its car-following; the only randomness is the
+         static per-vehicle speedFactor draw.  Kept as the control condition. -->
     <vType id="car" vClass="passenger" carFollowModel="IDM"
            accel="1.5" decel="2.0" emergencyDecel="9.0" sigma="0.5"
            tau="1.0" minGap="2.5" length="4.5" maxSpeed="30.019341712559083"
            speedFactor="normc(1.0,0.1,0.8,1.2)"
+           laneChangeModel="LC2013"/>
+
+    <!-- Extended IDM: IDM plus driver imperfection, so the platoon is string
+         unstable and stop-and-go waves form on their own.  Without that there is
+         nothing for a wave-damping controller to damp, which is measurable: under
+         the "car" type above, FollowerStopper scores identically to plain IDM.
+
+         The three sigmas below are SUMO's documented defaults, and are exactly
+         Table 3 of Salles, Kaufmann and Reuss, "Extending the Intelligent Driver
+         Model in SUMO and Verifying the Drive Off Trajectories with Aerial
+         Measurements" (SUMO Conf. 2020/2022):
+
+           sigmaerror  0.10  = the paper's sigma_a, driving error magnitude
+           sigmaleader 0.02  = sigma_r, error estimating the leader's speed
+           sigmagap    0.10  = V_s,     error estimating the gap
+
+         Provenance matters here, and it splits.  That paper's own case study is a
+         signalised junction in Stuttgart at 50 km/h, validating *drive-off from
+         standstill*, which is not freeway.  But the paper states these sigmas are
+         "taken from literature": they come from the Human Driver Model of Treiber,
+         Kesting and Helbing (2006), which is freeway-flow work on delays,
+         estimation error and string instability.  It is the drive-off parameters
+         (taccmax, Mflatness, Mbegin, jerkmax) that the Stuttgart study fitted, and
+         those govern pulling away from a stop rather than steady following.  So
+         for a freeway study the sigmas are on defensible lineage as they stand.
+
+         Relation to the Flow experiments this mirrors: closer than it first looks.
+         Flow perturbs acceleration directly, accel += sqrt(dt) * N(0, noise), with
+         ring-road stability runs around 0.1-0.2 m/s^2.  EIDM's sigma_a enters the
+         same way; the paper's eq. (8) is a_tilde(t) = a(t) + sigma_a * w_a(t);
+         so sigmaerror is an acceleration noise in m/s^2, and 0.10 sits at the low
+         end of Flow's range.  The one real difference is correlation: w_a is a
+         Wiener process with correlation time tPersDrive = 3 s, where Flow's noise
+         is white.  Same quantity, same units, different spectrum. 
+         accel/decel/tau/minGap/maxSpeed are all overwritten per-vehicle at
+         insertion time; tau in particular becomes 1/(w*rho_j) = 2.26 s from the
+         calibrated triangular FD, which is what keeps the micro steady state on
+         the same fundamental diagram as the CTM.  Flow's T=1, v0=30, s0=2 are
+         deliberately NOT adopted: they would decouple the two layers.  What is
+         matched is the IDM structure itself and delta=4, SUMO's default and
+         Treiber's original exponent, which Flow also uses. -->
+    <vType id="car_eidm" vClass="passenger" carFollowModel="EIDM"
+           accel="1.5" decel="2.0" emergencyDecel="9.0"
+           tau="1.0" minGap="2.5" length="4.5" maxSpeed="30.019341712559083"
+           speedFactor="normc(1.0,0.1,0.8,1.2)"
+           delta="4"
+           sigmaerror="0.10" sigmaleader="0.02" sigmagap="0.10"
            laneChangeModel="LC2013"/>
 
 </additional>
