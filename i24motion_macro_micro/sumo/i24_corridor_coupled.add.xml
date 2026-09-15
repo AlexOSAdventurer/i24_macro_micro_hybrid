@@ -14,13 +14,32 @@
 <additional xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
             xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/additional_file.xsd">
 
-    <!-- NOTE: sigma is the Krauss dawdling parameter and is IGNORED by IDM.
+    <!-- The active type for the coupled runs: plain IDM matched to AVC (Yan et
+         al., T-ASE 2022), the stack the ring-road controllers are trained on, so
+         that a controller moved between the two faces the same car-following
+         model on both sides.
+
+         NOTE: sigma is the Krauss dawdling parameter and is IGNORED by IDM.
          Verified directly: IDM with sigma=0.0 and sigma=0.5 produce identical
-         trajectories under the same seed, while Krauss does not.  This type is
-         therefore deterministic in its car-following; the only randomness is the
-         static per-vehicle speedFactor draw.  Kept as the control condition. -->
+         trajectories under the same seed, while Krauss does not.  It is left here
+         at AVC's human value only as documentation of the noise amplitude: the
+         driver noise is actually injected over TraCI, once per vehicle per
+         substep, by I24MotionSumoSimulationCoupled.apply_idm_noise (idm_sigma),
+         exactly as on the ring side, because AVC's own noise came from a patched
+         SUMO whose IDM adds randNorm(0, sigma) to the acceleration.
+
+         accel/decel are AVC's 1.0/1.5 (previously 1.5/2.0), and are also
+         overwritten per vehicle at insertion from the engine's max_accel/max_decel
+         so the two cannot drift apart.  tau/minGap/length stay ours and are
+         likewise overwritten at insertion: tau becomes 1/(w*rho_j) = 2.26 s and
+         length+minGap = 1/rho_j from the calibrated triangular FD, which is what
+         keeps the micro steady state on the CTM's fundamental diagram.  AVC's
+         tau=1.0, minGap=2.5 would decouple the two layers.  speedFactor is
+         unchanged and needs no change: normc(1.0,0.1,0.8,1.2) is exactly AVC's
+         speedFactor=1.0 with speedDev=0.1 at SUMO's default cutoff.  delta is
+         unset on both sides, i.e. SUMO's default 4, Treiber's original exponent. -->
     <vType id="car" vClass="passenger" carFollowModel="IDM"
-           accel="1.5" decel="2.0" emergencyDecel="9.0" sigma="0.5"
+           accel="1.0" decel="1.5" emergencyDecel="9.0" sigma="0.2"
            tau="1.0" minGap="2.5" length="4.5" maxSpeed="30.019341712559083"
            speedFactor="normc(1.0,0.1,0.8,1.2)"
            laneChangeModel="LC2013"/>

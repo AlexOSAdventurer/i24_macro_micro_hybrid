@@ -1,8 +1,8 @@
 """Replay and inspect the trained hero controllers from sim_rl_sumo_training.
 
 Runs one or more episodes of the coupled macro/micro simulation with the hero
-under a chosen controller -- a stable-baselines3 checkpoint (RecurrentPPO or
-plain PPO; the algorithm is read back from the run and the LSTM hidden state is
+under a chosen controller -- a stable-baselines3 checkpoint (RecurrentPPO, plain
+PPO or TRPO; the algorithm is read back from the run and the LSTM hidden state is
 carried across the episode), or one of the non-learned baselines -- and then
 lets you look at what happened:
 
@@ -128,13 +128,20 @@ def load_policy_controller(run_or_checkpoint: str, deterministic: bool = True, d
     return PolicyController(model, deterministic=deterministic, vec_normalize=vec_normalize)
 
 
+# Names that load the learned policy from --run.  The algorithm is read back from
+# the run itself, so these only label the controller in the outputs.
+LEARNED_CONTROLLERS = ("ppo", "trpo")
+
+
 def build_controller(name: str, args) -> BaselineController:
-    if (name == "ppo"):
+    if (name in LEARNED_CONTROLLERS):
         if (args.run is None):
-            raise ValueError("--controllers ppo needs --run pointing at a training run or checkpoint")
+            raise ValueError(f"--controllers {name} needs --run pointing at a training run or checkpoint")
         return load_policy_controller(args.run, deterministic=(not args.stochastic), device=args.device)
     if (name not in BASELINE_CONTROLLERS):
-        raise ValueError(f"unknown controller {name!r}; pick from ppo, {', '.join(BASELINE_CONTROLLERS)}")
+        raise ValueError(
+            f"unknown controller {name!r}; pick from {', '.join(LEARNED_CONTROLLERS + tuple(BASELINE_CONTROLLERS))}"
+        )
     return BASELINE_CONTROLLERS[name]()
 
 
@@ -154,7 +161,13 @@ def build_env(args) -> Tuple[I24SumoHeroEnv, RewardConfig]:
     """
     env_config = EnvConfig()
     reward_config = RewardConfig()
-    if (args.run is not None):
+    if (args.run is not None) and (args.no_run_config):
+        # A checkpoint trained outside this project (the AVC ring controllers) has no
+        # run_config.json.  The observation is AVC's three features at every setting, so
+        # EnvConfig defaults plus the explicit overrides below are the whole environment;
+        # the normalisers and control step still have to be passed to match the policy.
+        print(f"--no-run-config: evaluating {args.run} under EnvConfig defaults plus command-line overrides")
+    elif (args.run is not None):
         # Fail loudly rather than falling back to EnvConfig(): the defaults give
         # a different observation width than any real run, so a silent fallback
         # replays the policy in an environment it was never trained in and every
@@ -165,13 +178,28 @@ def build_env(args) -> Tuple[I24SumoHeroEnv, RewardConfig]:
                 "the policy under default environment settings"
             )
         env_config, reward_config, _ = load_run_config(args.run)
-    overrides: Dict[str, Any] = {"gui": args.gui, "verbose": args.verbose}
+    # The run's training pool is dropped unless a pool is named explicitly. It is
+    # pinned to the training days, so keeping it would quietly evaluate on the
+    # specs the policy was trained on while --datasets claimed otherwise.
+    overrides: Dict[str, Any] = {
+        "gui": args.gui, "verbose": args.verbose,
+        "spec_pool": (args.spec_pool or None),
+    }
     if (args.datasets):
         overrides["datasets"] = tuple(args.datasets)
     if (args.roads):
         overrides["roads"] = tuple(args.roads)
+    if (args.macro_dt is not None):
+        overrides["macro_dt"] = args.macro_dt
     if (args.max_steps is not None):
         overrides["max_steps"] = args.max_steps
+    elif (args.macro_dt is not None):
+        # Keep the episode's duration in seconds, as the training CLI does: max_steps is a
+        # count of outer steps, defined at the data's 1 s step.
+        overrides["max_steps"] = int(round(float(env_config.max_steps) * 1.0 / args.macro_dt))
+    for field in ("obs_max_speed", "obs_max_dist", "hero_min_gap", "max_acceleration", "max_deceleration"):
+        if (getattr(args, field) is not None):
+            overrides[field] = getattr(args, field)
     env_config = env_config_from_dict(asdict(env_config), **overrides)
 
     env = I24SumoHeroEnv(
@@ -182,6 +210,7 @@ def build_env(args) -> Tuple[I24SumoHeroEnv, RewardConfig]:
         # Every step then keeps a snapshot of the network, which is what the
         # Dash viewer and the RolloutStore read; training turns this off.
         record_rollout=(args.dash or args.store),
+        record_vehicles=(not args.no_vehicle_traces),
     )
     return env, reward_config
 
@@ -191,10 +220,32 @@ def sample_specs(env: I24SumoHeroEnv, count: int) -> List[EpisodeSpec]:
     return [env._sample_spec() for _ in range(count)]
 
 
+def pool_specs(
+    env: I24SumoHeroEnv, count: Optional[int] = None, episode_range: Optional[Sequence[int]] = None
+) -> List[EpisodeSpec]:
+    """Every spec in the loaded pool exactly once, in pool order.
+
+    ``episode_range`` (start, end) takes pool indices start..end-1, like a slice;
+    ``count`` then caps how many of those run.
+
+    ``sample_specs`` draws with replacement, so on a small evaluation pool it repeats
+    some episodes and never reaches others; a paired evaluation over a fixed episode
+    set wants each one once.
+    """
+    if (env._spec_pool is None):
+        raise ValueError("--all-pool-specs needs --spec-pool")
+    specs = list(env._spec_pool.specs)
+    start, end = (0, len(specs)) if (episode_range is None) else (int(episode_range[0]), int(episode_range[1]))
+    if (not (0 <= start < end <= len(specs))):
+        raise ValueError(f"--episode-range {start} {end} is outside the pool's 0..{len(specs)}")
+    specs = specs[start:end]
+    return specs if (count is None) else specs[:count]
+
+
 def run_episode(
     env: I24SumoHeroEnv, controller: BaselineController, spec: EpisodeSpec
-) -> Tuple[Dict[str, Any], List[Dict[str, float]]]:
-    """One pinned episode under one controller. Returns (summary, per-step records)."""
+) -> Tuple[Dict[str, Any], List[Dict[str, float]], List[Dict[str, Any]]]:
+    """One pinned episode under one controller. Returns (summary, per-step records, per-vehicle records)."""
     observation, _ = env.reset(options={"spec": spec})
     controller.reset()
     while True:
@@ -204,7 +255,7 @@ def run_episode(
         )
         if (terminated or truncated):
             break
-    return env.episode_summary(), env.episode_records()
+    return env.episode_summary(), env.episode_records(), env.vehicle_records()
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +289,20 @@ def write_trace(path: str, records: Sequence[Dict[str, float]]) -> None:
         writer.writeheader()
         for record in records:
             writer.writerow(record)
+
+
+def write_vehicle_trace(path: str, records: Sequence[Dict[str, Any]]) -> None:
+    """Per-vehicle rows (step, time, vehicle_id, is_hero, lane_id, s, length, speed) as parquet.
+
+    Long format because the bubble's population changes every step; one row per
+    vehicle per step keeps followers, lane changes and cut-ins recoverable offline.
+    """
+    if (len(records) == 0):
+        return
+    import pandas as pd
+
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    pd.DataFrame.from_records(records).to_parquet(path, index=False)
 
 
 def store_rollout(
@@ -330,13 +395,47 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run", default=None, help="training run directory or checkpoint (.zip) for the ppo controller")
     parser.add_argument(
         "--controllers", nargs="+", default=["ppo", "sumo"],
-        help="ppo plus any of: " + ", ".join(BASELINE_CONTROLLERS),
+        help="ppo or trpo (the policy in --run) plus any of: " + ", ".join(BASELINE_CONTROLLERS),
     )
     parser.add_argument("--episodes", type=int, default=3, help="episode specs, replayed by every controller")
     parser.add_argument("--seed", type=int, default=12345, help="seeds the episode sampling, so runs are repeatable")
     parser.add_argument("--datasets", nargs="+", default=["2022-11-29.json", "2022-11-30.json"], help="override the run's datasets (e.g. a held-out day)")
+    parser.add_argument(
+        "--spec-pool", default="",
+        help="pre-built spec pool to draw the evaluation episodes from. The run's "
+             "own training pool is dropped by default, because its specs are the "
+             "ones the policy was trained on; pass a pool built on the held-out "
+             "days to score out-of-sample.",
+    )
+    parser.add_argument(
+        "--all-pool-specs", action="store_true",
+        help="run every spec in --spec-pool once, in order, instead of sampling --episodes with "
+             "replacement; --episodes then caps how many (pass --episodes 0 for all)",
+    )
+    parser.add_argument(
+        "--episode-range", nargs=2, type=int, default=None, metavar=("START", "END"),
+        help="with --all-pool-specs, run pool indices START..END-1 (a slice). Episode numbers in "
+             "episodes.csv and traces/ keep the pool index, so shards run into separate --out "
+             "directories never collide and can be concatenated",
+    )
+    parser.add_argument(
+        "--no-run-config", action="store_true",
+        help="--run is a checkpoint with no run_config.json (e.g. an AVC ring controller): use "
+             "EnvConfig defaults plus the overrides below instead of refusing",
+    )
     parser.add_argument("--roads", nargs="+", default=None)
-    parser.add_argument("--max-steps", type=int, default=None)
+    parser.add_argument("--max-steps", type=int, default=None,
+                        help="episode step cap; by default the config's, rescaled to keep its duration when --macro-dt is set")
+    parser.add_argument("--macro-dt", type=float, default=None,
+                        help="outer control step in seconds (AVC controllers: 0.1)")
+    parser.add_argument("--obs-max-speed", type=float, default=None,
+                        help="observation speed normaliser (published AVC: 10; corridor-matched arms: 25.02)")
+    parser.add_argument("--obs-max-dist", type=float, default=None,
+                        help="observation gap normaliser (AVC: 300)")
+    parser.add_argument("--hero-min-gap", type=float, default=None,
+                        help="hero minGap while controlled (AVC's ring sets 0)")
+    parser.add_argument("--max-acceleration", type=float, default=None)
+    parser.add_argument("--max-deceleration", type=float, default=None)
     parser.add_argument("--out", default=None, help="output directory (default: <run>/demo, else run_data/rl/demo)")
     parser.add_argument(
         "--stochastic", action="store_true",
@@ -347,8 +446,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gui", action="store_true", help="run SUMO with its GUI")
     parser.add_argument("--dash", action="store_true", help="serve the last rollout in the Dash viewer")
     parser.add_argument("--dash-port", type=int, default=8050)
-    parser.add_argument("--store", action="store_true", help="write rollouts into the RolloutStore database")
-    parser.add_argument("--database", default=DEFAULT_DATABASE)
+    parser.add_argument(
+        "--no-vehicle-traces", action="store_true",
+        help="skip traces/vehicles/<controller>_<episode>.parquet, the per-step state of every bubble vehicle",
+    )
+    parser.add_argument("--store", action="store_true",
+                        help="write rollouts into a RolloutStore database, by default <out>/rollouts/rollouts.db")
+    # parser.add_argument("--database", default=DEFAULT_DATABASE)
+    parser.add_argument(
+        "--database", default=None,
+        help="RolloutStore file for --store (default: <out>/rollouts/rollouts.db, beside figures/, tables/ "
+             f"and traces/; pass {os.path.relpath(DEFAULT_DATABASE, HERE)} for the shared project store)",
+    )
     parser.add_argument("--verbose", action="store_true")
     return parser
 
@@ -360,13 +469,28 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if (output_dir is None):
         output_dir = os.path.join(args.run, "demo") if (args.run and os.path.isdir(args.run)) else os.path.join(HERE, "run_data", "rl", "demo")
     os.makedirs(os.path.join(output_dir, "traces"), exist_ok=True)
+    if (args.store) and (args.database is None):
+        # Rollouts live with the rest of this demo's results rather than in the shared project store.
+        args.database = os.path.join(output_dir, "rollouts", "rollouts.db")
+    if (args.store):
+        os.makedirs(os.path.dirname(os.path.abspath(args.database)), exist_ok=True)
+        print(f"storing rollouts in {args.database}")
 
     env, _ = build_env(args)
     controllers = [(name, build_controller(name, args)) for name in args.controllers]
-    specs = sample_specs(env, args.episodes)
+    # Episode numbers start at the pool index of the first spec, so a --episode-range shard labels
+    # its episodes the same way a full run would.
+    first_episode = 0
+    if (args.episode_range is not None) and (not args.all_pool_specs):
+        raise ValueError("--episode-range selects pool indices; pass --all-pool-specs with it")
+    if (args.all_pool_specs):
+        specs = pool_specs(env, args.episodes if (args.episodes > 0) else None, args.episode_range)
+        first_episode = 0 if (args.episode_range is None) else int(args.episode_range[0])
+    else:
+        specs = sample_specs(env, args.episodes)
     print(f"{len(specs)} episode(s) x {len(controllers)} controller(s); writing to {output_dir}")
     for i, spec in enumerate(specs):
-        print(f"  episode {i}: {spec.dataset} road {spec.road} at t={spec.start_time:.0f} seed={spec.sumo_seed}")
+        print(f"  episode {first_episode + i}: {spec.dataset} road {spec.road} at t={spec.start_time:.0f} seed={spec.sumo_seed}")
 
     rows: List[Dict[str, Any]] = []
     last_sim = None
@@ -374,9 +498,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     last_spec = None
     try:
         for name, controller in controllers:
-            for index, spec in enumerate(specs):
+            for index, spec in enumerate(specs, start=first_episode):
                 try:
-                    summary, records = run_episode(env, controller, spec)
+                    summary, records, vehicle_records = run_episode(env, controller, spec)
                 except Exception as exc:
                     # One unusable minute of data should not cost the whole sweep.
                     print(f"WARNING: {name} episode {index} failed: {exc}")
@@ -386,6 +510,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 row["episode"] = index
                 rows.append(row)
                 write_trace(os.path.join(output_dir, "traces", f"{name}_{index}.csv"), records)
+                write_vehicle_trace(
+                    os.path.join(output_dir, "traces", "vehicles", f"{name}_{index}.parquet"), vehicle_records
+                )
                 print(
                     f"{name:<18} ep {index}  steps {summary['steps']:>3}  "
                     f"return {summary['return']:>8.2f}  hero {summary['hero_mean_speed']:>5.2f} m/s  "

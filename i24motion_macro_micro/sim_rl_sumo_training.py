@@ -40,6 +40,23 @@ genuinely depends on the belief state.  RecurrentPPO's LSTM carries a summary of
 the history into both, which is the principled answer; ``--algorithm ppo``
 keeps the memoryless version available as the ablation.
 
+TRPO, as in the AVC ring controllers
+------------------------------------
+``--algorithm trpo`` trains with sb3-contrib's TRPO configured like the ring-road
+controllers of Yan et al. (T-ASE 2022), whose code is vendored in
+``automatic_vehicular_control/``: a 64-64 tanh network with their initialization
+(``avc_initialize``), their trust-region settings (max KL 0.01, 10
+conjugate-gradient steps, damping 0.1, step halving over 10 backtracks), no
+critic by default, and their reward normalization (``AVCRewardNormalization``).
+Their schedule is carried over in seconds of driving rather than in steps, since
+the outer step here need not be their 0.1 s; see ``ALGORITHM_CLI_DEFAULTS``.
+``--macro-dt 0.1`` runs the whole simulation at 10 Hz, one SUMO step per
+macroscopic step, which is their control rate exactly -- and the schedule then
+lands on their own numbers, 400,000 transitions per update and 20M in total, with
+gamma 0.999.  The empirical macroscopic data is 1 Hz regardless, so below a 1 s
+step the boundary conditions hold the nearest snapshot.  TRPO is feedforward
+only, so like ``--algorithm ppo`` it optimises over memoryless policies.
+
 Running
 -------
 SUMO, gymnasium and stable-baselines3 all live inside the container, so training
@@ -96,6 +113,37 @@ DEFAULT_FD_PARAMS = {
     "rho_j": 0.07719493079089293,
 }
 
+# The AVC ring's observation constants, from automatic_vehicular_control/ring.py: speeds
+# are divided by max_speed=10, the leader's front-to-front offset by
+# circumference_max=300, and each feature is clipped to [0, 1] then mapped to [low, 1]
+# with low=-1.  Deliberately NOT this corridor's own v_f and visible_window: the
+# ring-trained and corridor-trained agents have to see one identical transformation, so
+# the corridor adopts the ring's numbers rather than its own, and any difference between
+# the two agents is attributable to the environment each trained in.
+#
+# Measured consequence: corridor speeds exceed 10 m/s about 38% of the time and saturate
+# at 1.0, so an agent trained here cannot distinguish 12 m/s from 23 m/s.  That handicaps
+# this arm in free flow -- which makes a win for it a lower bound rather than a flattering
+# one -- and it is a property of the shared representation, worth reporting rather than
+# discovering later.
+# The two ring arms normalise speed differently, and that is the ONLY interface
+# difference between them -- verified against both runs' config.yaml:
+#
+#   original_run       (published AVC)  max_speed = 10.0                 <- ring.py default
+#   corridor_matched_* (rescaled)       max_speed = 25.02031797294094    <- the corridor's v_f
+#
+# circumference_max is 300 in both (default for the published run, set explicitly for the
+# rescaled one), so max_dist agrees; and both leave max_accel = max_decel = 0.5, so the
+# action space is identical and needs nothing here.
+#
+# A checkpoint MUST be evaluated through the normalisers it trained with, or it sees a
+# different transformation than it learned.  Defaults below are the CORRIDOR-SCALE values;
+# pass --obs-max-speed 10 to evaluate a published-AVC checkpoint.
+AVC_PUBLISHED_MAX_SPEED = 10.0               # ring.py's default; original_run
+AVC_CORRIDOR_MAX_SPEED = 25.02031797294094   # = DEFAULT_FD_PARAMS['v_f']; corridor_matched_*
+AVC_MAX_DIST = 300.0                         # = circumference_max, same in both arms
+AVC_OBS_LOW = -1.0                           # = ring.py's `low`, same in both arms
+
 # Dataset json read once per path; every episode re-parses the text so nothing
 # downstream can mutate a shared config dict.
 _CONFIG_TEXT_CACHE: Dict[str, str] = {}
@@ -113,7 +161,7 @@ class EnvConfig:
     config_folder: str = DEFAULT_CONFIG_FOLDER
     # Dataset json files (dates) episodes are drawn from.  Each one is a
     # different day of I-24 MOTION data, so this is the train/test split axis.
-    datasets: Tuple[str, ...] = ("2022-11-30.json",)
+    datasets: Tuple[str, ...] = ("2022-11-21.json", "2022-11-22.json", "2022-11-23.json", "2022-11-24.json", "2022-11-25.json", "2022-11-28.json", "2022-12-01.json", "2022-12-02.json")
     roads: Tuple[str, ...] = ("2",)
     lanes: Tuple[int, ...] = (-1, -2, -3, -4)
 
@@ -137,19 +185,35 @@ class EnvConfig:
 
     # Micro engine.
     step_length: float = 0.1
+    # The macroscopic (outer) step, i.e. how often the controller acts.  None
+    # takes the dataset's own ``time_step`` (1 s).  Set 0.1 to run the whole
+    # simulation at 10 Hz -- one SUMO step per macroscopic step -- which is the
+    # control rate the AVC ring controllers were trained at.  The empirical
+    # macroscopic data stays 1 Hz either way, so with a sub-second step the
+    # boundary conditions hold the nearest 1 Hz snapshot until the next one
+    # starts, while SUMO and the injected trajectories advance every step.
+    macro_dt: Optional[float] = None
     fd_params: Dict[str, float] = field(default_factory=lambda: dict(DEFAULT_FD_PARAMS))
     gui: bool = False
     verbose: bool = False
     # SUMO's lane-change model would otherwise move the hero sideways, which a
     # longitudinal controller has no say over and cannot be credited for.
     lock_hero_lane: bool = True
-    # SUMO vType every vehicle is inserted as.  "car" is deterministic IDM (the
-    # control condition); "car_eidm" is Extended IDM with driver imperfection, so
-    # the platoon is string unstable and stop-and-go waves form on their own.
-    # Under "car" a wave-damping controller has nothing to damp -- measured:
-    # FollowerStopper scores identically to plain IDM, and the reward's ceiling
-    # over the do-nothing counterfactual is +0.0006/step.
-    vehicle_type: str = "car_eidm"
+    # SUMO vType every vehicle is inserted as.  "car" is IDM with AVC's accel/decel
+    # plus their Gaussian acceleration noise, injected over TraCI by the engine
+    # (I24MotionSumoSimulationCoupled.apply_idm_noise, sigma 0.2) because stock
+    # SUMO's `sigma` is a no-op under IDM.  That is the point of this setting: the
+    # ring controllers are trained against exactly this model, so a transfer
+    # failure cannot be blamed on the corridor's humans following a different one.
+    # "car_eidm" is Extended IDM, whose sigmaerror/sigmaleader/sigmagap get the
+    # same instability from a correlated (Wiener, 3 s) noise process instead of a
+    # white one -- what the corridor used before this change.
+    # Either way the platoon must be string unstable or a wave-damping controller
+    # has nothing to damp: under deterministic IDM (idm_sigma = 0) FollowerStopper
+    # measured identically to plain IDM, with the reward's ceiling over the
+    # do-nothing counterfactual at +0.0006/step.
+    vehicle_type: str = "car"
+    # vehicle_type: str = "car_eidm"
     # SUMO speed mode for the hero, or None to leave its default (31, every
     # check on).  The default is the right setting for a wave-damping
     # controller: the commanded speed is clipped to the safe speed, so the hero
@@ -166,14 +230,43 @@ class EnvConfig:
 
     # Episode limits.  The bubble normally retires on its own at max_middle_s
     # after ~40 steps; max_steps only catches a hero that crawls.
-    max_steps: int = 120
+    max_steps: int = 60
     max_reset_attempts: int = 8
+
+    # A pre-built pool of episode specs with their counterfactuals already
+    # computed (see sim_rl_spec_pool.py).  ``_baseline_pass`` is 77% of reset,
+    # and because SubprocVecEnv is synchronous the whole fleet blocks on it, so
+    # loading the counterfactual instead of simulating it is the difference
+    # between ~9 and ~33 macro steps per second at 24 environments.  None keeps
+    # the original behaviour: sample a fresh spec and replay it every episode.
+    spec_pool: Optional[str] = None
+    # Fraction of the pool held back from training, as an evaluation set the
+    # policy never sees.  Split on a hash of spec identity, so it is stable.
+    spec_pool_holdout: float = 0.0
+    # Draw from the held-out slice instead of the training slice.  For eval runs.
+    spec_pool_use_holdout: bool = False
 
     # Action: one desired acceleration per macro step, held across the ten
     # 0.1 s substeps.  SUMO clips it to its own safe speed and bounds, so the
     # realised acceleration is what the reward is computed from.
-    max_acceleration: float = 1.5
-    max_deceleration: float = 2.0
+    # AVC's max_accel / max_decel, so the two agents share an action space as well as an
+    # observation: their mapping is (a * 2 - 1) * max_accel for a >= 0.5 and * max_decel
+    # below it, which with both at 0.5 is a symmetric +/-0.5 m/s^2.  Was 1.5 / -2.0.
+    max_acceleration: float = 0.5
+    max_deceleration: float = 0.5
+
+    # Observation normalisers, which must match the ring arm a checkpoint came from (see
+    # the AVC_* constants above).  Defaults are the corridor-scale arm; the published-AVC
+    # arm needs obs_max_speed = 10.0.  obs_max_dist is circumference_max, 300 in both.
+    obs_max_speed: float = AVC_CORRIDOR_MAX_SPEED
+    obs_max_dist: float = AVC_MAX_DIST
+
+    # minGap override for the hero, opt-in.  None (default) leaves it at the FD-derived
+    # value the rest of the traffic uses, so its jam spacing stays consistent.  0.0 grants
+    # the authority ring.py:86 gives the RL vehicle, which is what a ring-trained policy
+    # trained with -- worth enabling for a strict transfer comparison, at the cost of
+    # letting the hero tailgate (and therefore collide) as it can on the ring.
+    hero_min_gap: Optional[float] = None
 
     # Observation: how many macroscopic cells downstream of the bubble the hero
     # is allowed to see.  This is the part no on-board sensor could supply.
@@ -203,9 +296,18 @@ class EnvConfig:
             v_f=self.fd_params["v_f"], w=self.fd_params["w"], rho_j=self.fd_params["rho_j"]
         )
 
+    def macro_step(self, config: Dict[str, Any]) -> float:
+        """The outer step in seconds: ``macro_dt`` when set, else the dataset's."""
+        return float(self.macro_dt) if (self.macro_dt is not None) else float(config["time_step"])
+
     @property
     def observation_size(self) -> int:
-        return 15 + (2 * self.macro_lookahead_cells)
+        # AVC's three features: ego speed, leader speed, leader offset.
+        return 3
+        # The macro-lookahead observation, kept for the third arm -- what the coupled
+        # simulator's extra state buys over the ring's three features.  Re-enable this
+        # together with the commented block at the end of I24SumoHeroEnv._observation.
+        # return 13 + (2 * self.macro_lookahead_cells) + (2 * self.macro_lookbehind_cells)
 
 
 @dataclass
@@ -220,15 +322,32 @@ class RewardConfig:
     ignored it did to, say, energy.
     """
 
-    platoon_speed: float = 0.0     # mean speed of the hero and its followers
-    progress: float = 0.02         # one-sided floor: penalise *stalling* only
+    # AVC's Global objective, which is the active reward: "the average speed of all
+    # vehicles in s'" (ring.py: `np.mean([v.speed for v in ts.vehicles])`), scored every
+    # step, in raw m/s.  The scope is what makes it AVC's rather than ours -- see
+    # platoon_scope below -- and the units are what make the two arms comparable.
+    #
+    # CAUTION: this term and speed_variance are now in m/s (0-25), while every other term
+    # below is still normalised to roughly [-1, 1].  The weights are therefore NOT on a
+    # common scale any more: re-enabling acceleration, jerk, headway, energy or stopped at
+    # a weight near 1 would make them negligible beside a speed term 25x larger.  Divide
+    # those weights by v_f, or re-normalise this term, if the reward is ever mixed again.
+    platoon_speed: float = 1.0     # mean speed of the hero and every vehicle in the bubble
+    # 0 under AVC's objective: they have no such term, and none is needed here because the
+    # hero is inside the mean it is being scored on, so stalling lowers its own reward
+    # directly.  Was 0.02 as a guardrail when the reward was the macroscopic terms, which
+    # the hero could satisfy by stopping dead.
+    progress: float = 0.0          # one-sided floor: penalise *stalling* only
     speed_variance: float = 0.0    # penalise stop-and-go within the platoon
     acceleration: float = 0.0     # penalise realised |a|, a comfort/energy proxy
     jerk: float = 0.00             # penalise changes in realised a
     headway: float = 0.0          # penalise time headways below target_headway
     energy: float = 0.0            # penalise tractive energy (always reported)
     stopped: float = 0.0          # penalise standing still
-    collision: float = 10.0        # one-off penalty, terminates the episode
+    # AVC's collision_penalty exactly, in the same raw m/s units as the speed term above,
+    # and applied the same way: it *replaces* the step's reward rather than being
+    # subtracted from it.  Was 10.0, against a speed term that was then divided by v_f.
+    collision: float = 100.0       # one-off penalty, terminates the episode
 
     target_headway: float = 1.5    # seconds
     stopped_speed: float = 0.5     # m/s
@@ -254,7 +373,14 @@ class RewardConfig:
     energy_scale: float = 2000.0   # J/m
     # "lane_behind" (the hero's own followers -- the only vehicles a longitudinal
     # controller actually influences), "all_behind", or "bubble".
-    platoon_scope: str = "lane_behind"
+    # "bubble" is AVC's scope: they average over *every* vehicle in the simulation, which
+    # on a closed ring is the whole system and here is every vehicle in the microscopic
+    # window, across all lanes, ahead as well as behind.  _platoon() bypasses the
+    # behind-and-within-window test for this scope, and the hero is added separately in
+    # _reward (it is tracked apart from the coupler's visible_state, so it is not counted
+    # twice).  "lane_behind" -- the hero's own followers, the vehicles a longitudinal
+    # controller actually influences -- was the default when the reward was ours.
+    platoon_scope: str = "bubble"
 
     # What the upstream terms are scored against.  "baseline" replays the same
     # episode with the hero on SUMO's own car-following model and differences
@@ -270,8 +396,26 @@ class RewardConfig:
 
     # Macroscopic Objectives
     rear_flux_smoothness: float = 0.00
-    upstream_oscillation: float = 0.02
-    upstream_delay: float = 0.98
+    upstream_oscillation: float = 0.00
+    upstream_delay: float = 0.00   # 0 under AVC's objective; was 0.98. Zeroing all three
+    # macroscopic terms is also what lets RewardConfig.uses_counterfactual() skip the
+    # do-nothing replay, which is ~2.4 s of every reset.
+
+    def uses_counterfactual(self) -> bool:
+        """Whether any term actually reads the do-nothing replay.
+
+        Only the three macroscopic terms above are differenced against it, so a
+        reward that puts no weight on them would pay an entire extra environment
+        pass -- about 77% of reset -- for a reference nothing reads.  That is
+        exactly the case for the AVC objective, which is a weight on
+        ``platoon_speed`` alone.
+        """
+        if (self.upstream_reference != "baseline"):
+            return False
+        return any(
+            abs(weight) > 0.0 for weight in
+            (self.rear_flux_smoothness, self.upstream_oscillation, self.upstream_delay)
+        )
 
 
 @dataclass
@@ -523,6 +667,7 @@ class I24SumoHeroEnv(gym.Env):
         label_prefix: str = "rl",
         record_rollout: bool = False,
         ground_truth_cache: Optional[GroundTruthCache] = None,
+        record_vehicles: bool = False,
     ) -> None:
         super().__init__()
         self.env_config = env_config or EnvConfig()
@@ -531,16 +676,21 @@ class I24SumoHeroEnv(gym.Env):
         self.rng = np.random.default_rng(seed)
         self.label_prefix = label_prefix
         self.record_rollout = bool(record_rollout)
+        # Per-vehicle state of the whole micro bubble at every step (see vehicle_records).
+        # Off for training: it is ~35 dicts per step that nothing in the reward reads.
+        self.record_vehicles = bool(record_vehicles)
+        self._vehicle_records: List[Dict[str, Any]] = []
         self.gt_cache = ground_truth_cache or GroundTruthCache()
 
         self.fd = self.env_config.fundamental_diagram()
         self.observation_size = self.env_config.observation_size
-        # Every feature is scaled by v_f, rho_j or a window length, so the box is
-        # a containment guarantee rather than a real range; observations are
-        # clipped into it so a transient (an empty lookahead, a density above
-        # rho_j) can never violate the space.
+        # With AVC's mapping every feature is clipped to [0, 1] and then mapped to
+        # [AVC_OBS_LOW, 1], so this is the true range rather than a containment
+        # guarantee.  (The macro-lookahead arm used low=-10 / high=10, because features
+        # scaled by v_f or rho_j can overshoot on a transient such as an empty lookahead
+        # cell or a density above rho_j; restore that if you re-enable it.)
         self.observation_space = spaces.Box(
-            low=-10.0, high=10.0, shape=(self.observation_size,), dtype=np.float32
+            low=AVC_OBS_LOW, high=1.0, shape=(self.observation_size,), dtype=np.float32
         )
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
 
@@ -554,6 +704,9 @@ class I24SumoHeroEnv(gym.Env):
         self._episode_counter = 0
         self._band: Optional[Tuple[str, str, float, float]] = None
         self._band_uses = 0
+        # Loaded eagerly so a stale or missing pool fails at construction rather
+        # than mid-training, and inside every worker rather than only the parent.
+        self._spec_pool = self._load_spec_pool()
         self._step_index = 0
         self._previous_action = 0.0
         self._previous_acceleration = 0.0
@@ -584,7 +737,7 @@ class I24SumoHeroEnv(gym.Env):
         length = float(config["time_length"])
         first = origin + self.env_config.warmup_s
         # Leave room for the longest episode the step cap allows.
-        budget = (self.env_config.max_steps * float(config["time_step"])) + 60.0
+        budget = (self.env_config.max_steps * self.env_config.macro_step(config)) + 60.0
         last = origin + length - budget
         if (last <= first):
             raise ValueError(f"{dataset} is too short for warmup_s={self.env_config.warmup_s}")
@@ -600,13 +753,47 @@ class I24SumoHeroEnv(gym.Env):
         ``initialize_from_ground_truth`` looks the initial condition up in the
         macro store with a 1e-6 tolerance, so a start time drawn uniformly out of
         a band lands between snapshots and the episode fails to build.
+
+        This is the data's own 1 Hz grid, not the simulation step: with
+        ``macro_dt`` below 1 s the later steps fall between snapshots and hold the
+        nearest one, but the initial condition still has to be an exact snapshot.
         """
         _, config = self.env_config.dataset_paths(dataset)
         origin = float(config["time_origin"])
         step = float(config["time_step"])
         return origin + (round((float(time_value) - origin) / step) * step)
 
+    def _load_spec_pool(self):
+        """The configured spec pool, or None.
+
+        A mismatched pool is a hard failure rather than a fallback: its
+        counterfactuals would describe a road with different bubble geometry
+        than the one being scored, and every differenced reward term would be
+        silently wrong rather than visibly broken.
+        """
+        path = self.env_config.spec_pool
+        if (not path):
+            return None
+        from sim_rl_spec_pool import SpecPool
+
+        # The fingerprint gate protects differenced reward terms only.  With none
+        # weighted (AVC's raw mean-speed reward) the counterfactuals are never read, so a
+        # stale pool is still a valid spec list -- which matters because --macro-dt 0.1
+        # changes the fingerprint and rebuilding replays one episode per spec.
+        pool = SpecPool.load(
+            path, self.env_config, EpisodeSpec,
+            require_counterfactuals=self.reward_config.uses_counterfactual(),
+        )
+        if (self.env_config.spec_pool_holdout > 0.0):
+            train, held = pool.split(self.env_config.spec_pool_holdout)
+            pool = held if self.env_config.spec_pool_use_holdout else train
+        if (len(pool) == 0):
+            raise ValueError(f"spec pool {path} has no specs on the requested side")
+        return pool
+
     def _sample_spec(self) -> EpisodeSpec:
+        if (self._spec_pool is not None):
+            return self._spec_pool.sample(self.rng, self.env_config.episodes_per_band)
         dataset = str(self.rng.choice(np.asarray(self.env_config.datasets)))
         road = str(self.rng.choice(np.asarray(self.env_config.roads)))
         reuse = (
@@ -645,12 +832,12 @@ class I24SumoHeroEnv(gym.Env):
         # the controller.
         random.seed(spec.sumo_seed)
         dataset_dir, config = env_config.dataset_paths(spec.dataset)
-        self._macro_dt = float(config["time_step"])
+        self._macro_dt = env_config.macro_step(config)
         gt = self.gt_cache.get(dataset_dir, spec.road, spec.band_start, spec.band_end)
 
         sim = Simulation.from_json(
             json_path=os.path.join(dataset_dir, "network.json"),
-            time_resolution=config["time_step"],
+            time_resolution=self._macro_dt,
             origin_time=spec.start_time,
             min_cell_length=env_config.cell_length,
         )
@@ -665,7 +852,7 @@ class I24SumoHeroEnv(gym.Env):
         )
         coupler = I24SumoCoupler(
             gt,
-            dt=config["time_step"],
+            dt=self._macro_dt,
             fd=self.fd,
             lanes=list(env_config.lanes),
             mapping=config,
@@ -679,6 +866,7 @@ class I24SumoHeroEnv(gym.Env):
             seed=spec.sumo_seed,
             gui=env_config.gui,
             hero_policy=self.policy_shim,
+            hero_min_gap=env_config.hero_min_gap,
             label=f"{self.label_prefix}_{os.getpid()}_{self._episode_counter}",
             verbose=env_config.verbose,
         )
@@ -717,9 +905,14 @@ class I24SumoHeroEnv(gym.Env):
             try:
                 # The counterfactual has to be recorded before the pass that is
                 # scored against it, and it builds and tears down its own episode.
+                # A pooled spec has it precomputed; anything pinned from outside
+                # the pool (the demo, the analysis harnesses) still replays live.
+                # Skipped when no differenced term carries weight: _upstream_profiles
+                # then scores neutral and rear_flux_smoothness 0.0, which is what a
+                # zero weight would have produced anyway.
                 self._baseline_density_maps, self._baseline_rear_fluxes = (
-                    self._baseline_pass(spec)
-                    if (self.reward_config.upstream_reference == "baseline") else ([], [])
+                    self._counterfactual_for(spec)
+                    if (self.reward_config.uses_counterfactual()) else ([], [])
                 )
                 self._build_episode(spec)
                 self._step_index = 0
@@ -728,6 +921,7 @@ class I24SumoHeroEnv(gym.Env):
                 self._previous_rear_flux = None
                 self._previous_rear_flux_2 = None
                 self._episode_records = []
+                self._vehicle_records = []
                 self._terminal_reason = ""
                 self.policy_shim.set_acceleration(None)
                 self.sim.step()
@@ -735,6 +929,9 @@ class I24SumoHeroEnv(gym.Env):
                     raise RuntimeError("bubble retired on the warm-up step")
                 if (self._retires_next_step()):
                     raise RuntimeError("bubble starts past max_middle_s")
+                # Step 0 is the state after the warm-up step, before the controller acts,
+                # so every episode's vehicle log starts from the same uncontrolled snapshot.
+                self._record_vehicles()
                 # Seed the previous acceleration from the warm-up step rather
                 # than asserting zero.  It is both an observation feature and the
                 # reference the first step's jerk penalty is measured against, so
@@ -871,6 +1068,22 @@ class I24SumoHeroEnv(gym.Env):
             total += abs(second_difference / self.fd.capacity)
         return min(1.0, (total / float(len(current))))
 
+    def _counterfactual_for(
+        self, spec: EpisodeSpec
+    ) -> Tuple[List[Dict[Tuple[str, str], float]], List[Dict[int, float]]]:
+        """The stored counterfactual for ``spec`` if the pool has one, else a live pass.
+
+        Equivalent either way -- ``_build_episode`` reseeds the spawn RNG from
+        ``spec.sumo_seed``, so a stored counterfactual is bit-identical to one
+        computed now.  The fallback keeps pinned specs from outside the pool
+        working, which the demo and the ceiling searches rely on.
+        """
+        if (self._spec_pool is not None):
+            stored = self._spec_pool.counterfactual(spec)
+            if (stored is not None):
+                return stored
+        return self._baseline_pass(spec)
+
     def _baseline_pass(
         self, spec: EpisodeSpec
     ) -> Tuple[List[Dict[Tuple[str, str], float]], List[Dict[int, float]]]:
@@ -976,6 +1189,73 @@ class I24SumoHeroEnv(gym.Env):
         while (len(profile) < count):
             profile.append(profile[-1])
         return profile[:count]
+
+    def _macro_lookbehind(self, lane: int) -> List[Tuple[float, float]]:
+        """Density and velocity of the cells upstream of the mask, in order.
+
+        This is the hero's over-the-horizon view: the CTM cells past the rear of
+        the bubble, which no microscopic sensor could reach.  Short chains are
+        padded with their last entry so the observation keeps a fixed width.
+        """
+        count = self.env_config.macro_lookbehind_cells
+        profile: List[Tuple[float, float]] = []
+        try:
+            cell = self.sim.active.get_cell_with_mask(self.bridge._mask_id(lane))
+            while ((cell is not None) and (len(profile) < count)):
+                neighbours = cell.inflow_neighbors
+                if (len(neighbours) == 0):
+                    break
+                cell = self.sim.active.active_cells[neighbours[0]]
+                if (cell.kind == "mask"):
+                    break
+                density = float(cell.density)
+                velocity = (
+                    float(cell.velocity)
+                    if (cell.velocity is not None)
+                    else float(cell.fd.velocity_from_density(density))
+                )
+                profile.append((density, velocity))
+        except Exception:
+            pass
+        if (len(profile) == 0):
+            profile.append((self.fd.rho_c, self.fd.v_f))
+        while (len(profile) < count):
+            profile.append(profile[-1])
+        return (profile[:count])[::-1]
+
+    def _adjacent_cell_flow(self, lane: int, side: str) -> float:
+        """Flow rho * v (veh/s) in the macro cell directly behind ("upstream") or ahead of
+        ("downstream") the bubble in ``lane``, or NaN when there is no such normal cell.
+
+        Unlike ``_macro_lookahead``/``_macro_lookbehind`` this never pads a missing cell with
+        (rho_c, v_f): that stand-in is capacity flow and would read as real throughput.  rho * v
+        is the flow in the road frame, so it is not biased by the bubble moving, which a flux
+        across the bubble's own moving edge would be.
+        """
+        try:
+            cell = self.sim.active.get_cell_with_mask(self.bridge._mask_id(lane))
+            neighbours = cell.inflow_neighbors if (side == "upstream") else cell.outflow_neighbors
+            if (len(neighbours) == 0):
+                return float("nan")
+            cell = self.sim.active.active_cells[neighbours[0]]
+            if (cell.kind == "mask"):
+                return float("nan")
+            density = float(cell.density)
+            velocity = (
+                float(cell.velocity)
+                if (cell.velocity is not None)
+                else float(cell.fd.velocity_from_density(density))
+            )
+            return density * velocity
+        except Exception:
+            return float("nan")
+
+    def _lane_averaged_flow(self, side: str) -> float:
+        """``_adjacent_cell_flow`` averaged over the lanes that have that cell, in veh/h per lane."""
+        flows = np.asarray([self._adjacent_cell_flow(lane, side) for lane in self.env_config.lanes], dtype=float)
+        if (not np.isfinite(flows).any()):
+            return float("nan")
+        return float(np.nanmean(flows) * 3600.0)
 
     def _upstream_profiles(
         self, lane: int
@@ -1103,50 +1383,105 @@ class I24SumoHeroEnv(gym.Env):
         return members
 
     def _observation(self) -> np.ndarray:
+        """AVC's ring observation, computed from this corridor's state.
+
+        Three features -- the hero's speed, its leader's speed, and the front-to-front
+        offset to that leader -- divided by the ring's own constants, clipped to [0, 1]
+        and mapped to [AVC_OBS_LOW, 1], exactly as ``RingEnv.step`` does.  One identical
+        transformation in both environments is what makes a difference between the
+        ring-trained and corridor-trained agents attributable to where each trained
+        rather than to what each could see.
+
+        Two conventions, because this codebase contains three of them.  ``offset`` is
+        **front-to-front**: the coupler's ``s`` is a rear bumper, so the leader's length
+        is added back, which reproduces AVC's difference of two SUMO ``laneposition``
+        values.  It is therefore neither ``_gap_to``'s rear-to-front gap nor
+        ``getLeader``'s gap, which subtracts the hero's minGap (~7.7 m here) as well.
+
+        With no leader inside the bubble the offset saturates at 1.0 ("nothing in
+        sight") and the leader's speed is reported as the hero's own ("nothing slowing
+        me"), so both features stay continuous as a leader leaves the window.
+        """
         hero = self._hero()
-        v_f = self.fd.v_f
-        rho_j = self.fd.rho_j
         speed = float(hero["velocity"])
-        leader, follower = self._leader_and_follower()
-        leader_gap = self._gap_to(hero, leader)
-        follower_gap = (
-            float("inf") if (follower is None) else float(hero["s"] - (follower["s"] + follower["length"]))
+        leader, _ = self._leader_and_follower()
+        max_speed = self.env_config.obs_max_speed
+        max_dist = self.env_config.obs_max_dist
+        if (leader is None):
+            offset = max_dist
+            leader_speed = speed
+        else:
+            offset = self._gap_to(hero, leader) + float(leader["length"])
+            leader_speed = float(leader["velocity"])
+        features = np.asarray(
+            [speed / max_speed, leader_speed / max_speed, offset / max_dist],
+            dtype=np.float32,
         )
-        gap_scale = self.env_config.visible_window
-        headway = (leader_gap / speed) if (speed > 0.1) else 10.0
+        observation = np.clip(features, 0.0, 1.0) * (1.0 - AVC_OBS_LOW) + AVC_OBS_LOW
+        return observation.astype(np.float32)
 
-        platoon = self._platoon()
-        platoon_speeds = np.asarray([speed] + [float(v["velocity"]) for v in platoon], dtype=float)
-        ahead = [v for v in self._neighbours_in_lane(hero["lane_id"]) if (v["s"] > hero["s"])]
+    # ------------------------------------------------------------------
+    # The macro-lookahead observation: the third arm, kept verbatim.
+    #
+    # This is what the coupled simulator can supply and the ring cannot -- macroscopic
+    # density and velocity in cells ahead of and behind the bubble, plus platoon
+    # statistics.  It is commented out rather than deleted because the comparison it
+    # enables ("what does the extra state buy?") is the affirmative counterpart to the
+    # ring-transfer result.  To re-enable: restore the body below as _observation, switch
+    # EnvConfig.observation_size back to its commented expression, and widen the
+    # observation_space box to low=-10 / high=10.
+    # ------------------------------------------------------------------
+    #
+    # def _observation(self) -> np.ndarray:
+    #     hero = self._hero()
+    #     v_f = self.fd.v_f
+    #     rho_j = self.fd.rho_j
+    #     speed = float(hero["velocity"])
+    #     leader, follower = self._leader_and_follower()
+    #     leader_gap = self._gap_to(hero, leader)
+    #     follower_gap = (
+    #         float("inf") if (follower is None) else float(hero["s"] - (follower["s"] + follower["length"]))
+    #     )
+    #     gap_scale = self.env_config.visible_window
+    #     headway = (leader_gap / speed) if (speed > 0.1) else 10.0
 
-        lookahead = self._macro_lookahead(hero["lane_id"])
-        behind_density, behind_velocity = self._macro_behind(hero["lane_id"])
-        progress = (float(hero["s"]) - self.env_config.initial_middle_s) / max(
-            1.0, (self.env_config.max_middle_s - self.env_config.initial_middle_s)
-        )
-
-        features = [
-            speed / v_f,
-            self._previous_acceleration / self.env_config.max_acceleration,
-            min(leader_gap, gap_scale) / gap_scale,
-            0.0 if (leader is None) else ((float(leader["velocity"]) - speed) / v_f),
-            min(headway, 10.0) / 10.0,
-            min(follower_gap, gap_scale) / gap_scale,
-            0.0 if (follower is None) else ((float(follower["velocity"]) - speed) / v_f),
-            float(np.mean(platoon_speeds)) / v_f,
-            float(np.std(platoon_speeds)) / v_f,
-            min(len(platoon), 20) / 20.0,
-            min(len(ahead), 20) / 20.0,
-            behind_density / rho_j,
-            behind_velocity / v_f,
-            self._previous_action,
-            progress,
-        ]
-        for density, velocity in lookahead:
-            features.append(density / rho_j)
-            features.append(velocity / v_f)
-        observation = np.asarray(features, dtype=np.float32)
-        return np.clip(observation, self.observation_space.low, self.observation_space.high)
+    #
+    #     platoon = self._platoon()
+    #     platoon_speeds = np.asarray([speed] + [float(v["velocity"]) for v in platoon], dtype=float)
+    #     ahead = [v for v in self._neighbours_in_lane(hero["lane_id"]) if (v["s"] > hero["s"])]
+    #
+    #     lookahead = self._macro_lookahead(hero["lane_id"])
+    #     lookbehind = self._macro_lookbehind(hero["lane_id"])
+    #     behind_density, behind_velocity = self._macro_behind(hero["lane_id"])
+    #     progress = (float(hero["s"]) - self.env_config.initial_middle_s) / max(
+    #         1.0, (self.env_config.max_middle_s - self.env_config.initial_middle_s)
+    #     )
+    #
+    #     features = [
+    #         speed / v_f,
+    #         self._previous_acceleration / self.env_config.max_acceleration,
+    #         min(leader_gap, gap_scale) / gap_scale,
+    #         0.0 if (leader is None) else ((float(leader["velocity"]) - speed) / v_f),
+    #         min(headway, 10.0) / 10.0,
+    #         min(follower_gap, gap_scale) / gap_scale,
+    #         0.0 if (follower is None) else ((float(follower["velocity"]) - speed) / v_f),
+    #         float(np.mean(platoon_speeds)) / v_f,
+    #         float(np.std(platoon_speeds)) / v_f,
+    #         min(len(platoon), 20) / 20.0,
+    #         min(len(ahead), 20) / 20.0,
+    #         # behind_density / rho_j,
+    #         # behind_velocity / v_f,
+    #         self._previous_action,
+    #         progress,
+    #     ]
+    #     for density, velocity in lookahead:
+    #         features.append(density / rho_j)
+    #         features.append(velocity / v_f)
+    #     for density, velocity in lookbehind:
+    #         features.append(density / rho_j)
+    #         features.append(velocity / v_f)
+    #     observation = np.asarray(features, dtype=np.float32)
+    #     return np.clip(observation, self.observation_space.low, self.observation_space.high)
 
     # ------------------------------------------------------------------
     # Reward
@@ -1179,9 +1514,14 @@ class I24SumoHeroEnv(gym.Env):
         return {
             "acceleration": float(np.mean(accelerations)),
             "acceleration_rms": float(np.sqrt(np.mean(np.square(accelerations)))),
+            # With one substep per macroscopic step (macro_dt == step_length, the
+            # 10 Hz setting) there is no within-step difference to take, so the
+            # jerk is measured against the previous step's acceleration rather
+            # than reported as zero.  Unchanged when a step has several substeps.
             "jerk_rms": (
                 float(np.sqrt(np.mean(np.square(np.diff(accelerations)))) / step_length)
-                if (len(accelerations) > 1) else 0.0
+                if (len(accelerations) > 1)
+                else (abs(accelerations[0] - self._previous_acceleration) / max(1e-9, self._macro_dt))
             ),
             "energy": float(energy),
             "distance": float(distance),
@@ -1297,8 +1637,13 @@ class I24SumoHeroEnv(gym.Env):
             "rear_flux_smoothness": rear_flux_smoothness,
             "upstream_oscillation": upstream_oscillation_reward,
             "upstream_delay": upstream_delay_reward,
-            "platoon_speed": float(np.mean(platoon_speeds)) / v_f,
-            "speed_variance": -float(np.std(platoon_speeds)) / v_f,
+            # In m/s, NOT divided by v_f: AVC's reward is a raw mean speed, and each
+            # environment has a different v_f (13.89 on the ring, 25.02 here), so dividing
+            # by it would make the two arms' rewards incomparable -- 0.5 would mean 6.9 m/s
+            # there and 12.5 m/s here.  Raw m/s keeps ep_rew_mean the same physical
+            # quantity in both.
+            "platoon_speed": float(np.mean(platoon_speeds)),
+            "speed_variance": -float(np.std(platoon_speeds)),
             "acceleration": -((metrics["acceleration_rms"] / self.env_config.max_acceleration) ** 2),
             "jerk": -((jerk / self.env_config.max_acceleration) ** 2),
             "headway": -(shortfall ** 2),
@@ -1402,7 +1747,11 @@ class I24SumoHeroEnv(gym.Env):
         reward, components = self._reward(metrics)
         if (collided):
             components["collision"] = -1.0
-            reward -= self.reward_config.collision
+            # AVC *replaces* the step's reward rather than adding to it
+            # (ring.py: `return c.observation_space.low, -c.collision_penalty, True, None`),
+            # so the penalty is exactly -collision instead of being offset by up to a full
+            # unit of speed reward. The step is terminal, so nothing else is lost.
+            reward = -self.reward_config.collision
 
         self._previous_acceleration = metrics["acceleration"]
         self._previous_rear_flux_2 = self._previous_rear_flux
@@ -1425,10 +1774,16 @@ class I24SumoHeroEnv(gym.Env):
             "distance": metrics["distance"],
             "min_headway": metrics["min_headway"],
             "platoon_size": len(self._platoon()),
-            "platoon_mean_speed": components["platoon_speed"] * self.fd.v_f,
-            "platoon_speed_std": -components["speed_variance"] * self.fd.v_f,
+            # Already m/s, so no v_f factor: these two components stopped being normalised
+            # when the reward became AVC's raw mean speed.
+            "platoon_mean_speed": components["platoon_speed"],
+            "platoon_speed_std": -components["speed_variance"],
             "macro_density_ahead": lookahead[0][0],
             "macro_velocity_ahead": lookahead[0][1],
+            # Throughput of the macro cells adjacent to the bubble, veh/h per lane averaged over
+            # the lanes (NaN where a lane has no such cell, e.g. at the corridor ends).
+            "upstream_flow": self._lane_averaged_flow("upstream"),
+            "downstream_flow": self._lane_averaged_flow("downstream"),
             "progress_reward": components["progress"],
             "rear_flux_smoothness": components["rear_flux_smoothness"],
             "upstream_oscillation": components["upstream_oscillation"],
@@ -1436,6 +1791,7 @@ class I24SumoHeroEnv(gym.Env):
             "reward": reward,
         }
         self._episode_records.append(record)
+        self._record_vehicles()
         self._last_observation = self._observation()
 
         # Both endings are truncations of an otherwise continuing process, so SB3
@@ -1522,6 +1878,43 @@ class I24SumoHeroEnv(gym.Env):
 
     def episode_records(self) -> List[Dict[str, float]]:
         return list(self._episode_records)
+
+    def _record_vehicles(self) -> None:
+        """Append one row per bubble vehicle (and the hero) at the current step.
+
+        ``step`` matches the per-step trace: 0 is the uncontrolled snapshot taken in
+        reset, k the state after the k-th controlled step.  ``s`` is the rear bumper,
+        as everywhere in the coupler, so the gap to a leader in the same lane is
+        ``leader.s - (s + length)``.  Acceleration is left to the analysis (speed
+        differences per vehicle id), because vehicles enter and leave the bubble
+        between steps.
+        """
+        if (not self.record_vehicles):
+            return
+        step = int(self._step_index)
+        time_value = float(self.coupler.current_timestamp)
+        hero = self._hero()
+        hero_id = str(hero.get("id", "hero"))
+        rows = [(hero, True)]
+        for lane in self.env_config.lanes:
+            for vehicle in self._neighbours_in_lane(lane):
+                if (str(vehicle.get("id")) != hero_id):
+                    rows.append((vehicle, False))
+        for vehicle, is_hero in rows:
+            self._vehicle_records.append({
+                "step": step,
+                "time": time_value,
+                "vehicle_id": str(vehicle.get("id", "hero" if (is_hero) else "")),
+                "is_hero": bool(is_hero),
+                "lane_id": int(vehicle["lane_id"]),
+                "s": float(vehicle["s"]),
+                "length": float(vehicle["length"]),
+                "speed": float(vehicle["velocity"]),
+            })
+
+    def vehicle_records(self) -> List[Dict[str, Any]]:
+        """Per-vehicle rows of the last episode; empty unless ``record_vehicles`` is set."""
+        return list(self._vehicle_records)
 
 
 # ---------------------------------------------------------------------------
@@ -1722,14 +2115,14 @@ class TrainConfig:
     remains selectable as the memoryless ablation.
     """
 
-    algorithm: str = "recurrent_ppo"  # "recurrent_ppo" or "ppo"
-    total_timesteps: int = 1_000_000
+    algorithm: str = "recurrent_ppo"  # "recurrent_ppo", "ppo" or "trpo"
+    total_timesteps: int = 5_000_000
     envs: int = 24
     # Steps per environment per update.  An episode is about 40 steps, so 128
     # keeps two or three episodes' worth of experience per environment in each
     # batch without letting the policy go stale.
     n_steps: int = 128
-    batch_size: int = 128*3
+    batch_size: int = 12*128
     n_epochs: int = 10
     learning_rate: float = 3.0e-4
     gamma: float = 0.99
@@ -1738,7 +2131,7 @@ class TrainConfig:
     ent_coef: float = 0.005
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
-    target_kl: Optional[float] = 0.05
+    target_kl: Optional[float] = 0.02
     net_arch: Tuple[int, ...] = (64, 64)
     log_std_init: float = -0.5
     # Generalised State-Dependent Exploration.  Default PPO perturbs the action
@@ -1763,6 +2156,22 @@ class TrainConfig:
     n_lstm_layers: int = 1
     shared_lstm: bool = False
     enable_critic_lstm: bool = True
+    # TRPO only (sb3-contrib), at the AVC ring controllers' values: their
+    # max_kl, steps_cg, damping and steps_backtrack, with the step halved on each
+    # backtrack.  With use_critic=False (their paper runs) the value head is
+    # zeroed and never trained, so the advantages are plain discounted returns;
+    # n_critic_updates is their n_gds and only applies with a critic.
+    max_kl: float = 0.01
+    cg_max_steps: int = 10
+    cg_damping: float = 0.1
+    line_search_shrinking_factor: float = 0.5
+    line_search_max_iter: int = 10
+    use_critic: bool = False
+    n_critic_updates: int = 1
+    normalize_advantage: bool = False
+    # AVC's reward normalization (AVCRewardNormalization).  None means on for
+    # TRPO and off otherwise.  Not to be combined with ``normalize``.
+    avc_reward_normalization: Optional[bool] = None
     seed: int = 0
     # Checkpoint every this many environment steps (summed over environments).
     checkpoint_freq: int = 10_000
@@ -1774,14 +2183,113 @@ class TrainConfig:
     normalize: bool = False
 
 
+def is_trpo(algorithm: str) -> bool:
+    return str(algorithm).lower() == "trpo"
+
+
+def uses_avc_reward_normalization(train_config: TrainConfig) -> bool:
+    if (train_config.avc_reward_normalization is None):
+        return is_trpo(train_config.algorithm)
+    return bool(train_config.avc_reward_normalization)
+
+
+class RunningMoments:
+    """Streaming mean and standard deviation, exactly as AVC's ``ut.RunningStats``.
+
+    Kept as it is there, including the quirk of reporting ``var = mean ** 2``
+    until two samples have been seen, so the first rewards are scaled as in AVC.
+    """
+
+    def __init__(self) -> None:
+        self.n = 0
+        self.mean = 0.0
+        self._nstd = 0.0
+
+    def update(self, x: float) -> None:
+        self.n += 1
+        if (self.n == 1):
+            self.mean = x
+        else:
+            old_mean = self.mean
+            self.mean = old_mean + (x - old_mean) / self.n
+            self._nstd = self._nstd + (x - old_mean) * (x - self.mean)
+
+    @property
+    def std(self) -> float:
+        variance = (self._nstd / (self.n - 1)) if (self.n > 1) else (self.mean ** 2)
+        return math.sqrt(variance)
+
+
+class AVCRewardNormalization(gym.Wrapper):
+    """AVC's ``NormEnv`` reward normalization, with center_reward and norm_reward on.
+
+    That is how their ring controllers were trained: subtract the running mean
+    reward, then divide by the running standard deviation of the discounted
+    return.  The statistics belong to one environment and, as in AVC, are never
+    reset -- the return accumulator runs straight across episode boundaries.
+    This is not VecNormalize, which does not centre and clips at 10.
+
+    The centring matters more here than on the ring: without a critic it is the
+    only baseline the policy gradient has, and the counterfactual-scored rewards
+    of this environment sit around 1e-3.  Wrapped outside Monitor, so the episode
+    logs keep the raw reward.
+    """
+
+    def __init__(self, env: gym.Env, gamma: float) -> None:
+        super().__init__(env)
+        self.gamma = float(gamma)
+        self.reward_stats = RunningMoments()
+        self.return_stats = RunningMoments()
+        self.running_return = 0.0
+
+    def step(self, action):
+        observation, reward, terminated, truncated, info = self.env.step(action)
+        self.reward_stats.update(float(reward))
+        reward = float(reward) - self.reward_stats.mean
+        self.running_return = self.running_return * self.gamma + reward
+        self.return_stats.update(self.running_return)
+        return observation, reward / (self.return_stats.std + 1e-8), terminated, truncated, info
+
+
+def avc_initialize(policy, use_critic: bool) -> None:
+    """Initialize an SB3 ActorCriticPolicy the way AVC initialized its network.
+
+    AVC's ``ut.FFN.sequential_init`` with its defaults: orthogonal weights with
+    gain 1 on hidden layers and 0.01 on each head's output layer, zero biases
+    (SB3's ``ortho_init`` uses sqrt(2) / 0.01 / 1).  Without a critic the value
+    head is zeroed and, never being trained, predicts exactly 0, so GAE with
+    ``gae_lambda=1`` reduces to the discounted return AVC's no-critic TRPO used.
+    """
+    import torch.nn as nn
+
+    heads = (
+        (policy.mlp_extractor.policy_net, policy.action_net),
+        (policy.mlp_extractor.value_net, policy.value_net),
+    )
+    for hidden, output in heads:
+        for module in hidden:
+            if (isinstance(module, nn.Linear)):
+                nn.init.orthogonal_(module.weight, gain=1.0)
+                nn.init.zeros_(module.bias)
+        nn.init.orthogonal_(output.weight, gain=0.01)
+        nn.init.zeros_(output.bias)
+    if (not use_critic):
+        nn.init.zeros_(policy.value_net.weight)
+        nn.init.zeros_(policy.value_net.bias)
+
+
 def make_env(
     rank: int,
     env_config: EnvConfig,
     reward_config: RewardConfig,
     seed: int,
     monitor_dir: Optional[str] = None,
+    avc_reward_gamma: Optional[float] = None,
 ):
-    """Factory for one monitored environment, for Dummy/SubprocVecEnv."""
+    """Factory for one monitored environment, for Dummy/SubprocVecEnv.
+
+    ``avc_reward_gamma`` adds ``AVCRewardNormalization`` with that discount.
+    """
 
     def _init():
         from stable_baselines3.common.monitor import Monitor
@@ -1793,7 +2301,10 @@ def make_env(
             label_prefix=f"rl{rank}",
         )
         filename = None if (monitor_dir is None) else os.path.join(monitor_dir, f"monitor_{rank}")
-        return Monitor(env, filename=filename, info_keywords=EPISODE_INFO_KEYS)
+        env = Monitor(env, filename=filename, info_keywords=EPISODE_INFO_KEYS)
+        if (avc_reward_gamma is not None):
+            env = AVCRewardNormalization(env, gamma=avc_reward_gamma)
+        return env
 
     return _init
 
@@ -1807,8 +2318,9 @@ def build_vec_env(
 ):
     from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 
+    avc_reward_gamma = train_config.gamma if (uses_avc_reward_normalization(train_config)) else None
     factories = [
-        make_env(rank, env_config, reward_config, train_config.seed, output_dir)
+        make_env(rank, env_config, reward_config, train_config.seed, output_dir, avc_reward_gamma)
         for rank in range(max(1, train_config.envs))
     ]
     if ((not subprocess) or (train_config.envs <= 1)):
@@ -1922,6 +2434,12 @@ def train(
     from stable_baselines3.common.logger import configure
     from stable_baselines3.common.vec_env import VecNormalize
 
+    if (train_config.normalize and uses_avc_reward_normalization(train_config)):
+        raise ValueError(
+            "normalize (VecNormalize) and AVC reward normalization both rescale the reward; "
+            "pick one (--no-avc-reward-normalization turns the TRPO default off)"
+        )
+
     checkpoint_dir = os.path.join(output_dir, "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
 
@@ -1966,6 +2484,10 @@ def train(
         "activation_fn": nn.Tanh,
         "log_std_init": train_config.log_std_init,
     }
+    if (is_trpo(train_config.algorithm)):
+        # avc_initialize replaces SB3's initialization, and AVC used torch's Adam
+        # defaults: SB3 substitutes eps=1e-5 whenever optimizer_kwargs is unset.
+        policy_kwargs.update({"ortho_init": False, "optimizer_kwargs": {"eps": 1e-8}})
     if (is_recurrent(train_config.algorithm)):
         if (train_config.shared_lstm and train_config.enable_critic_lstm):
             raise ValueError("shared_lstm and enable_critic_lstm are mutually exclusive")
@@ -1985,6 +2507,29 @@ def train(
             f"resumed {train_config.algorithm} from {resume_checkpoint} "
             f"at {model.num_timesteps} steps (env seed offset to {train_config.seed})"
         )
+    elif (is_trpo(train_config.algorithm)):
+        model = algorithm(
+            policy_name,
+            vec_env,
+            learning_rate=train_config.learning_rate,  # drives only the critic, as in AVC
+            n_steps=train_config.n_steps,
+            batch_size=train_config.batch_size,
+            gamma=train_config.gamma,
+            cg_max_steps=train_config.cg_max_steps,
+            cg_damping=train_config.cg_damping,
+            line_search_shrinking_factor=train_config.line_search_shrinking_factor,
+            line_search_max_iter=train_config.line_search_max_iter,
+            n_critic_updates=(train_config.n_critic_updates if (train_config.use_critic) else 0),
+            gae_lambda=train_config.gae_lambda,
+            use_sde=train_config.use_sde,
+            sde_sample_freq=train_config.sde_sample_freq,
+            normalize_advantage=train_config.normalize_advantage,
+            target_kl=train_config.max_kl,
+            seed=train_config.seed,
+            policy_kwargs=policy_kwargs,
+            verbose=0,
+        )
+        avc_initialize(model.policy, use_critic=train_config.use_critic)
     else:
         model = algorithm(
             policy_name,
@@ -2008,6 +2553,10 @@ def train(
         )
     model.set_logger(logger)
     print(f"{train_config.algorithm} / {policy_name} over {max(1, train_config.envs)} environment(s)")
+    print(
+        "counterfactual baseline pass: "
+        + ("on" if (reward_config.uses_counterfactual()) else "off (no differenced term carries weight)")
+    )
 
     callbacks: List[Any] = [_episode_metrics_callback()()]
     if (train_config.checkpoint_freq > 0):
@@ -2022,8 +2571,9 @@ def train(
         )
     eval_env = None
     if (train_config.eval_freq > 0):
+        # Scored on the raw reward: the AVC normalization only shapes training.
         eval_env = build_vec_env(
-            env_config, reward_config, replace(train_config, envs=1), None, subprocess=False
+            env_config, reward_config, replace(train_config, envs=1, avc_reward_normalization=False), None, subprocess=False
         )
         callbacks.append(
             EvalCallback(
@@ -2198,8 +2748,12 @@ def algorithm_and_policy(algorithm: str):
         from sb3_contrib import RecurrentPPO
 
         return RecurrentPPO, "MlpLstmPolicy"
+    if (is_trpo(algorithm)):
+        from sb3_contrib import TRPO
+
+        return TRPO, "MlpPolicy"
     if (str(algorithm).lower() != "ppo"):
-        raise ValueError(f"unknown algorithm {algorithm!r}; expected 'recurrent_ppo' or 'ppo'")
+        raise ValueError(f"unknown algorithm {algorithm!r}; expected 'recurrent_ppo', 'ppo' or 'trpo'")
     from stable_baselines3 import PPO
 
     return PPO, "MlpPolicy"
@@ -2230,6 +2784,9 @@ def detect_algorithm(checkpoint: str) -> str:
         policy_class = str(data.get("policy_class", ""))
         if (("Lstm" in policy_class) or ("Recurrent" in policy_class)):
             return "recurrent_ppo"
+        if ("cg_max_steps" in data):
+            # TRPO saves the same ActorCriticPolicy as PPO; its own hyperparameters give it away.
+            return "trpo"
     except Exception:
         pass
     return "ppo"
@@ -2245,6 +2802,51 @@ def load_model(path: str, device: str = "cpu", algorithm: Optional[str] = None):
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+
+# The AVC ring controllers' schedule (the paper's single_ring runs): 40 workers,
+# each running one 10,000-step episode at a 0.1 s control step per update, 50
+# updates, discount 0.999 per step.
+AVC_WORKERS = 40
+AVC_STEPS_PER_WORKER = 10_000
+AVC_CONTROL_STEP_S = 0.1
+AVC_UPDATES = 50
+AVC_GAMMA = 0.999
+AVC_CONTROL_SECONDS_PER_UPDATE = AVC_WORKERS * AVC_STEPS_PER_WORKER * AVC_CONTROL_STEP_S  # 40,000 s
+DATA_MACRO_STEP_S = 1.0  # the I-24 macroscopic aggregation, and this environment's default outer step
+
+# CLI defaults that depend on --algorithm.  The parser's defaults for these are
+# None, so an explicit flag always wins and anything unset comes from here.  The
+# PPO values are the ones this parser always had.  The TRPO values carry the AVC
+# schedule over in seconds of driving, since they acted every 0.1 s and this
+# environment acts every 1 s:
+#   gamma    AVC's 0.999 per 0.1 s, re-expressed for the outer step: 0.990 at a
+#            1 s step, and exactly 0.999 at --macro-dt 0.1
+#   n_steps  40 workers x 10,000 x 0.1 s = 40,000 s of control per update, split
+#            over the environments (see configs_from_args)
+#   updates  50, i.e. total_timesteps = 50 * envs * n_steps unless given
+# At --macro-dt 0.1 this reproduces the paper's numbers exactly: 400,000
+# transitions per update and 20M in total, at their 10 Hz control rate.
+# envs stays at 24 rather than their 40: each worker here holds several GB of
+# ground truth, and 40 of them do not fit in this machine's memory.
+ALGORITHM_CLI_DEFAULTS: Dict[str, Dict[str, Any]] = {
+    "ppo": dict(
+        envs=24, n_steps=128, batch_size=12 * 128, total_timesteps=5_000_000,
+        learning_rate=3.0e-4, gamma=0.99, gae_lambda=0.97,
+        use_sde=TrainConfig.use_sde, log_std_init=TrainConfig.log_std_init,
+    ),
+    "trpo": dict(
+        envs=24,
+        batch_size=None,  # only the critic's minibatch; None is the whole rollout, as in AVC
+        learning_rate=1.0e-4,  # AVC's default; only the critic uses it
+        # gamma and n_steps depend on the outer step, so configs_from_args computes them
+        gae_lambda=1.0,
+        use_sde=False,
+        log_std_init=0.0,  # AVC's policy head starts at std 1
+        updates=AVC_UPDATES,
+    ),
+}
+ALGORITHM_CLI_DEFAULTS["recurrent_ppo"] = ALGORITHM_CLI_DEFAULTS["ppo"]
 
 
 REWARD_WEIGHT_NAMES = (
@@ -2273,8 +2875,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--datasets", nargs="+", default=["2022-11-21.json", "2022-11-22.json", "2022-11-23.json", "2022-11-24.json", "2022-11-25.json", "2022-11-28.json", "2022-12-01.json", "2022-12-02.json"], help="dataset json files to train on")
     parser.add_argument("--roads", nargs="+", default=["2"])
     parser.add_argument(
-        "--algorithm", default="recurrent_ppo", choices=["recurrent_ppo", "ppo"],
-        help="recurrent_ppo (sb3-contrib LSTM, the default) or ppo (memoryless ablation)",
+        "--algorithm", default="recurrent_ppo", choices=["recurrent_ppo", "ppo", "trpo"],
+        help="recurrent_ppo (sb3-contrib LSTM, the default), ppo (memoryless ablation), or "
+             "trpo (sb3-contrib, configured like the AVC ring controllers; changes several defaults)",
     )
     parser.add_argument("--lstm-hidden-size", type=int, default=128)
     parser.add_argument("--n-lstm-layers", type=int, default=2)
@@ -2286,39 +2889,115 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--no-critic-lstm", dest="enable_critic_lstm", action="store_false",
         help="give the critic no recurrence of its own",
     )
-    parser.add_argument("--envs", type=int, default=24, help="parallel environments; 1 runs in-process")
+    # Defaults of None below are filled in per algorithm from ALGORITHM_CLI_DEFAULTS.
+    parser.add_argument("--envs", type=int, default=None, help="parallel environments; 1 runs in-process (default 24)")
     parser.add_argument("--no-subprocess", action="store_true", help="use DummyVecEnv even with several environments")
-    parser.add_argument("--total-timesteps", type=int, default=1_000_000)
-    parser.add_argument("--n-steps", type=int, default=128)
-    parser.add_argument("--batch-size", type=int, default=3*128)
+    parser.add_argument(
+        "--total-timesteps", type=int, default=None,
+        help="default: 5M for PPO; --updates rollouts of envs * n_steps for TRPO",
+    )
+    parser.add_argument(
+        "--updates", type=int, default=None,
+        help="set total_timesteps to this many rollouts of envs * n_steps (TRPO default: AVC's 50)",
+    )
+    parser.add_argument(
+        "--n-steps", type=int, default=None,
+        help="steps per environment per update (default: 128 for PPO; AVC's 40,000 s of driving / envs for TRPO)",
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=None,
+        help="PPO minibatch, or TRPO critic minibatch (default: 1536 for PPO; the whole rollout for TRPO)",
+    )
     parser.add_argument("--n-epochs", type=int, default=10)
-    parser.add_argument("--learning-rate", type=float, default=3.0e-4)
-    parser.add_argument("--gamma", type=float, default=0.99)
-    parser.add_argument("--gae-lambda", type=float, default=0.97)
+    parser.add_argument(
+        "--learning-rate", type=float, default=None,
+        help="default: 3e-4 for PPO; 1e-4 for TRPO, where it only trains the critic",
+    )
+    parser.add_argument(
+        "--gamma", type=float, default=None,
+        help="default: 0.99 for PPO; for TRPO AVC's 0.999 per 0.1 s, i.e. 0.990 per 1 s step",
+    )
+    parser.add_argument("--gae-lambda", type=float, default=None, help="default: 0.97 for PPO; 1.0 for TRPO")
     parser.add_argument("--clip-range", type=float, default=0.2)
     parser.add_argument("--ent-coef", type=float, default=TrainConfig.ent_coef)
-    parser.add_argument("--target-kl", type=float, default=0.0, help="0 disables the KL early stop")
+    parser.add_argument(
+        "--target-kl", type=float, default=0.0,
+        help="PPO's KL early stop; 0 disables it (TRPO's trust region is --max-kl)",
+    )
+    parser.add_argument(
+        "--max-kl", type=float, default=TrainConfig.max_kl,
+        help="TRPO's trust region: the KL bound on each update (AVC: 0.01)",
+    )
+    parser.add_argument(
+        "--trpo-critic", dest="use_critic", action=argparse.BooleanOptionalAction, default=TrainConfig.use_critic,
+        help="train a value function for TRPO's advantages; off by default, as in the AVC paper runs",
+    )
+    parser.add_argument(
+        "--avc-reward-normalization", action=argparse.BooleanOptionalAction, default=None,
+        help="AVC's reward normalization (centre, then scale by the running return std); "
+             "default on for TRPO, off otherwise",
+    )
     parser.add_argument(
         # BooleanOptionalAction, not store_true: store_true's default is always
         # False, which silently overrides TrainConfig's value on every CLI launch
-        # and makes the dataclass default dead code.  This form defaults to the
-        # dataclass and gives an explicit --no-use-sde to turn it off.
-        "--use-sde", action=argparse.BooleanOptionalAction, default=TrainConfig.use_sde,
+        # and makes the dataclass default dead code.  None here defers to
+        # ALGORITHM_CLI_DEFAULTS, and --no-use-sde turns it off explicitly.
+        "--use-sde", action=argparse.BooleanOptionalAction, default=None,
         help="state-dependent exploration: temporally correlated noise, so whole "
-             "manoeuvres get explored rather than per-step jitter",
+             "manoeuvres get explored rather than per-step jitter (default: on for PPO, off for TRPO)",
     )
     parser.add_argument(
         "--sde-sample-freq", type=int, default=TrainConfig.sde_sample_freq,
         help="steps a gSDE perturbation is held for (-1 = once per rollout; 8-16 is a good range)",
     )
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--max-steps", type=int, default=120)
+    parser.add_argument(
+        "--max-steps", type=int, default=None,
+        help=f"episode step cap (default: {EnvConfig.max_steps} at a 1 s outer step, scaled by --macro-dt)",
+    )
+    parser.add_argument(
+        "--macro-dt", type=float, default=None,
+        help="outer (macroscopic) step in seconds; default is the dataset's 1 s. 0.1 runs the whole "
+             "simulation at 10 Hz, one SUMO step per macroscopic step, which is the AVC control rate: "
+             "the empirical macroscopic data stays 1 Hz and its boundary snapshot is held across the "
+             "sub-second steps",
+    )
     parser.add_argument("--macro-lookahead-cells", type=int, default=4)
-    parser.add_argument("--max-acceleration", type=float, default=1.5)
-    parser.add_argument("--max-deceleration", type=float, default=2.0)
+    # Defaults reference the dataclass: an argparse default always wins, so a literal here
+    # would silently override EnvConfig and make the field dead code.
+    parser.add_argument("--max-acceleration", type=float, default=EnvConfig.max_acceleration)
+    parser.add_argument("--max-deceleration", type=float, default=EnvConfig.max_deceleration)
+    parser.add_argument(
+        "--obs-max-speed", type=float, default=EnvConfig.obs_max_speed,
+        help="speed normaliser for the AVC observation; must match the ring arm a "
+             f"checkpoint trained with. {AVC_CORRIDOR_MAX_SPEED} (default) for the "
+             f"corridor-scale arm, {AVC_PUBLISHED_MAX_SPEED} for published AVC.",
+    )
+    parser.add_argument(
+        "--obs-max-dist", type=float, default=EnvConfig.obs_max_dist,
+        help="leader-offset normaliser, i.e. the ring's circumference_max (300 in both "
+             "arms, so it rarely needs changing).",
+    )
+    parser.add_argument(
+        "--hero-min-gap", type=float, default=EnvConfig.hero_min_gap,
+        help="override the hero's minGap (m). Omitted: it keeps the FD-derived value the "
+             "rest of the traffic uses. Pass 0 to grant the authority ring.py gives the "
+             "RL vehicle, which a ring-trained policy trained with -- strictly fairer for "
+             "transfer, but it lets the hero tailgate and collide as it can on the ring.",
+    )
     parser.add_argument(
         "--hero-speed-mode", type=int, default=None,
         help="SUMO speed mode for the hero (default: SUMO's 31, safe-speed clipped; 30 drops the safe-speed check, 0 gives full authority)",
+    )
+    parser.add_argument(
+        "--spec-pool", default=None,
+        help="pre-built spec pool from sim_rl_spec_pool.py. Loads each episode's "
+             "counterfactual instead of replaying it, which is 77%% of reset and, "
+             "because SubprocVecEnv is synchronous, is what the whole fleet blocks on",
+    )
+    parser.add_argument(
+        "--spec-pool-holdout", type=float, default=0.0,
+        help="fraction of the pool reserved as an evaluation set training never samples",
     )
     parser.add_argument("--checkpoint-freq", type=int, default=10_000)
     parser.add_argument("--eval-freq", type=int, default=0, help="0 disables periodic evaluation")
@@ -2332,19 +3011,38 @@ def build_arg_parser() -> argparse.ArgumentParser:
         parser.add_argument(f"--w-{name.replace('_', '-')}", type=float, default=None, dest=f"w_{name}")
     parser.add_argument("--target-headway", type=float, default=None)
     parser.add_argument("--platoon-scope", default=None, choices=["lane_behind", "all_behind", "bubble"])
+    parser.add_argument(
+        "--upstream-reference", default=None, choices=["baseline", "empirical"],
+        help="what the macroscopic terms are differenced against. 'baseline' replays each episode with the "
+             "hero uncontrolled, which costs an extra environment pass -- skipped automatically when none "
+             "of those terms carries weight, as with the AVC objective",
+    )
     return parser
 
 
 def configs_from_args(args) -> Tuple[EnvConfig, RewardConfig, TrainConfig]:
+    # The outer step sets the step cap (a count of steps) and, for TRPO, the
+    # discount and the rollout length, so it is resolved before anything else.
+    macro_dt = args.macro_dt if (args.macro_dt is not None) else DATA_MACRO_STEP_S
+    max_steps = (
+        args.max_steps if (args.max_steps is not None)
+        else int(round(EnvConfig.max_steps * DATA_MACRO_STEP_S / macro_dt))
+    )
     env_config = EnvConfig(
         config_folder=args.config_folder,
         datasets=tuple(args.datasets),
         roads=tuple(args.roads),
-        max_steps=args.max_steps,
+        macro_dt=args.macro_dt,
+        max_steps=max_steps,
         macro_lookahead_cells=args.macro_lookahead_cells,
         max_acceleration=args.max_acceleration,
         max_deceleration=args.max_deceleration,
+        obs_max_speed=args.obs_max_speed,
+        obs_max_dist=args.obs_max_dist,
+        hero_min_gap=args.hero_min_gap,
         hero_speed_mode=args.hero_speed_mode,
+        spec_pool=args.spec_pool,
+        spec_pool_holdout=args.spec_pool_holdout,
         gui=args.gui,
         verbose=args.verbose,
     )
@@ -2357,6 +3055,32 @@ def configs_from_args(args) -> Tuple[EnvConfig, RewardConfig, TrainConfig]:
         reward_config.target_headway = args.target_headway
     if (args.platoon_scope is not None):
         reward_config.platoon_scope = args.platoon_scope
+    if (args.upstream_reference is not None):
+        reward_config.upstream_reference = args.upstream_reference
+
+    defaults = ALGORITHM_CLI_DEFAULTS[args.algorithm]
+
+    def resolved(name: str):
+        value = getattr(args, name)
+        return defaults.get(name) if (value is None) else value
+
+    envs = resolved("envs")
+    n_steps = resolved("n_steps")
+    if (n_steps is None):
+        # TRPO: AVC's seconds of driving per update, split over the environments.
+        n_steps = math.ceil(AVC_CONTROL_SECONDS_PER_UPDATE / macro_dt / max(1, envs))
+    gamma = resolved("gamma")
+    if (gamma is None):
+        # TRPO: AVC's discount per second of driving, at this outer step.
+        gamma = AVC_GAMMA ** (macro_dt / AVC_CONTROL_STEP_S)
+    batch_size = resolved("batch_size") or (max(1, envs) * n_steps)
+    total_timesteps = args.total_timesteps
+    if (total_timesteps is None):
+        updates = resolved("updates")
+        total_timesteps = (
+            (updates * max(1, envs) * n_steps) if (updates is not None) else defaults["total_timesteps"]
+        )
+
     train_config = TrainConfig(
         algorithm=args.algorithm,
         lstm_hidden_size=args.lstm_hidden_size,
@@ -2365,19 +3089,23 @@ def configs_from_args(args) -> Tuple[EnvConfig, RewardConfig, TrainConfig]:
         # sb3-contrib rejects the two together, and --shared-lstm is the explicit
         # request of the pair, so it wins.
         enable_critic_lstm=(args.enable_critic_lstm and (not args.shared_lstm)),
-        total_timesteps=args.total_timesteps,
-        envs=args.envs,
-        n_steps=args.n_steps,
-        batch_size=args.batch_size,
+        total_timesteps=total_timesteps,
+        envs=envs,
+        n_steps=n_steps,
+        batch_size=batch_size,
         n_epochs=args.n_epochs,
-        learning_rate=args.learning_rate,
-        gamma=args.gamma,
-        gae_lambda=args.gae_lambda,
+        learning_rate=resolved("learning_rate"),
+        gamma=gamma,
+        gae_lambda=resolved("gae_lambda"),
         clip_range=args.clip_range,
         ent_coef=args.ent_coef,
         target_kl=(args.target_kl if (args.target_kl > 0.0) else None),
-        use_sde=args.use_sde,
+        use_sde=resolved("use_sde"),
         sde_sample_freq=args.sde_sample_freq,
+        log_std_init=defaults["log_std_init"],
+        max_kl=args.max_kl,
+        use_critic=args.use_critic,
+        avc_reward_normalization=args.avc_reward_normalization,
         seed=args.seed,
         checkpoint_freq=args.checkpoint_freq,
         eval_freq=args.eval_freq,

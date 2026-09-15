@@ -268,7 +268,7 @@ def run_demo_open_loop():
         micro_coupler=replayer,
         bridge_callback_name="bridge_step"
     )
-    bridge_time_window = 1800.0 #360.0 #1080.0
+    bridge_time_window = 600.0 #360.0 #1080.0
     current_bridge_iteration = 1.0
     def update_bridge_callback(current_time, resolution):
         nonlocal bridge
@@ -324,7 +324,7 @@ def run_demo_carla():
         micro_coupler=coupler,
         bridge_callback_name="bridge_step"
     )
-    bridge_time_step = 3600.0 #1200.0 #360.0 #1080.0
+    bridge_time_step = 600.0 #1200.0 #360.0 #1080.0
     bridge_time_window = 150.0
     current_bridge_iteration = 1
     def update_bridge_callback(current_time, resolution):
@@ -332,11 +332,9 @@ def run_demo_carla():
         nonlocal bridge_time_step
         nonlocal current_bridge_iteration
         nonlocal sim
-        if ((current_time - sim.origin_time) >= ((bridge_time_step * (current_bridge_iteration - 1)) + bridge_time_window)) and (bridge.running):
-            print("Resetting bridge!")
+        if ((current_time - sim.origin_time) >= (bridge_time_step * (current_bridge_iteration))):
             if (bridge.running):
                 bridge.destroy()
-        if ((current_time - sim.origin_time) >= (bridge_time_step * (current_bridge_iteration))):
             current_bridge_iteration += 1
             coupler = I24CarlaCoupler(gt, dt=1.0, fd=triangular_fd, lanes=[-1, -2, -3, -4], mapping=config, hero_road="2", desired_time=sim.current_time, desired_s=350.0, visible_window=150.0, ghost_window=0.0, bev_video_path=f"carla_camera_{current_bridge_iteration}_low_congestion")
             bridge = I24MicroSimBridge(
@@ -351,8 +349,8 @@ def run_demo_carla():
             )
             #bridge._step(sim.current_time, sim.time_resolution)
             print("Bridge reset!")
-    sim.register_step_callback(update_bridge_callback, "bridge_restart")
-    for i in range(3599):
+    sim.register_poststep_callback(update_bridge_callback, "bridge_restart")
+    for i in range(10799):
         sim.step()
     run_app(sim, rotation_deg=82.8192)
 
@@ -400,7 +398,7 @@ def run_demo_sumo():
         micro_coupler=coupler,
         bridge_callback_name="bridge_step"
     )
-    bridge_time_step = 3600.0 #1200.0 #360.0 #1080.0
+    bridge_time_step = 600.0 #1200.0 #360.0 #1080.0
     bridge_time_window = 90.0
     current_bridge_iteration = 1
     def update_bridge_callback(current_time, resolution):
@@ -414,8 +412,9 @@ def run_demo_sumo():
             if (bridge.running):
                 bridge.destroy()
         """
-        #if ((current_time - sim.origin_time) >= (bridge_time_step * (current_bridge_iteration))):
-        if (not bridge.running):
+        if ((current_time - sim.origin_time) >= (bridge_time_step * (current_bridge_iteration))):
+            if (bridge.running):
+                bridge.destroy()
             current_bridge_iteration += 1
             coupler = I24SumoCoupler(
                 gt,
@@ -430,7 +429,7 @@ def run_demo_sumo():
                 ghost_window=0.0,
                 step_length=0.1,
                 seed=42,
-                gui=True,
+                gui=False,
                 verbose=True,
             )
             #I24CarlaCoupler(gt, dt=1.0, lanes=[-1, -2, -3, -4], mapping=config, hero_road="2", desired_time=sim.current_time, desired_s=350.0, visible_window=150.0, ghost_window=0.0, bev_video_path=f"carla_camera_{current_bridge_iteration}_low_congestion")
@@ -446,8 +445,8 @@ def run_demo_sumo():
             )
             #bridge._step(sim.current_time, sim.time_resolution)
             print("Bridge reset!")
-    #sim.register_poststep_callback(update_bridge_callback, "bridge_restart")
-    for i in range(3599):
+    sim.register_poststep_callback(update_bridge_callback, "bridge_restart")
+    for i in range(10799):
         sim.step()
         print(i)
     run_app(sim, rotation_deg=82.8192)
@@ -534,4 +533,4 @@ def run_demo_metanet():
     run_app(sim, rotation_deg=82.8192)
 
 if __name__ == "__main__":
-    run_demo_sumo()
+    run_demo_carla()

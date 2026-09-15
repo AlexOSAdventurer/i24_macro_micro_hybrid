@@ -955,7 +955,16 @@ class GroundTruthStore:
             raise KeyError(f"No ground-truth snapshot near time={time_value}. Closest: {chosen}.")
         return chosen
 
-    def get_empirical_densities_at_time(self, time_value: float, tolerance: float = 1e-1):
+    # The empirical macroscopic data is aggregated at 1 Hz, so a simulation whose
+    # step is shorter than that (see EnvConfig.macro_dt, which can run the outer
+    # loop at 10 Hz) asks for times that fall between snapshots.  The tolerance
+    # below spans a whole interval, which holds the nearest snapshot until the next
+    # one starts; at a 1 s step it still picks the exact match.  The initial
+    # condition is a different matter and stays strict: see
+    # apply_density_snapshot_to_network, whose caller passes 1e-6.
+    BOUNDARY_TIME_TOLERANCE = 1.0
+
+    def get_empirical_densities_at_time(self, time_value: float, tolerance: float = BOUNDARY_TIME_TOLERANCE):
         density_map = self._macro_density_lookup[self._nearest_time(time_value, tolerance)]
         return density_map
 
@@ -967,7 +976,7 @@ class GroundTruthStore:
             network.get_cell(road_id, cell_id).mass = density * network.get_cell(road_id, cell_id).length
 
     def apply_density_snapshot_to_network_boundaries(
-        self, network: Network, time_value: float, tolerance: float = 1e-1
+        self, network: Network, time_value: float, tolerance: float = BOUNDARY_TIME_TOLERANCE
     ) -> None:
         density_map = self._macro_density_lookup[self._nearest_time(time_value, tolerance)]
         for (road_id, cell_id), density in density_map.items():

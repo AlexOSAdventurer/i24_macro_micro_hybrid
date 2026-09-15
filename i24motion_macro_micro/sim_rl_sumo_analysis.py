@@ -24,9 +24,9 @@ like everything else in this project::
         'cd /workspaces/i24motion_macro_micro && python3.10 sim_rl_sumo_analysis.py \\
              --run run_data/rl/ppo_smoothing --demo run_data/rl/ppo_smoothing/demo --latex'
 
-It is algorithm-agnostic: RecurrentPPO and PPO runs log identically, and figure
-titles name which one a run used so the recurrent/memoryless ablation can be
-told apart.
+It is algorithm-agnostic: RecurrentPPO, PPO and TRPO runs log the same rollout/
+and episode/ series, and figure titles name which one a run used so the
+recurrent/memoryless ablation and the TRPO runs can be told apart.
 
 Figures land in ``<out>/figures`` and LaTeX tables in ``<out>/tables``, matching
 how ``sim_analysis.py`` reports the macroscopic model comparison.
@@ -87,6 +87,7 @@ DEFAULT_TABLE_METRICS = (
 
 CONTROLLER_DISPLAY_NAMES = {
     "ppo": "PPO",
+    "trpo": "TRPO",
     "sumo": "SUMO (uncontrolled)",
     "idm": "IDM",
     "follower_stopper": "FollowerStopper",

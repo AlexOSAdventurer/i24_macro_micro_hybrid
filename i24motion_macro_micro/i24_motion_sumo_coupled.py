@@ -25,6 +25,8 @@ from __future__ import annotations
 import os
 from typing import Dict, List, Optional
 
+import numpy as np
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 DEFAULT_NET_FILE = os.path.join(HERE, "sumo", "i24_corridor.net.xml")
@@ -71,6 +73,31 @@ class I24MotionSumoSimulationCoupled:
     # as an insertion failure and its mass refunded to the macro flux memory.
     insertion_grace_substeps = 2
 
+    # Acceleration Constants.  These are AVC's (Yan et al., T-ASE 2022) ring-road
+    # values, adopted so the corridor's human drivers are the same car-following
+    # model the ring controllers were trained against; the previous corridor
+    # values were max_accel = 1.5, max_decel = 2.0.  Not adopted from AVC:
+    # tau and minGap/length, which are pinned by the calibrated triangular FD
+    # (tau = 1/(w * rho_j) = 2.26 s, length + minGap = 1/rho_j) and are what keep
+    # the microscopic steady state on the CTM's fundamental diagram -- taking
+    # AVC's tau=1.0 would imply w = 12.95 m/s, 2.26x the calibrated backward wave
+    # speed, and 1.83x the CTM's capacity.  speedFactor needs no change: the
+    # add.xml's normc(1.0,0.1,0.8,1.2) is exactly AVC's speedFactor=1.0 with
+    # speedDev=0.1 at SUMO's default two-deviation cutoff.
+    #max_accel = 1.5
+    #max_decel = 2.0
+    max_accel = 1.0
+    max_decel = 1.5
+
+    # Amplitude of the human-driver acceleration noise, in m/s^2.  AVC's ring
+    # gets its string instability from a patched SUMO (ZhongxiaYan/sumo, branch
+    # 1.1.0) whose IDM adds randNorm(0, sigma) to the computed acceleration every
+    # step, with sigma = 0.2 for human vehicles and 0 for the RL vehicle.  The
+    # stock SUMO here has no such hook and its `sigma` attribute is a documented
+    # no-op under IDM, so the noise is injected over TraCI instead; see
+    # apply_idm_noise.  Set to 0 to recover deterministic IDM.
+    idm_sigma = 0.2
+
     def __init__(
         self,
         coupler,
@@ -85,6 +112,7 @@ class I24MotionSumoSimulationCoupled:
         end_time: float = 1e6,
         lead_speed_control: bool = True,
         hero_policy: Optional[HeroPolicy] = None,
+        hero_min_gap: Optional[float] = None,
         label: str = "i24_bridge",
         extra_args: Optional[List[str]] = None,
         verbose: bool = False,
@@ -101,6 +129,10 @@ class I24MotionSumoSimulationCoupled:
         self.end_time = float(end_time)
         self.lead_speed_control = lead_speed_control
         self.hero_policy = hero_policy
+        # None keeps the class default (the FD-derived minGap); 0.0 opts into the ring's
+        # AV authority.  See the hero_min_gap class attribute.
+        if hero_min_gap is not None:
+            self.hero_min_gap = float(hero_min_gap)
         self.label = label
         self.extra_args = list(extra_args) if extra_args else []
         self.verbose = verbose
@@ -131,6 +163,16 @@ class I24MotionSumoSimulationCoupled:
         # rather than re-read every substep for every vehicle.
         self._vehicle_geometry: Dict[str, tuple] = {}
         self._lane_max_speed: Dict[str, float] = {}
+        # Driver noise is drawn PER VEHICLE, from a generator seeded by (run seed,
+        # cosim id), rather than from one shared stream.  That makes the noise common
+        # random numbers across runs that differ only in the hero's actions, which is
+        # what the paired policy-vs-baseline comparison needs: a shared stream desyncs
+        # as soon as the hero changes how many vehicles are lane leaders or on spawn
+        # holds, so the two arms would see different noise realisations and the paired
+        # difference would carry variance unrelated to the controller.  Kept separate
+        # from SUMO's own RNG (--seed above) for the same reason.
+        self._noise_seed = seed
+        self._noise_rngs: Dict[int, np.random.Generator] = {}
 
     # ------------------------------------------------------------------
     # Identifiers and geometry
@@ -344,8 +386,8 @@ class I24MotionSumoSimulationCoupled:
             self.conn.vehicle.setSpeed(veh_id, speed)
             self.conn.vehicle.setMinGap(veh_id, self.coupler.min_spawn_distance)
             self.conn.vehicle.setMaxSpeed(veh_id, self.coupler.fd.v_f)
-            self.conn.vehicle.setAccel(veh_id, 1.5)
-            self.conn.vehicle.setDecel(veh_id, 2.0)
+            self.conn.vehicle.setAccel(veh_id, self.max_accel)
+            self.conn.vehicle.setDecel(veh_id, self.max_decel)
             self.conn.vehicle.setTau(veh_id, 1.0 / (self.coupler.fd.w * self.coupler.fd.rho_j))
         except Exception as exc:
             print(f"WARNING: could not place {veh_id} at {lane_id}@{front_pos:.2f}: {exc}")
@@ -366,10 +408,36 @@ class I24MotionSumoSimulationCoupled:
         if veh_id is None:
             raise RuntimeError(f"Failed to insert the hero vehicle into SUMO: {cosim_data}")
         self.hero_state = self._tracking_record(cosim_data, veh_id, self._spawn_side_for(cosim_data))
+        self._apply_hero_min_gap(veh_id)
         try:
             self.conn.vehicle.setColor(veh_id, (255, 0, 0, 255))
         except Exception:
             pass
+
+    # Override for the designated AV slot's minGap.  DEFAULT None: the hero keeps the
+    # FD-derived minGap (1/rho_j - average_spawn_length) that every other vehicle gets,
+    # so the jam spacing stays consistent for it too.
+    #
+    # Pass 0.0 to OPT IN to ring-equivalent authority.  ring.py:86 zeroes the RL
+    # vehicle's minGap for its controlled phase, so a ring-trained policy learned with
+    # the freedom to close a gap completely; evaluating it here behind a 7.705 m buffer
+    # applies a constraint it never trained with, and the mismatch flatters it, because
+    # pressing against a buffer looks better behaved than the tailgating its training
+    # rewarded.  Note the same line means very different things in the two setups: AVC's
+    # minGap is 2 m, so zeroing frees 2 m, where ours is 7.705 m at a ~17 m mean gap.
+    #
+    # Whatever the value, it is applied to the hero whether or not a policy is driving,
+    # so a paired policy-vs-baseline comparison differs in CONTROL ONLY rather than also
+    # in vehicle physics.
+    hero_min_gap: Optional[float] = None
+
+    def _apply_hero_min_gap(self, veh_id):
+        if self.hero_min_gap is None:
+            return
+        try:
+            self.conn.vehicle.setMinGap(veh_id, float(self.hero_min_gap))
+        except Exception as exc:
+            print(f"WARNING: could not set hero minGap on {veh_id}: {exc}")
 
     def spawn_visible_vehicle(self, cosim_data):
         veh_id = self.spawn_vehicle_from_co_sim(cosim_data)
@@ -489,6 +557,71 @@ class I24MotionSumoSimulationCoupled:
                 continue
             try:
                 self.conn.vehicle.setSpeed(record["sumo_id"], -1)
+            except Exception:
+                pass
+
+    def apply_idm_noise(self):
+        """Perturb every human driver's acceleration by N(0, idm_sigma) m/s^2.
+
+        AVC's ring adds the draw inside IDM; TraCI cannot reach into the model, so
+        the equivalent is done from outside.  ``setPreviousSpeed`` overwrites the
+        speed SUMO integrates from, and IDM's update is
+        ``v(t+dt) = v(t) + a(v(t), gap, v_lead) * dt``, so telling it the vehicle
+        is at ``v + N(0, sigma) * dt`` shifts the next speed by exactly the same
+        amount an acceleration perturbation of ``N(0, sigma)`` would -- to first
+        order in dt, which is what the discrete model actually integrates.  This
+        is the same emulation used on the ring side (``TrafficState.apply_idm_noise``
+        in automatic_vehicular_control/env.py), so the two stacks share one noise
+        process rather than two different ones.
+
+        Three classes of vehicle are skipped.  The hero, because AVC's ``rl`` vType
+        carries sigma=0 and its controller should not be fighting its own actuation
+        noise.  Lane leaders, because ``apply_lead_vehicle_speeds`` has already
+        forced their speed to the macroscopic velocity ahead -- they are not
+        car-following at all, so a perturbation could not change their motion, only
+        the acceleration SUMO reports for them.  Freshly spawned vehicles still on
+        their insertion hold, for the same reason.
+
+        Cost: one TraCI command per noised vehicle per substep.  There is no
+        batched setter, and the call must happen after the readback and before
+        ``simulationStep`` because it consumes the current speed.  Measured at ~5%
+        of wall time on the socket client.
+
+        On common random numbers: the per-vehicle generators are deliberately NOT
+        reaped when a vehicle leaves, so a vehicle that exits and re-enters the bubble
+        resumes its own sequence rather than restarting it.  The residual imperfection
+        is that a vehicle present for a different NUMBER of substeps between two arms
+        advances its stream a different number of times; perfect synchronisation would
+        need a fresh generator keyed by (seed, id, absolute step) per draw, which costs
+        a Generator construction per vehicle per substep.  The population-level desync
+        this replaces was far larger: it shifted every vehicle's draw whenever the hero
+        changed how many vehicles were lane leaders or on spawn holds.
+        """
+        if not self.idm_sigma:
+            return
+        dt = self.step_length
+        for cosim_id, record in self.visible_states.items():
+            if (cosim_id in self.lead_controlled) or (record["hold_substeps"] > 0):
+                continue # under setSpeed, so a perturbation cannot move it
+            veh_id = record["sumo_id"]
+            sample = self._vehicle_sample(veh_id)
+            if sample is None:
+                continue
+            # One generator per vehicle, advanced once per substep.  A vehicle's noise
+            # sequence therefore depends only on its own id and the run seed -- not on
+            # how many other vehicles happen to be present, nor on iteration order.
+            rng = self._noise_rngs.get(cosim_id)
+            if rng is None:
+                rng = np.random.default_rng(
+                    (self._noise_seed, int(cosim_id)) if (self._noise_seed is not None)
+                    else (int(cosim_id),)
+                )
+                self._noise_rngs[cosim_id] = rng
+            speed = float(sample[self._tc.VAR_SPEED])
+            try:
+                self.conn.vehicle.setPreviousSpeed(
+                    veh_id, max(0.0, speed + float(rng.normal(0.0, self.idm_sigma)) * dt)
+                )
             except Exception:
                 pass
 
@@ -791,6 +924,9 @@ class I24MotionSumoSimulationCoupled:
         if veh_id is None:
             raise RuntimeError("Lost the hero vehicle and could not reinsert it.")
         self.hero_state = self._tracking_record(cosim_data, veh_id, self.hero_state["spawn_side"])
+        # The reinserted vehicle is a fresh SUMO id, so it came in with the FD-derived
+        # minGap that spawn_vehicle_from_co_sim applies to everything; re-grant the AV's.
+        self._apply_hero_min_gap(veh_id)
 
     # ------------------------------------------------------------------
     # Stepping
@@ -804,6 +940,8 @@ class I24MotionSumoSimulationCoupled:
             self.release_spawn_holds()
             self.apply_lead_vehicle_speeds()
             self.apply_hero_policy()
+            # Last, so it reads the speeds the step will actually start from.
+            self.apply_idm_noise()
             self.conn.simulationStep()
             self.current_timestamp += self.step_length
             # One round-trip for the whole population, before anything reads it.
