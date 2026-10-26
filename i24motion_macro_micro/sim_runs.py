@@ -219,6 +219,6 @@ def run_carla():
                     print(f"Exception {e} raised during running {dataset}, {road}, {current_start_time}, {current_episode_step}, range ending in {end_time}. Skipping it.")
 
 if __name__ == "__main__":
-    #run_lwr_triangular()
-    #run_sumo()
+    run_lwr_triangular()
+    run_sumo()
     run_carla()

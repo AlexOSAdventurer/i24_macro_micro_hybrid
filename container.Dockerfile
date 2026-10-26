@@ -57,20 +57,29 @@ COPY .tmp/i24_macro_micro_requirements.txt /requirements/i24_macro_micro_require
 #RUN python3.9 -m pip install -r requirements/i24carla_requirements.txt
 #RUN python3.9 -m pip install -r requirements/i24_macro_micro_requirements.txt
 
-RUN python3.10 -m pip install -r requirements/examples_requirements.txt
-RUN python3.10 -m pip install -r requirements/util_requirements.txt
-RUN python3.10 -m pip install -r requirements/i24carla_requirements.txt
-RUN python3.10 -m pip install -r requirements/i24_macro_micro_requirements.txt
+#RUN python3.10 -m pip install -r requirements/examples_requirements.txt
+#RUN python3.10 -m pip install -r requirements/util_requirements.txt
+#RUN python3.10 -m pip install -r requirements/i24carla_requirements.txt
+#RUN python3.10 -m pip install -r requirements/i24_macro_micro_requirements.txt
 
 #RUN python3.11 -m pip install -r requirements/examples_requirements.txt
 #RUN python3.11 -m pip install -r requirements/util_requirements.txt
 #RUN python3.11 -m pip install -r requirements/i24carla_requirements.txt
 #RUN python3.11 -m pip install -r requirements/i24_macro_micro_requirements.txt
 
-#RUN python3.12 -m pip install -r requirements/examples_requirements.txt
-#RUN python3.12 -m pip install -r requirements/util_requirements.txt
-#RUN python3.12 -m pip install -r requirements/i24carla_requirements.txt
-#RUN python3.12 -m pip install -r requirements/i24_macro_micro_requirements.txt
+RUN python3.12 -m pip install -r requirements/examples_requirements.txt
+RUN python3.12 -m pip install -r requirements/util_requirements.txt
+RUN python3.12 -m pip install -r requirements/i24carla_requirements.txt
+RUN python3.12 -m pip install -r requirements/i24_macro_micro_requirements.txt
+
+# On 24.04, Ubuntu's own /usr/bin/python3 is also 3.12 (3.12.3) but cannot see the
+# packages installed above into the altinstall'd /usr/local 3.12.9. Make python/python3
+# (and pip/pip3) resolve to the /usr/local build; /usr/local/bin precedes /usr/bin on PATH,
+# and apt's own tooling calls /usr/bin/python3 by absolute path, so it is unaffected.
+RUN ln -sf /usr/local/bin/python3.12 /usr/local/bin/python3 \
+    && ln -sf /usr/local/bin/python3.12 /usr/local/bin/python \
+    && ln -sf /usr/local/bin/pip3.12 /usr/local/bin/pip3 \
+    && ln -sf /usr/local/bin/pip3.12 /usr/local/bin/pip
 
 # Starting with Ubuntu 23.04, official Docker images include a default `ubuntu` user with UID 1000.
 # This can cause conflicts when remapping the container's UID/GID to match the host user, which often also uses UID 1000.
@@ -116,10 +125,12 @@ RUN apt install osmium-tool -y
 USER ${USERNAME}
 #RUN python3.10 -m pip install trimesh==4.9.0 osmium==4.0.2 pyproj==3.5.0 numpy==1.24.4 scipy==1.10.1 joblib==1.4.2 shapely==2.0.7 tqdm==4.67.1 pandas==2.0.3 open3d==0.19.0 laspy==2.5.4 networkx==3.1 rtree==1.3.0 gdal==3.6.2 --user
 # Install Cosimulation dependencies
-RUN python3.10 -m pip install pyarrow duckdb moviepy>=2.0.0 --user
+#RUN python3.10 -m pip install pyarrow duckdb moviepy>=2.0.0 --user
+RUN python3.12 -m pip install pyarrow duckdb moviepy>=2.0.0 --user
 # Install SUMO (microscopic backend alternative to CARLA).
 # Ships prebuilt sumo/sumo-gui/netconvert binaries into ~/.local/bin.
-RUN python3.10 -m pip install eclipse-sumo==1.27.1 traci==1.27.1 sumolib==1.27.1 --user
+#RUN python3.10 -m pip install eclipse-sumo==1.27.1 traci==1.27.1 sumolib==1.27.1 --user
+RUN python3.12 -m pip install eclipse-sumo==1.27.1 traci==1.27.1 sumolib==1.27.1 --user
 # Final environment variable setup
 ENV UE4_ROOT="/workspaces/unreal-engine"
 ENV CARLA_UE4_ROOT="/workspaces/carla"
@@ -131,10 +142,14 @@ ENV CARLA_UE4_ROOT="/workspaces/carla"
 WORKDIR ${CARLA_UE4_ROOT}
 
 # Install user libraries
-RUN python3.10 -m pip install --user -r /requirements/examples_requirements.txt
-RUN python3.10 -m pip install --user -r /requirements/util_requirements.txt
-RUN python3.10 -m pip install --user -r /requirements/i24carla_requirements.txt
-RUN python3.10 -m pip install --user -r /requirements/i24_macro_micro_requirements.txt
+#RUN python3.10 -m pip install --user -r /requirements/examples_requirements.txt
+#RUN python3.10 -m pip install --user -r /requirements/util_requirements.txt
+#RUN python3.10 -m pip install --user -r /requirements/i24carla_requirements.txt
+#RUN python3.10 -m pip install --user -r /requirements/i24_macro_micro_requirements.txt
+RUN python3.12 -m pip install --user -r /requirements/examples_requirements.txt
+RUN python3.12 -m pip install --user -r /requirements/util_requirements.txt
+RUN python3.12 -m pip install --user -r /requirements/i24carla_requirements.txt
+RUN python3.12 -m pip install --user -r /requirements/i24_macro_micro_requirements.txt
 
 FROM development AS monolith
 

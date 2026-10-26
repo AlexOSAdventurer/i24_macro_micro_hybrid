@@ -64,14 +64,31 @@ def get_sim_and_empirical_densities(store, run_id, road_id, lane_id, baseline=Fa
     aligned_empirical_data = unaligned_empirical_data[empirical_alignment_start_index:empirical_alignment_end_index, :]
     return sim_data, aligned_empirical_data
 
-def pair_and_filter_for_upstream_data(store, run_id, road_id, lane_id, sim_data, empirical_data):
-    masks = get_masks(store, run_id, road_id, lane_id)
+# The LWR baseline has no mask of its own, so it is evaluated on the SUMO / CARLA run's
+# space-time region: rows covering the same absolute times as that run.
+def get_matched_baseline_densities(store, baseline_run, run_id, road_id, lane_id):
+    run_sim_data, aligned_empirical_data = get_sim_and_empirical_densities(store, run_id, road_id, lane_id)
+    _, _, _, time_origin_run, _, _, time_step, _ = extract_run_data(store, run_id)
+    _, _, _, time_origin_baseline, _, _, _, _ = extract_run_data(store, baseline_run, baseline=True)
+    baseline_sim_data = store[baseline_run, road_id, lane_id, "sim", "density"]
+    baseline_start_index = int(round((time_origin_run - time_origin_baseline) / time_step))
+    baseline_end_index = baseline_start_index + run_sim_data.shape[0]
+    if (baseline_start_index < 0) or (baseline_end_index > baseline_sim_data.shape[0]):
+        raise ValueError("%s rows [%d, %d) fall outside baseline %s (%d rows)" % (run_id, baseline_start_index, baseline_end_index, baseline_run, baseline_sim_data.shape[0]))
+    return baseline_sim_data[baseline_start_index:baseline_end_index, :], aligned_empirical_data
+
+# Timesteps without a mask use the entire road; timesteps whose mask leaves no whole cell
+# upstream are skipped.  Passing the same masks for a coupled run and its matched baseline
+# guarantees both are scored on identical cells and timesteps.
+def pair_and_filter_for_upstream_data(masks, sim_data, empirical_data):
     pairs = []
     for i, mask in enumerate(masks):
         start_cell = 0
         end_cell = sim_data.shape[1] - 1
         if (mask is not None):
             end_cell = _get_highest_upstream_cell_id(mask[0])
+        if (end_cell < start_cell):
+            continue
         pair_sim = sim_data[i][start_cell:(end_cell + 1)]
         pair_empirical = empirical_data[i][start_cell:(end_cell + 1)]
         pairs.append([pair_sim, pair_empirical])
@@ -102,22 +119,41 @@ def join_metrics(metric1, metric2):
 def str_is_baseline(run):
     return ("lwr_triangular" in run)
 
+def get_baseline_run(store, dataset):
+    baseline_runs = [run for run in store.runs() if str_is_baseline(run) and (dataset == extract_run_data(store, run, True)[-1])]
+    if (len(baseline_runs) != 1):
+        raise ValueError("Expected one baseline run for %s, found %r" % (dataset, baseline_runs))
+    return baseline_runs[0]
+
+def matched_baseline_key(sim):
+    return "lwr_triangular|" + sim
+
+# Returns (coupled metrics, matched LWR baseline metrics) for one coupled sim and dataset.
 def collate_metrics_for_sim_and_dataset(store, sim, dataset):
     metrics = {
         "l1": [],
         "wasserstein": []
     }
-    baseline = str_is_baseline(sim)
+    baseline_metrics = {
+        "l1": [],
+        "wasserstein": []
+    }
     runs = [run for run in store.runs() if (sim == extract_run_data(store, run, str_is_baseline(run))[0]) and (dataset == extract_run_data(store, run, str_is_baseline(run))[-1])]
+    if (len(runs) == 0):
+        return metrics, baseline_metrics
+    baseline_run = get_baseline_run(store, dataset)
     for run in runs:
-        _, road_id, lanes, time_origin_sim, time_origin_empirical, episode_length, time_step, _ = extract_run_data(store, run, baseline)
+        _, road_id, lanes, _, _, _, _, _ = extract_run_data(store, run)
         for current_road_id in road_id:
             for current_lane_id in lanes:
-                sim_data, empirical_data = get_sim_and_empirical_densities(store, run, current_road_id, current_lane_id, baseline)
-                pairs = pair_and_filter_for_upstream_data(store, run, current_road_id, current_lane_id, sim_data, empirical_data)
-                new_metrics = calculate_metrics_from_pairs(pairs)
-                metrics = join_metrics(metrics, new_metrics)
-    return metrics
+                masks = get_masks(store, run, current_road_id, current_lane_id)
+                sim_data, empirical_data = get_sim_and_empirical_densities(store, run, current_road_id, current_lane_id)
+                baseline_data, _ = get_matched_baseline_densities(store, baseline_run, run, current_road_id, current_lane_id)
+                pairs = pair_and_filter_for_upstream_data(masks, sim_data, empirical_data)
+                baseline_pairs = pair_and_filter_for_upstream_data(masks, baseline_data, empirical_data)
+                metrics = join_metrics(metrics, calculate_metrics_from_pairs(pairs))
+                baseline_metrics = join_metrics(baseline_metrics, calculate_metrics_from_pairs(baseline_pairs))
+    return metrics, baseline_metrics
 
 def generate_sim_metrics(store, sim):
     datasets = os.listdir(config_folder)
@@ -125,19 +161,33 @@ def generate_sim_metrics(store, sim):
         "l1": [],
         "wasserstein": []
     }
+    baseline_summary_metrics = {
+        "l1": [],
+        "wasserstein": []
+    }
     dataset_metrics = {}
+    baseline_dataset_metrics = {}
     for dataset in datasets:
-        dataset_metrics[dataset] = collate_metrics_for_sim_and_dataset(store, sim, dataset)
+        dataset_metrics[dataset], baseline_dataset_metrics[dataset] = collate_metrics_for_sim_and_dataset(store, sim, dataset)
         summary_metrics = join_metrics(summary_metrics, dataset_metrics[dataset])
+        baseline_summary_metrics = join_metrics(baseline_summary_metrics, baseline_dataset_metrics[dataset])
 
-    return summary_metrics, dataset_metrics
+    return summary_metrics, dataset_metrics, baseline_summary_metrics, baseline_dataset_metrics
 
+# Each coupled sim is preceded by the LWR baseline scored on that sim's matched regions.
 def generate_full_metrics(store):
-    sims = ["lwr_triangular", "sumo", "carla"]
+    sims = ["sumo", "carla"]
     results = {}
     for sim in sims:
-        results[sim] = {}
-        results[sim]["summary_metrics"], results[sim]["dataset_metrics"] = generate_sim_metrics(store, sim)
+        summary_metrics, dataset_metrics, baseline_summary_metrics, baseline_dataset_metrics = generate_sim_metrics(store, sim)
+        results[matched_baseline_key(sim)] = {
+            "summary_metrics": baseline_summary_metrics,
+            "dataset_metrics": baseline_dataset_metrics
+        }
+        results[sim] = {
+            "summary_metrics": summary_metrics,
+            "dataset_metrics": dataset_metrics
+        }
     return results
 
 # ---------------------------------------------------------------------------
@@ -148,9 +198,13 @@ def generate_full_metrics(store):
 
 sim_display_names = {
     "lwr_triangular": "LWR",
+    "lwr_triangular|sumo": "LWR (SUMO reg.)",
     "sumo": "SUMO",
+    "lwr_triangular|carla": "LWR (CARLA reg.)",
     "carla": "CARLA"
 }
+
+sim_order = ["lwr_triangular|sumo", "sumo", "lwr_triangular|carla", "carla"]
 
 metric_display_names = {
     "l1": r"$L^1$ error",
@@ -269,7 +323,7 @@ def generate_latex_for_metrics(store=None,
                                font_size=r"\footnotesize",
                                column_separation="4pt",
                                full_width=False,
-                               caption="Upstream density error of each simulation technique against the empirical I-24 MOTION data, per dataset and aggregated over all datasets.",
+                               caption="Density error upstream of the microscopic bubble against the empirical I-24 MOTION data, per dataset and aggregated over all datasets. LWR (SUMO reg.) and LWR (CARLA reg.) score the fully fluid LWR simulation on the same cells and timesteps as the SUMO and CARLA runs respectively.",
                                label="tab:full_metrics",
                                output_path=None):
     """Build a LaTeX table summarising generate_full_metrics' results dictionary.
@@ -319,7 +373,7 @@ def generate_latex_for_metrics(store=None,
             if (dataset not in datasets):
                 datasets.append(dataset)
     datasets = sorted(datasets)
-    sims = [sim for sim in ["lwr_triangular", "sumo", "carla"] if (sim in results)]
+    sims = [sim for sim in sim_order if (sim in results)]
 
     metric_names = metric_short_names if (compact) else metric_display_names
     stat_names = stat_short_names if (compact) else stat_display_names

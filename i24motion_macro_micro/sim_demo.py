@@ -355,12 +355,13 @@ def run_demo_carla():
     run_app(sim, rotation_deg=82.8192)
 
 def run_demo_sumo():
+    time_step = 0.1
     with open("config/2022-11-30.json", "r") as f:
         config = json.load(f)
 
     sim = Simulation.from_json(
         json_path=os.path.join(config["storage_locations"]["simulation_dataset"], "network.json"),
-        time_resolution=config["time_step"],
+        time_resolution=time_step,
         origin_time=config["time_origin"]+3600.0,
         min_cell_length=100.0
     )
@@ -373,7 +374,7 @@ def run_demo_sumo():
 
     coupler = I24SumoCoupler(
         gt,
-        dt=config["time_step"],
+        dt=time_step,  # the micro clock advances by dt per macro step, so it must be the sim step (0.1 s), not the data step (1 s)
         fd=triangular_fd,
         lanes=[-1, -2, -3, -4],
         mapping=config,
@@ -384,7 +385,7 @@ def run_demo_sumo():
         ghost_window=0.0,
         step_length=0.1,
         seed=42,
-        gui=True,
+        gui=False,
         verbose=True,
     )
     #I24CarlaCoupler(gt, dt=1.0, lanes=[-1, -2, -3, -4], mapping=config, hero_road="2", desired_time=config["time_origin"], desired_s=350.0, visible_window=150.0, ghost_window=0.0, bev_video_path="carla_camera_1_low_congestion")
@@ -418,7 +419,7 @@ def run_demo_sumo():
             current_bridge_iteration += 1
             coupler = I24SumoCoupler(
                 gt,
-                dt=config["time_step"],
+                dt=time_step,  # the micro clock advances by dt per macro step, so it must be the sim step (0.1 s), not the data step (1 s)
                 fd=triangular_fd,
                 lanes=[-1, -2, -3, -4],
                 mapping=config,
@@ -446,7 +447,7 @@ def run_demo_sumo():
             #bridge._step(sim.current_time, sim.time_resolution)
             print("Bridge reset!")
     sim.register_poststep_callback(update_bridge_callback, "bridge_restart")
-    for i in range(10799):
+    for i in range(107990):
         sim.step()
         print(i)
     run_app(sim, rotation_deg=82.8192)
@@ -533,4 +534,4 @@ def run_demo_metanet():
     run_app(sim, rotation_deg=82.8192)
 
 if __name__ == "__main__":
-    run_demo_carla()
+    run_demo_sumo()

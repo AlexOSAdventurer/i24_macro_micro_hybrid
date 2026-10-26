@@ -1,8 +1,5 @@
 --extra-index-url https://download.pytorch.org/whl/cu128
 rtree
-pandas
-pyarrow
-matplotlib
 ffmpeg-python
 duckdb
 ipykernel
@@ -12,9 +9,7 @@ torchvision==0.26.0+cu128
 torchaudio==2.11.0+cu128
 optuna
 jax
-plotly
 orjson
-dash
 # Reinforcement learning for the hero-vehicle controllers (sim_rl_sumo_*.py).
 # gymnasium is the maintained successor to gym; stable-baselines3 2.9 is the
 # first line that accepts gymnasium 1.x and torch 2.11 without pinning either
@@ -28,3 +23,10 @@ gymnasium==1.3.0
 stable-baselines3==2.9.0
 sb3-contrib==2.9.0
 tensorboard
+numpy==2.2.6
+pandas==2.3.3
+pyarrow==24.0.0
+matplotlib==3.10.9
+plotly==6.7.0
+dash==4.1.0
+joblib==1.5.3

@@ -1,2 +1,2 @@
 #!/bin/bash
-git clone https://github.com/AlexOSAdventurer/i24motion_to_carla_helpers.git i24motion_to_carla
+git clone -b macro_coupled https://github.com/AlexOSAdventurer/i24motion_to_carla_helpers.git i24motion_to_carla

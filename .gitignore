@@ -1,3 +1,36 @@
 i24motion_to_carla
 .tmp
 __pycache__/
+
+# ----------------------------------------------------------------------------------------
+# Local datasets and run outputs. These must stay ignored, not merely uncommitted.
+#
+# Anything that stages the working tree -- `git add -A`, `git add .`, the IDE's "Stage All
+# Changes", `git stash -u` -- walks every untracked file. A file above
+# core.bigFileThreshold (512 MB by default) is not written as a loose object: git streams
+# it straight into a new pack via the bulk-checkin path. Interrupt that and the partial
+# pack is orphaned as .git/objects/pack/tmp_pack_XXXXXX, which nothing ever cleans up --
+# `git gc` only warns "garbage found". 1,603 such orphans had grown .git to 281 GB.
+#
+# i24_motion_source_data holds single 25 GB JSONs, so one stray `git add -A` is enough.
+# Below 512 MB the failure just changes shape: git writes a multi-hundred-MB loose object
+# per file instead, so the sweep's 132 logs still cannot go in here.
+# ----------------------------------------------------------------------------------------
+
+# Source data and preprocessing products
+i24motion_macro_micro/i24_motion_source_data/
+i24motion_macro_micro/preprocessing_data/
+i24motion_macro_micro/preprocessing_data_100m_1s/
+i24motion_macro_micro/11-30-2022/
+i24motion_macro_micro/simulation_dataset/
+
+# Simulation / sweep / RL outputs
+i24motion_macro_micro/simplified_scenario_tests/verification_results*/
+i24motion_macro_micro/simplified_scenario_tests/figure_runs*/
+i24motion_macro_micro/run_data/
+i24motion_macro_micro/junk_output/
+
+# Scratch
+i24motion_macro_micro/claude_debug_junk_folder/
+i24motion_macro_micro/junk_notebooks/
+i24motion_macro_micro/.ropeproject/

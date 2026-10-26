@@ -6,6 +6,7 @@ from typing import Dict, List, Tuple, Optional, Any, Set
 import copy
 import json
 import math
+import warnings
 
 import plotly.graph_objects as go
 import numpy as np
@@ -3130,6 +3131,9 @@ class RolloutRenderer:
         self.N_frames: int = len(sim.rollout_results)
         min_sim_time = min([rs.sim_time for rs in sim.rollout_results])
         self.sim_times: List[float] = [rs.sim_time - min_sim_time for rs in sim.rollout_results]
+        # Absolute time of frame 0, so empirical data (absolute timestamps) can be put on
+        # the same seconds-since-start axis as sim_times.
+        self.origin_sim_time: float = float(min_sim_time)
         self.mask_snapshots_per_step: List[Dict[str, Any]] = [
             rs.mask_snapshots or {} for rs in sim.rollout_results
         ]
@@ -3254,7 +3258,7 @@ class RolloutRenderer:
         cols = [self._base_col[(road_id, cid)] for cid in cell_ids]
         rho_ts = self._base_density_viz[:, cols]  # (N_frames, N_cells)
         vel_ts = self._base_velocity[:, cols]     # NaN where there is no model speed
-        sim_entry: Dict[str, Any] = {"s_mids": s_mids, "density": rho_ts}
+        sim_entry: Dict[str, Any] = {"s_mids": s_mids, "density": rho_ts, "times": np.asarray(self.sim_times, dtype=float)}
         for q in ("flow", "velocity"):
             sim_entry[q] = self._q_matrix(rho_ts, fds, q, vel_ts)
 
@@ -3281,20 +3285,49 @@ class RolloutRenderer:
         # the "empirical" version that is then absent.
         if not self._has_macro_gt():
             return
-        _times, dp, vp = self._macro_pivots()
+        times, dp, vp = self._macro_pivots()
         cols = [(road_id, cid) for cid in cell_ids]
-        vals_density = dp.reindex(columns=cols).to_numpy()
-        vals_velocity = vp.reindex(columns=cols).to_numpy()
+        # The empirical store covers the whole dataset at its own step (1 s), from its own
+        # origin. It used to be drawn against sim_times, i.e. column k at the k-th sim
+        # frame's time, which compressed and shifted it whenever the sim step was not the
+        # data step or the rollout did not start at the dataset origin. Put it on its own
+        # seconds-since-rollout-start axis and crop it to the simulated window.
+        relative = times - self.origin_sim_time
+        end = self.sim_times[-1] if self.sim_times else 0.0
+        keep = (relative >= -1e-9) & (relative <= end + 1e-9)
+        vals_density = dp.reindex(columns=cols).to_numpy()[keep]
+        vals_velocity = vp.reindex(columns=cols).to_numpy()[keep]
         self.ts_data[(road_id, lane, "empirical")] = {
             "s_mids": s_mids,
             "density": vals_density,
             "velocity": vals_velocity,
             "flow": vals_density * vals_velocity,
+            "times": relative[keep],
             "mask_extents": [[]],
         }
 
-    def get_ts_figure(self, road_id: str, lane: int, quantity: str = "density", version: str = "sim", render_masks: bool = True) -> go.Figure:
-        """Return a time-space heatmap (viridis pcolormesh style) for one road+lane."""
+    @staticmethod
+    def _block_mean(values: np.ndarray, stride: int) -> np.ndarray:
+        """Average consecutive rows of ``values`` in groups of ``stride`` (last group may be shorter)."""
+        if (stride <= 1) or (values.shape[0] <= stride):
+            return values
+        full = (values.shape[0] // stride) * stride
+        with np.errstate(invalid="ignore"), warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            blocks = np.nanmean(values[:full].reshape((full // stride, stride) + values.shape[1:]), axis=1)
+            if (full < values.shape[0]):
+                blocks = np.concatenate([blocks, np.nanmean(values[full:], axis=0, keepdims=True)], axis=0)
+        return blocks
+
+    def get_ts_figure(self, road_id: str, lane: int, quantity: str = "density", version: str = "sim",
+                      render_masks: bool = True, display_dt: Optional[float] = 1.0) -> go.Figure:
+        """Return a time-space heatmap (viridis pcolormesh style) for one road+lane.
+
+        The x axis is seconds since the start of the rollout for both versions. Frames are
+        averaged into ``display_dt``-second columns before drawing (None keeps every frame):
+        at a 0.1 s step a 3 h rollout is ~108,000 columns, which is too large for the
+        browser to render, and 1 s matches the empirical data's own resolution.
+        """
         self._ensure_ts_lane(road_id, lane)
         key = (road_id, lane, version)
         if key not in self.ts_data:
@@ -3307,9 +3340,19 @@ class RolloutRenderer:
             vmin, vmax = 0.0, 60.0
         elif (quantity == "flow"):
             vmin, vmax = 0.0, 12.0
-        z = entry[quantity].T  # (N_cells, N_frames)
+        times = np.asarray(entry["times"], dtype=float)
+        values = np.asarray(entry[quantity], dtype=float)  # (N_frames, N_cells)
+        stride = 1
+        if (display_dt is not None) and (len(times) > 1):
+            frame_dt = float(np.median(np.diff(times)))
+            if (frame_dt > 0.0):
+                stride = max(1, int(round(display_dt / frame_dt)))
+        # Each averaged column is labelled with the time its window starts, which puts a 1 s
+        # sim column on the same instants as the 1 s empirical samples.
+        z = self._block_mean(values, stride).T  # (N_cells, N_columns)
+        x = times[::stride][: z.shape[1]]
         fig = go.Figure(go.Heatmap(
-            x=self.sim_times,
+            x=x,
             y=entry["s_mids"],
             z=z,
             zmin=vmin,
@@ -3325,9 +3368,9 @@ class RolloutRenderer:
             for mask in entry["mask_extents"]:
                 pairs = [
                     (t, ext)
-                    for t, ext in zip(self.sim_times[mask_position:(mask_position + len(mask))], mask)
+                    for t, ext in zip(times[mask_position:(mask_position + len(mask))], mask)
                     if ext is not None
-                ]
+                ][::stride]  # same thinning as the heatmap, so the outline stays drawable
                 t_fwd = [t for t, _ in pairs]
                 t_rev = t_fwd[::-1]
                 s_lo = [ext[0] for _, ext in pairs]
@@ -3343,6 +3386,16 @@ class RolloutRenderer:
                 ))
                 mask_position += len(mask)
 
+        # Pin both axes to the heatmap's own cell edges. With only a heatmap Plotly fits the
+        # data exactly, but the mask outline is a scatter trace, and scatter traces make
+        # autorange pad the axes -- so the sim figure (with masks) drew its heatmap smaller
+        # than the empirical figure (without) over the same data range.
+        s_mids = np.asarray(entry["s_mids"], dtype=float)
+        half_dx = (float(np.median(np.diff(x))) / 2.0) if (len(x) > 1) else 0.5
+        half_ds = (float(np.median(np.diff(s_mids))) / 2.0) if (len(s_mids) > 1) else 0.5
+        x_range = [float(x[0]) - half_dx, float(x[-1]) + half_dx] if (len(x) > 0) else None
+        y_range = [float(s_mids.min()) - half_ds, float(s_mids.max()) + half_ds] if (len(s_mids) > 0) else None
+
         fig.update_layout(
             xaxis_title="Time (s)",
             yaxis_title="Position (m)",
@@ -3351,6 +3404,8 @@ class RolloutRenderer:
             margin=dict(t=60),
             uirevision="ts-constant",
         )
+        fig.update_xaxes(range=x_range, autorange=False)
+        fig.update_yaxes(range=y_range, autorange=False)
         return fig
 
     def _white_template(self) -> dict:

@@ -34,9 +34,10 @@ over a centred --oscillation-window-s window, and the rolling link ratio against
 ahead.  Figures show the median across episodes with the interquartile range, one colour per
 arm, the excluded start of the episode shaded.
 
-BINNED VARIANCE RATIOS (summary window only): each pair in BINNED_RATIOS (H/L1, H/F1, F1/F2, F2/F3,
+BINNED VARIANCE RATIOS (summary window only): each pair in BINNED_RATIOS (H/L1, F1/H, F2/F1, F3/F2,
 F3/L1) as var(numerator)/var(denominator) per --bin-s bin (default 5 s), over the steps of the bin
-where both are present (at least half the bin).  Figures show the median per bin with IQR whiskers.
+where both are present (at least half the bin); below 1 attenuates.  Figures show the median per
+bin with IQR whiskers.
 
 Paired effects against the reference arm (per metric, per spec) are kept alongside, with a
 bootstrap 95% interval over 15-minute clock bins: adjacent tiles in the same bin share a jam.
@@ -73,9 +74,10 @@ POSITIONS = LEADERS + ["H"] + FOLLOWERS          # each entry's leader is the on
 LINKS = POSITIONS[1:]                            # positions with a leader in the chain
 FIRST, LAST = POSITIONS[0], POSITIONS[-1]        # chain ends: FIRST reported raw, cumulative LAST / FIRST
 # Binned speed-variance ratios over the summary window, (numerator, denominator) in panel order.
-# Note the direction differs between pairs: H/L1 and F3/L1 are below 1 when the rear vehicle is
-# quieter, while H/F1, F1/F2 and F2/F3 are above 1 when the rear vehicle is quieter.
-BINNED_RATIOS = [("H", "L1"), ("H", "F1"), ("F1", "F2"), ("F2", "F3"), ("F3", "L1")]
+# Every pair is rear vehicle / vehicle ahead of it, as in the table's link rows, so every panel reads
+# "below 1 attenuates".
+# BINNED_RATIOS = [("H", "L1"), ("H", "F1"), ("F1", "F2"), ("F2", "F3"), ("F3", "L1")]
+BINNED_RATIOS = [("H", "L1"), ("F1", "H"), ("F2", "F1"), ("F3", "F2"), ("F3", "L1")]
 BIN_S = 900.0
 MIN_LEADER_VARIANCE = 1e-6
 
@@ -441,7 +443,7 @@ def plot_timeseries(aggregated: pd.DataFrame, arms: Sequence[str], directory: st
             if (index % columns == 0):
                 axis.set_ylabel(ylabel)
             if (index // columns == rows - 1):
-                axis.set_xlabel("episode time (s)")
+                axis.set_xlabel("Episode Time (s)")
         for index in range(len(quantities), rows * columns):
             axes[index // columns][index % columns].axis("off")
         axes[0][0].legend(fontsize=8, loc="upper left")
@@ -453,7 +455,7 @@ def plot_timeseries(aggregated: pd.DataFrame, arms: Sequence[str], directory: st
             _draw(axis, aggregated, quantity, arms, args.skip_s, args.min_episodes)
             axis.set_title(title(quantity), fontsize=10)
             axis.set_ylabel(ylabel)
-            axis.set_xlabel("episode time (s)")
+            axis.set_xlabel("Episode Time (s)")
             axis.legend(fontsize=8)
             _save(single, directory, f"{name}_{quantity}")
             plt.close(single)
@@ -492,9 +494,9 @@ def plot_binned(aggregated: pd.DataFrame, arms: Sequence[str], directory: str, a
         axis = axes[0][index]
         _draw_binned(axis, aggregated, ratio, arms, args)
         axis.set_title(title(ratio), fontsize=9)
-        axis.set_xlabel("episode time (s)")
+        axis.set_xlabel("Episode Time (s)")
         if (index == 0):
-            axis.set_ylabel("speed variance ratio")
+            axis.set_ylabel("Speed Variance Ratio")
     axes[0][0].legend(fontsize=8, loc="best")
     figure.suptitle(f"{args.bin_s:g} s bins over {args.skip_s:g} s onward; median and IQR across episodes",
                     fontsize=8, color="#555555")
@@ -504,8 +506,8 @@ def plot_binned(aggregated: pd.DataFrame, arms: Sequence[str], directory: str, a
         single, axis = plt.subplots(figsize=(4.8, 3.0))
         _draw_binned(axis, aggregated, ratio, arms, args)
         axis.set_title(title(ratio), fontsize=10)
-        axis.set_ylabel("speed variance ratio")
-        axis.set_xlabel("episode time (s)")
+        axis.set_ylabel("Speed Variance Ratio")
+        axis.set_xlabel("Episode Time (s)")
         axis.legend(fontsize=8)
         _save(single, directory, f"binned_variance_ratio_{ratio.replace('/', '_over_')}")
         plt.close(single)

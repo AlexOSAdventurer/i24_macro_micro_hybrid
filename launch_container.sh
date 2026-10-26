@@ -4,7 +4,8 @@ set -e
 
 DOC_STRING="Run docker containers.
 
-This script launches development or CI/CD docker containers."
+This script launches the i24-sim-DISTRO development container, with the prebuilt
+Unreal Engine, CARLA, i24motion_to_carla, and i24motion_macro_micro trees mounted under /workspaces."
 
 USAGE_STRING=$(cat <<- END
 Usage: $0 [options]
@@ -16,7 +17,7 @@ User and group options:
 
 Ubuntu distribution:
 
-    --ubuntu-distro DISTRO   Specify ubuntu distro (default: 20.04)
+    --ubuntu-distro DISTRO   Specify ubuntu distro (default: 24.04)
 
 Build options:
 
@@ -28,7 +29,7 @@ Other commands:
 END
 )
 
-UBUNTU_DISTRO=22.04
+UBUNTU_DISTRO=24.04
 
 HOST_UID=$(id -u)
 HOST_GID=$(id -g)
@@ -64,9 +65,9 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-CARLA_ROOT="./i24motion_to_carla/carla-0.9.16"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-UE4_ROOT="./i24motion_to_carla/UnrealEngine_4.26/"
+CARLA_ROOT="${SCRIPT_DIR}/i24motion_to_carla/carla-0.9.16"
+UE4_ROOT="${SCRIPT_DIR}/i24motion_to_carla/UnrealEngine_4.26/"
 
 # Docker / NVIDIA checks
 if ! command -v docker &> /dev/null; then

@@ -4,17 +4,12 @@ set -e
 
 DOC_STRING="Build docker images.
 
-This script builds the base, development, and CI/CD docker images."
+This script builds the CARLA base image (carla-base:ue4-DISTRO), the i24-sim-DISTRO
+development image on top of it, and the i24-sim-volume-DISTRO home volume.
+Unreal Engine is not built here; it is prebuilt on the host and mounted by launch_container.sh."
 
 USAGE_STRING=$(cat <<- END
 Usage: $0 [options]
-
-Build configurations (choose one or more):
-
-    --base               Build base docker image (required by dev, monolith and ci)
-    --dev                Build development docker image
-    --monolith           Build monolith docker image
-    --ci                 Build CI/CD docker image
 
 User and group options:
 
@@ -23,16 +18,12 @@ User and group options:
 
 Ubuntu distribution:
 
-    --ubuntu-distro DISTRO   Specify ubuntu distro (default: 20.04).
+    --ubuntu-distro DISTRO   Specify ubuntu distro (default: 24.04).
 
 Build options:
 
-    --force-rebuild      Force rebuild images with no cache
-    --branch             CARLA branch (only for monolith configuration)
-
-Epic credentials (only needed for monolith configuration)
-    --epic-user          Github user name
-    --epic-token         Github access token
+    --force-rebuild      Rebuild the development image with no cache, and delete and
+                         recreate the i24-sim-volume-DISTRO home volume
 
 Other commands:
 
@@ -40,7 +31,7 @@ Other commands:
 END
 )
 
-UBUNTU_DISTRO=22.04
+UBUNTU_DISTRO=24.04
 
 # CARLA target branch for monolith build
 BRANCH="0.9.16_OpenTwinMap"
@@ -91,9 +82,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CARLA_ROOT="./i24motion_to_carla/carla-0.9.16"
-I24MOTION_CARLA_ROOT="./i24motion_to_carla/i24motion_to_carla"
-I24MOTION_MACRO_MICRO_ROOT="./i24motion_macro_micro/"
+CARLA_ROOT="${SCRIPT_DIR}/i24motion_to_carla/carla-0.9.16"
+I24MOTION_CARLA_ROOT="${SCRIPT_DIR}/i24motion_to_carla/i24motion_to_carla"
+I24MOTION_MACRO_MICRO_ROOT="${SCRIPT_DIR}/i24motion_macro_micro/"
 
 # Copy python runtime requirements for later installation in the docker image
 rm -rf ${SCRIPT_DIR}/.tmp && mkdir ${SCRIPT_DIR}/.tmp
@@ -110,10 +101,10 @@ docker build \
   -f ${CARLA_ROOT}/Util/Docker/Base.Dockerfile ${CARLA_ROOT}/Util/Docker/
 
 if [ "$FORCE_REBUILD" = true ]; then
-  echo "Removing existing volume i24-sim-${UBUNTU_DISTRO}"
-  docker volume rm -f i24-sim-${UBUNTU_DISTRO} 2>/dev/null || true
+  echo "Removing existing volume i24-sim-volume-${UBUNTU_DISTRO}"
+  docker volume rm -f i24-sim-volume-${UBUNTU_DISTRO} 2>/dev/null || true
 fi
-echo "Ensuring volume i24-sim-${UBUNTU_DISTRO} exists"
+echo "Ensuring volume i24-sim-volume-${UBUNTU_DISTRO} exists"
 docker volume create i24-sim-volume-${UBUNTU_DISTRO}
 
 echo "Building development image i24-sim-${UBUNTU_DISTRO} with user ${HOST_UID}:${HOST_GID}"
