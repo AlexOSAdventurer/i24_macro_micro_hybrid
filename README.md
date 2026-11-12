@@ -16,6 +16,14 @@ This README covers the full reproduction pipeline:
 7. [Run the simulations (`sim_runs.py`)](#7-run-the-simulations-sim_runspy)
 8. [Generate the results table (`sim_analysis.py`)](#8-generate-the-results-table-sim_analysispy)
 
+
+We also cover a quickstart reproduction pipeline for quickly running a coupled SUMO version (no CARLA) if you have access to Vanderbilt's:
+
+1. [Download Docker Image](#1-download-the-docker-image)
+2. [Download Processed INCEPTION Data](#2-download-processed-inception-data)
+3. [Launch the container as per above pipeline](#3-launch-the-container-quick)
+4. [Run the simulations (`sim_runs.py`)](#7-run-the-simulations-sim_runspy-quick)
+
 ## Repository layout
 
 | Path | Purpose |
@@ -271,3 +279,76 @@ If either the SUMO or the CARLA runs are missing, their rows show `--`. The tabl
 the including document. To change its layout (scaling, compact headers, rows vs. columns), see the parameters of
 `generate_latex_for_metrics` in `sim_analysis.py`. TeX Live is installed in the container, so you can compile the
 paper there too.
+
+# "Quick-Load" Directions
+
+## 1. Download the Docker Image
+In the main folder of the git repo, run:
+```bash
+./download_container.sh
+```
+
+## 2. Download Processed INCEPTION data
+
+This is only available if you have access to the RANSOM disk at Vanderbilt - this is a private dataset, and not part of the official INCEPTION release.
+
+In the main folder of the git repo, download the zip file `simulation_dataset.zip`. Unzip the contained folder `simulation_dataset/` into `i24motion_macro_micro` so that its path is `i24motion_macro_micro/simulation_dataset/`
+
+## 3. Launch the container Quick
+
+From any directory:
+
+```bash
+./launch_container.sh            # add --rebuild to run build_container.sh first
+```
+
+The container is named `i24-sim-24.04` and starts in `/workspaces/carla`. It uses host networking, so CARLA's port
+2000 and the Dash viewer's port 8050 are reachable from the host. Mounts:
+
+| Host | Container |
+|---|---|
+| `i24motion_to_carla/carla-0.9.16` | `/workspaces/carla` |
+| `i24motion_to_carla/UnrealEngine_4.26` | `/workspaces/unreal-engine` |
+| `i24motion_to_carla/i24motion_to_carla` | `/workspaces/i24motion_to_carla` |
+| `i24motion_macro_micro` | `/workspaces/i24motion_macro_micro` |
+
+The container is started with `--rm`, so it is removed when its first shell exits. To open more shells, for example
+one for CARLA and one for the simulation, run:
+
+```bash
+docker exec -it i24-sim-24.04 bash
+```
+
+If the Unreal editor cannot open a window, allow local X clients on the host with `xhost +local:` and make sure
+`DISPLAY` is set in the shell you launch from.
+
+## 4. Run the simulations (`sim_runs.py`) Quick
+
+`sim_runs.py` has three experiment functions. Each loops over every dataset config and stores its rollouts in the
+SQLite database `run_data/results_final.db`:
+
+| Function | Run IDs | What it runs |
+|---|---|---|
+| `run_lwr_triangular()` | `lwr_triangular_<date>.json` | Fully macroscopic LWR over the whole 4 h window. This is the baseline. |
+| `run_sumo()` | `sumo_road(<r>)_timeorigin(<t>)_episodelength(<n>)_<date>.json` | Hybrid LWR + SUMO bubble, for both roads, in 6-minute episodes over the last 3 h |
+| `run_carla()` | `carla_road(...)...` | The same episodes, with CARLA as the micro engine. Needs CARLA running (step 5). |
+
+Run this in your terminal to generate the simulation data:
+
+```bash
+cd /workspaces/i24motion_macro_micro
+python3 sim_runs.py
+```
+
+Notes:
+
+- **Start from an empty database.** Run IDs are deterministic, and storing an ID that already exists raises an error.
+  The SUMO and CARLA loops catch that error, print `... Skipping it.`, and move on, so a re-run into an existing
+  database silently keeps the old results. For a fresh reproduction, move the old database aside first:
+  `mv run_data/results_final.db run_data/results_final.old.db`. The analysis also expects exactly one LWR baseline per
+  dataset.
+- An episode that throws for any other reason is also skipped with the same message. Check the log for `Skipping it.`
+  lines before trusting the table.
+- The calibrated triangular fundamental diagram (`v_f`, `w`, `rho_j`) is hard-coded in `sim_runs.py` and in
+  `simulation_dataset.py`.
+- To browse a stored run interactively, `sim_demo.py` serves a Dash viewer on port 8050.
