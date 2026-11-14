@@ -20,10 +20,8 @@ Standalone (requires a pickled Simulation at demo_sim.pickle)::
     python sim_demo.py
 """
 from __future__ import annotations
-import sim_calibration_metanet
 from simulation import Simulation, RolloutRenderer, GroundTruthStore, I24WestAndEastNetworkCollapsed, METANETModel, METANETParams, TriangularFD
 from i24_trajectory_replayer import I24TrajectoryReplayer
-from i24_carla_coupler import I24CarlaCoupler
 from i24_sumo_coupler import I24SumoCoupler
 from i24_micro_bridge import I24MicroSimBridge
 from dash import Dash, dcc, html, Input, Output, State, callback
@@ -297,6 +295,7 @@ def run_demo_open_loop():
     run_app(sim, rotation_deg=82.8192)
 
 def run_demo_carla():
+    from i24_carla_coupler import I24CarlaCoupler 
     with open("config/2022-11-30.json", "r") as f:
         config = json.load(f)
 
@@ -453,6 +452,7 @@ def run_demo_sumo():
     run_app(sim, rotation_deg=82.8192)
 
 def run_demo_metanet():
+    import sim_calibration_metanet
     """
     -0.7499999999999981 -0.8339045886961388
     1.0478862366201542 0.44127095672850625

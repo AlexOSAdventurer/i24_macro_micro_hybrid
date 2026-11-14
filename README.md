@@ -3,7 +3,7 @@
 A macroscopic LWR (cell transmission model) simulation of a ~1 mile stretch of I-24 (mile markers 60.6 to 61.6,
 eastbound road `1` and westbound road `2`, four lanes each), with an embedded, moving microscopic region that is
 simulated by either SUMO or CARLA. Both are initialized from and scored against the I-24 MOTION "INCEPTION"
-trajectory dataset.
+trajectory dataset. Runs on AMD64, with NVIDIA for CARLA.
 
 This README covers the full reproduction pipeline:
 
@@ -17,12 +17,15 @@ This README covers the full reproduction pipeline:
 8. [Generate the results table (`sim_analysis.py`)](#8-generate-the-results-table-sim_analysispy)
 
 
-We also cover a quickstart reproduction pipeline for quickly running a coupled SUMO version (no CARLA) if you have access to Vanderbilt's:
+We also cover a quick-load pipeline that runs the hybrid LWR + SUMO version (no CARLA) from a prebuilt image, if you
+have access to Vanderbilt's processed dataset. It needs only Docker, and runs natively on x86_64 Linux and Apple Silicon
+Macs:
 
-1. [Download Docker Image](#1-download-the-docker-image)
-2. [Download Processed INCEPTION Data](#2-download-processed-inception-data)
-3. [Launch the container as per above pipeline](#3-launch-the-container-quick)
-4. [Run the simulations (`sim_runs.py`)](#7-run-the-simulations-sim_runspy-quick)
+1. [Download the Docker image](#1-download-the-docker-image)
+2. [Download the processed INCEPTION data](#2-download-the-processed-inception-data)
+3. [Launch the quick container](#3-launch-the-quick-container)
+4. [Run the simulations (`sim_runs.py`)](#4-run-the-simulations-sim_runspy-quick)
+5. [Browse a run in the Dash viewer (`sim_demo.py`)](#5-browse-a-run-in-the-dash-viewer-sim_demopy)
 
 ## Repository layout
 
@@ -282,45 +285,56 @@ paper there too.
 
 # "Quick-Load" Directions
 
-## 1. Download the Docker Image
-In the main folder of the git repo, run:
+The quick-load pipeline uses `papapalpi/i24-sim-quick`, a slim image built from `quick.Dockerfile`. It has Python 3.12,
+this project's requirements (with the CPU build of torch), and SUMO 1.27.1, but no CARLA, Unreal Engine, LaTeX or
+GDAL. It is published for both `linux/amd64` and `linux/arm64`, and Docker pulls the variant that matches your machine.
+On Apple Silicon it therefore runs natively rather than under x86 emulation, which is much faster and avoids segfaults
+in emulated native libraries.
+
+The host needs only Docker (Docker Desktop on macOS). No NVIDIA driver or X server is required.
+
+## 1. Download the Docker image
+
+From the main folder of the git repo:
+
 ```bash
 ./download_container.sh
 ```
 
-## 2. Download Processed INCEPTION data
+This pulls `papapalpi/i24-sim-quick:latest` and tags it locally as `i24-sim-quick:latest`.
 
-This is only available if you have access to the RANSOM disk at Vanderbilt - this is a private dataset, and not part of the official INCEPTION release.
-
-In the main folder of the git repo, download the zip file `simulation_dataset.zip`. Unzip the contained folder `simulation_dataset/` into `i24motion_macro_micro` so that its path is `i24motion_macro_micro/simulation_dataset/`
-
-## 3. Launch the container Quick
-
-From any directory:
+To build the image yourself instead of pulling it:
 
 ```bash
-./launch_container.sh            # add --rebuild to run build_container.sh first
+./build_quick_container.sh                                     # this machine's architecture only, loaded locally
+./build_quick_container.sh --push --repo <you>/i24-sim-quick   # amd64 + arm64, pushed to a registry (needs docker login)
 ```
 
-The container is named `i24-sim-24.04` and starts in `/workspaces/carla`. It uses host networking, so CARLA's port
-2000 and the Dash viewer's port 8050 are reachable from the host. Mounts:
+## 2. Download the processed INCEPTION data
 
-| Host | Container |
-|---|---|
-| `i24motion_to_carla/carla-0.9.16` | `/workspaces/carla` |
-| `i24motion_to_carla/UnrealEngine_4.26` | `/workspaces/unreal-engine` |
-| `i24motion_to_carla/i24motion_to_carla` | `/workspaces/i24motion_to_carla` |
-| `i24motion_macro_micro` | `/workspaces/i24motion_macro_micro` |
+This is only available if you have access to the RANSOM disk at Vanderbilt. It is a private dataset, and not part of
+the official INCEPTION release.
 
-The container is started with `--rm`, so it is removed when its first shell exits. To open more shells, for example
-one for CARLA and one for the simulation, run:
+Download `simulation_dataset.zip` into the main folder of the git repo, and unzip the folder it contains into
+`i24motion_macro_micro`, so that its path is `i24motion_macro_micro/simulation_dataset/`.
+
+## 3. Launch the quick container
+
+From the main folder of the git repo:
 
 ```bash
-docker exec -it i24-sim-24.04 bash
+./launch_quick_container.sh          # add --port PORT to serve the Dash viewer on another host port
 ```
 
-If the Unreal editor cannot open a window, allow local X clients on the host with `xhost +local:` and make sure
-`DISPLAY` is set in the shell you launch from.
+The container is named `i24-sim-quick` and opens a shell in `/workspaces/i24motion_macro_micro`. That is the host's
+`i24motion_macro_micro` folder mounted read-write, so results land on the host. The container runs as your host user,
+and its port 8050 is published on the host (default `localhost:8050`).
+
+The container is started with `--rm`, so it is removed when its first shell exits. To open more shells:
+
+```bash
+docker exec -it i24-sim-quick bash
+```
 
 ## 4. Run the simulations (`sim_runs.py`) Quick
 
@@ -331,24 +345,37 @@ SQLite database `run_data/results_final.db`:
 |---|---|---|
 | `run_lwr_triangular()` | `lwr_triangular_<date>.json` | Fully macroscopic LWR over the whole 4 h window. This is the baseline. |
 | `run_sumo()` | `sumo_road(<r>)_timeorigin(<t>)_episodelength(<n>)_<date>.json` | Hybrid LWR + SUMO bubble, for both roads, in 6-minute episodes over the last 3 h |
-| `run_carla()` | `carla_road(...)...` | The same episodes, with CARLA as the micro engine. Needs CARLA running (step 5). |
+| `run_carla()` | `carla_road(...)...` | The same episodes, with CARLA as the micro engine. **Not available in the quick image.** |
 
-Run this in your terminal to generate the simulation data:
+`python3 sim_runs.py` runs all three, and stops with an import error when it reaches `run_carla()`. In the quick
+container, run only the first two:
 
 ```bash
 cd /workspaces/i24motion_macro_micro
-python3 sim_runs.py
+python3 -c "import sim_runs; sim_runs.run_lwr_triangular(); sim_runs.run_sumo()"
 ```
 
 Notes:
 
 - **Start from an empty database.** Run IDs are deterministic, and storing an ID that already exists raises an error.
-  The SUMO and CARLA loops catch that error, print `... Skipping it.`, and move on, so a re-run into an existing
-  database silently keeps the old results. For a fresh reproduction, move the old database aside first:
+  The SUMO loop catches that error, prints `... Skipping it.`, and moves on, so a re-run into an existing database
+  silently keeps the old results. For a fresh reproduction, move the old database aside first:
   `mv run_data/results_final.db run_data/results_final.old.db`. The analysis also expects exactly one LWR baseline per
   dataset.
 - An episode that throws for any other reason is also skipped with the same message. Check the log for `Skipping it.`
   lines before trusting the table.
 - The calibrated triangular fundamental diagram (`v_f`, `w`, `rho_j`) is hard-coded in `sim_runs.py` and in
   `simulation_dataset.py`.
-- To browse a stored run interactively, `sim_demo.py` serves a Dash viewer on port 8050.
+- To watch a long run, open a second shell (`docker exec -it i24-sim-quick bash`) and use `top` or `htop`.
+
+## 5. Browse a run in the Dash viewer (`sim_demo.py`)
+
+```bash
+cd /workspaces/i24motion_macro_micro
+python3 sim_demo.py
+```
+
+By default this runs `run_demo_sumo()`, which simulates a hybrid LWR + SUMO rollout and then serves the viewer. The
+simulation runs before the server starts, so expect a wait. Once Dash reports that the server is running, open
+http://localhost:8050 on the host. `run_demo_carla()` needs the full CARLA container and does not work in the quick
+image.
