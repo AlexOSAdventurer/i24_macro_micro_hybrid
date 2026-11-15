@@ -240,7 +240,7 @@ SQLite database `run_data/results_final.db`:
 | Function | Run IDs | What it runs |
 |---|---|---|
 | `run_lwr_triangular()` | `lwr_triangular_<date>.json` | Fully macroscopic LWR over the whole 4 h window. This is the baseline. |
-| `run_sumo()` | `sumo_road(<r>)_timeorigin(<t>)_episodelength(<n>)_<date>.json` | Hybrid LWR + SUMO bubble, for both roads, in 6-minute episodes over the last 3 h |
+| `run_sumo()` | `sumo_road(<r>)_timeorigin(<t>)_episodelength(<n>)_<date>.json` | Hybrid LWR + SUMO bubble, for both roads, in 10-minute episodes over the last 3 h |
 | `run_carla()` | `carla_road(...)...` | The same episodes, with CARLA as the micro engine. Needs CARLA running (step 5). |
 
 Run this in your terminal to generate the simulation data:
