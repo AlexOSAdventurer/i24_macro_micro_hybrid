@@ -24,6 +24,14 @@ We also cover a quickstart reproduction pipeline for quickly running a coupled S
 3. [Launch the container as per above pipeline](#3-launch-the-container-quick)
 4. [Run the simulations (`sim_runs.py`)](#7-run-the-simulations-sim_runspy-quick)
 
+Once either pipeline is done, [Replicating the ICRA paper results](#replicating-the-icra-paper-results) trains the two
+ring controllers and evaluates them in the coupled I-24 simulation:
+
+1. [Train the Arm 1 and Arm 2 controllers](#1-train-the-arm-1-and-arm-2-controllers)
+2. [Build the evaluation episode pools (`create_spec_pool.sh`)](#2-build-the-evaluation-episode-pools-create_spec_poolsh)
+3. [Run the controllers in the coupled simulation (`simulate_sumo_avc.sh`)](#3-run-the-controllers-in-the-coupled-simulation-simulate_sumo_avcsh)
+4. [Generate the results tables and figures (`analyse_sumo_avc.sh`)](#4-generate-the-results-tables-and-figures-analyse_sumo_avcsh)
+
 ## Repository layout
 
 | Path | Purpose |
@@ -352,3 +360,99 @@ Notes:
 - The calibrated triangular fundamental diagram (`v_f`, `w`, `rho_j`) is hard-coded in `sim_runs.py` and in
   `simulation_dataset.py`.
 - To browse a stored run interactively, `sim_demo.py` serves a Dash viewer on port 8050.
+
+# Replicating the ICRA paper results
+
+This pipeline trains two versions of the AVC ring controller
+([Yan et al., T-ASE 2022](https://arxiv.org/abs/2208.00268); code in
+`i24motion_macro_micro/automatic_vehicular_control/`, ported to gymnasium + sb3-contrib) and evaluates each one as the
+bubble's hero vehicle in the coupled LWR + SUMO simulation, against SUMO's own IDM car-following.
+
+| Arm | Training script | Training rings |
+|---|---|---|
+| **Arm 1** | `train_original.sh` | The published AVC setup: 40 single-lane rings of 230-269 m, with AVC's vehicle and IDM parameters |
+| **Arm 2** | `train_corridor_matched_v4.sh` | The I-24 corridor's calibrated IDM, vehicle length, and speed limit, on 40 rings of 426-498 m, which sweep the same density band AVC trained on (0.57-0.67 of jam density) |
+
+**Prerequisites.** Finish either the full pipeline or the quick-load pipeline above, through a populated
+`i24motion_macro_micro/simulation_dataset/`. The day configs in `i24motion_macro_micro/config/` must also be present.
+The evaluation reads its episodes from `simulation_dataset/` and does not use `run_data/results_final.db`, so
+`sim_runs.py` does not need to have finished. CARLA is not needed. Everything below runs inside the container.
+
+## 1. Train the Arm 1 and Arm 2 controllers
+
+Both training scripts use relative paths, so run them from the `automatic_vehicular_control` directory. Each one
+trains with TRPO for 50 updates over 40 parallel SUMO workers, one per ring size, so it needs a machine with about 40
+cores. Run them one after the other, not at the same time:
+
+```bash
+cd /workspaces/i24motion_macro_micro/automatic_vehicular_control
+bash train_original.sh               # Arm 1 -> run_data/original_run/
+bash train_corridor_matched_v4.sh    # Arm 2 -> run_data/corridor_matched_v4/
+```
+
+Each run directory gets a `models/model-<update>.zip` checkpoint every 5 updates and a `train_results.csv` with the
+training curves. The evaluation uses the final checkpoint, `models/model-50.zip`. If a run is interrupted, rerun the
+same script and it resumes from its latest checkpoint.
+
+## 2. Build the evaluation episode pools (`create_spec_pool.sh`)
+
+```bash
+cd /workspaces/i24motion_macro_micro
+./create_spec_pool.sh
+```
+
+This splits every day in `config/` into non-overlapping episodes and writes two pools to `run_data/rl/spec_data/`:
+
+- `data_full_no_counterfactual.pkl.gz` holds every episode.
+- `data_full_inband_057_068.pkl.gz` holds the episodes whose initial density at the bubble's start position is
+  0.57-0.68 of jam density. Density is measured over cells 2-4 (200-500 m) and averaged over lanes. That range is
+  congested and string-unstable for the corridor IDM, and it covers the band both controllers trained on. The
+  evaluation runs on this pool.
+
+The episode length and the other sampling settings come from the `EnvConfig` defaults in `sim_rl_sumo_training.py`.
+Rebuild the pools whenever those defaults change. Each run overwrites both pools.
+
+## 3. Run the controllers in the coupled simulation (`simulate_sumo_avc.sh`)
+
+```bash
+cd /workspaces/i24motion_macro_micro
+./simulate_sumo_avc.sh
+```
+
+For each arm, this runs every episode in the in-band pool twice: once with the trained controller (`trpo`) driving the
+hero, and once with SUMO's IDM (`sumo`) driving it. Each controller episode therefore has a paired reference with the
+same initial conditions. Both arms use a 0.1 s control step, a hero `minGap` of 0 (as on the ring), and the policy's
+mean action. Each arm normalises its observations the way it was trained: speed is divided by 10 m/s for Arm 1 and by
+25.02 m/s for Arm 2, and gap is divided by 300 m for both.
+
+The script reads the two `model-50.zip` checkpoints from step 1 and writes:
+
+| Output | Contents |
+|---|---|
+| `run_data/rl/analysis/avc_original/` and `avc_original.log` | Arm 1 and its paired SUMO IDM runs |
+| `run_data/rl/analysis/avc_corridor/` and `avc_corridor.log` | Arm 2 and its paired SUMO IDM runs |
+
+Each output directory holds `episodes.csv`, the per-step and per-vehicle `traces/`, and the stored `rollouts/`. Check
+both `.log` files for failed episodes before going on.
+
+## 4. Generate the results tables and figures (`analyse_sumo_avc.sh`)
+
+Run this after both simulations in step 3 have finished:
+
+```bash
+cd /workspaces/i24motion_macro_micro
+./analyse_sumo_avc.sh
+```
+
+This compares three arms on the same episodes: **SUMO IDM** (the paired reference, taken from `avc_original`),
+**Arm-1**, and **Arm-2**. The summary metrics skip the first 30 s of each episode, and speed oscillation is measured
+over a rolling 10 s window. The outputs go to `run_data/rl/analysis/stability/`, and the log goes to
+`run_data/rl/analysis/stability.log`:
+
+| Output | Contents |
+|---|---|
+| `tables/summary_statistics.tex` | The paper's summary table, as median [min, max] per arm. `summary_statistics.csv` has the same numbers. |
+| `tables/paired_vs_reference.csv` | Each arm's paired differences against SUMO IDM, with a bootstrap 95% interval and a Wilcoxon p-value |
+| `tables/episode_metrics.csv` | Every summary metric for every arm and episode |
+| `tables/oscillation_timeseries.csv`, `tables/binned_variance_ratio.csv` | The data behind the figures |
+| `figures/timeseries/` | Speed variance and link ratio by position along the hero's lane, and the binned variance ratios (`.png` and `.pdf`) |
