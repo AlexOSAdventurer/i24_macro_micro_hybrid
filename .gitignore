@@ -28,6 +28,7 @@ i24motion_macro_micro/simulation_dataset/
 i24motion_macro_micro/simplified_scenario_tests/verification_results*/
 i24motion_macro_micro/simplified_scenario_tests/figure_runs*/
 i24motion_macro_micro/run_data/
+i24motion_macro_micro/automatic_vehicular_control/run_data/
 i24motion_macro_micro/junk_output/
 
 # Scratch

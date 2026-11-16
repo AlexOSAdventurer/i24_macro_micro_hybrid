@@ -1,0 +1,15 @@
+# Matches the i24-sim-22.04 container (see i24motion_macro_micro/requirements.txt, which pins the same versions).
+gymnasium==1.3.0
+stable-baselines3==2.9.0
+sb3-contrib==2.9.0
+traci
+sumolib
+pyyaml
+numpy
+scipy
+pandas
+matplotlib
+tqdm
+jupyter
+tensorboard
+# ray is only needed by the legacy training loop (backend='legacy') with more than one worker

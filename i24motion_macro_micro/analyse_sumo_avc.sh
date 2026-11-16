@@ -12,7 +12,7 @@ cd "$(dirname "$0")"
 
 OUT=run_data/rl/analysis/stability
 mkdir -p "$OUT"
-python3 sim_rl_sumo_analysis_2.py \
+python3 sim_rl_sumo_analysis.py \
   --arm "SUMO IDM=run_data/rl/analysis/avc_original:sumo" \
   --arm "Arm-1=run_data/rl/analysis/avc_original:trpo" \
   --arm "Arm-2=run_data/rl/analysis/avc_corridor:trpo" \

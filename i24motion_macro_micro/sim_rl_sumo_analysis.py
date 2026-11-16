@@ -1,310 +1,387 @@
-"""Analysis of the RL hero-controller runs produced by sim_rl_sumo_training/demo.
+"""Hero, lane and corridor metrics for the ring controllers, from the per-vehicle traces.
 
-Three things get analysed, from three sources on disk:
+Compares three arms on the same episode specs -- by default SUMO IDM (the ``sumo`` hero),
+the published AVC ring controller and the corridor-matched one -- using what
+sim_rl_sumo_demo.py writes per episode:
 
-  training progress   ``<run>/progress.csv`` (SB3's logger) and
-                      ``<run>/monitor_*.monitor.csv`` (one row per episode) --
-                      learning curves for the return and for the traffic
-                      quantities the reward is built out of.
-  controller results  ``<demo>/episodes.csv`` -- every controller replayed on the
-                      same episode specs, so the comparison is paired and a
-                      signed-rank test on the per-episode differences is the
-                      right test rather than an unpaired one across noisy days.
-  single episodes     ``<demo>/traces/<controller>_<index>.csv`` -- the hero's
-                      speed, acceleration and the macroscopic velocity ahead of
-                      the bubble, which is where you can see whether a
-                      controller is actually reacting to the downstream state or
-                      just to its leader.
+  <demo>/traces/vehicles/<controller>_<episode>.parquet   every bubble vehicle, every step
+  <demo>/traces/<controller>_<episode>.csv                 per-step record (upstream/downstream flow)
+  <demo>/episodes.csv                                      spec identity (dataset, start_time)
 
-This module imports neither SUMO, gymnasium nor stable-baselines3 -- it reads
-only the CSVs the other two leave behind -- but it still runs in the container
-like everything else in this project::
+Positions in the hero's lane are ranked by ``s`` on each side of the hero at every step and
+followed as series, whoever occupies them.  The chain is set by LEADERS and FOLLOWERS, currently
 
-    docker exec <container> bash -lc \\
-        'cd /workspaces/i24motion_macro_micro && python3.10 sim_rl_sumo_analysis.py \\
-             --run run_data/rl/ppo_smoothing --demo run_data/rl/ppo_smoothing/demo --latex'
+  L1  H  F1 F2 F3        (leader ahead, hero, followers behind)
 
-It is algorithm-agnostic: RecurrentPPO, PPO and TRPO runs log the same rollout/
-and episode/ series, and figure titles name which one a run used so the
-recurrent/memoryless ablation and the TRPO runs can be told apart.
+SUMMARY TABLE (one value per episode over the window step * dt >= --skip-s, default 30 s,
+then median [min, max] across episodes per arm):
 
-Figures land in ``<out>/figures`` and LaTeX tables in ``<out>/tables``, matching
-how ``sim_analysis.py`` reports the macroscopic model comparison.
+  hero_speed           mean hero speed (m/s)
+  hero_gap             median space gap to L1, L1.s - (H.s + H.length) (m)
+  <first>_var          speed variance of the first position in the chain (m^2/s^2), reported raw
+  <position>_link      for every later position: var(position) / var(vehicle directly ahead of
+                       it), over the steps where both are present; below 1 attenuates
+  cumulative_<last>_<first>  var(last) / var(first), over the steps where both are present
+  cutins_ahead         vehicles entering the hero's lane directly ahead of it (count)
+  upstream_flow        flow rho*v in the macro cell behind the bubble, lane-averaged (veh/h/lane)
+  downstream_flow      same, in the cell ahead of the bubble
+
+A variance needs at least --min-samples-s of shared samples, and a ratio a leader variance
+above 1e-6; otherwise the episode is left out of that row, and n says how many remain.
+
+SPEED OSCILLATION TIME SERIES (every step, whole episode): rolling speed variance per position
+over a centred --oscillation-window-s window, and the rolling link ratio against the vehicle
+ahead.  Figures show the median across episodes with the interquartile range, one colour per
+arm, the excluded start of the episode shaded.
+
+BINNED VARIANCE RATIOS (summary window only): each pair in BINNED_RATIOS (H/L1, F1/H, F2/F1, F3/F2,
+F3/L1) as var(numerator)/var(denominator) per --bin-s bin (default 5 s), over the steps of the bin
+where both are present (at least half the bin); below 1 attenuates.  Figures show the median per
+bin with IQR whiskers.
+
+Paired effects against the reference arm (per metric, per spec) are kept alongside, with a
+bootstrap 95% interval over 15-minute clock bins: adjacent tiles in the same bin share a jam.
+
+Outputs under --out:
+  tables/episode_metrics.csv          every summary metric, every arm and episode
+  tables/summary_statistics.csv       median, min, max and n per metric and arm
+  tables/summary_statistics.tex       the paper table, median [min, max]
+  tables/paired_vs_reference.csv      paired differences, bin-bootstrap interval, Wilcoxon p
+  tables/oscillation_timeseries.csv   per-step median, quartiles and n per arm and position
+  tables/binned_variance_ratio.csv    per-bin median, quartiles and n per arm and ratio
+  figures/timeseries/                 variance and link ratio by position, binned variance ratios (.png/.pdf)
 """
 from __future__ import annotations
 
 import argparse
 import glob
 import os
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-DEFAULT_RUN_ROOT = os.path.join(HERE, "run_data", "rl")
+# The chain is set by these two lists alone; every row, caption and figure is derived from them.
+# L3..F5 left L3 and F5 unoccupied in many episodes, and unequally across arms (a long AVC gap
+# pushes L3 out of the bubble, a fast IDM hero leaves F5 behind it), so the chain is L1..F3.
+# LEADERS = ["L3", "L2", "L1"]
+# FOLLOWERS = ["F1", "F2", "F3", "F4", "F5"]
+LEADERS = ["L1"]
+FOLLOWERS = ["F1", "F2", "F3"]
+POSITIONS = LEADERS + ["H"] + FOLLOWERS          # each entry's leader is the one before it
+LINKS = POSITIONS[1:]                            # positions with a leader in the chain
+FIRST, LAST = POSITIONS[0], POSITIONS[-1]        # chain ends: FIRST reported raw, cumulative LAST / FIRST
+# Binned speed-variance ratios over the summary window, (numerator, denominator) in panel order.
+# Every pair is rear vehicle / vehicle ahead of it, as in the table's link rows, so every panel reads
+# "below 1 attenuates".
+# BINNED_RATIOS = [("H", "L1"), ("H", "F1"), ("F1", "F2"), ("F2", "F3"), ("F3", "L1")]
+BINNED_RATIOS = [("H", "L1"), ("F1", "H"), ("F2", "F1"), ("F3", "F2"), ("F3", "L1")]
+BIN_S = 900.0
+MIN_LEADER_VARIANCE = 1e-6
 
+DEFAULT_ARMS = [
+    "SUMO IDM=run_data/rl/analysis/avc_original:sumo",
+    "Arm-1=run_data/rl/analysis/avc_original:trpo",     # published AVC ring controller
+    "Arm-2=run_data/rl/analysis/avc_corridor:trpo",     # corridor-matched AVC controller
+]
+# The default palette's first three categorical slots, assigned in this fixed order.
+ARM_COLOURS = ["#2a78d6", "#eb6834", "#1baf7a"]
 
-# ---------------------------------------------------------------------------
-# Metric vocabulary
-# ---------------------------------------------------------------------------
-
-# Every metric with the direction that counts as better, its units, and how it
-# is written in a figure axis and in a LaTeX table.  "higher" for the things a
-# smoothing controller is supposed to increase, "lower" for the costs.
-METRICS: Dict[str, Dict[str, Any]] = {
-    "return": {
-        "better": "higher", "unit": "", "label": "Episode return", "latex": "Return",
-    },
-    "hero_mean_speed": {
-        "better": "higher", "unit": "m/s", "label": "Hero speed", "latex": "Hero $\\bar{v}$",
-    },
-    "platoon_mean_speed": {
-        "better": "higher", "unit": "m/s", "label": "Platoon speed", "latex": "Platoon $\\bar{v}$",
-    },
-    "platoon_speed_std": {
-        "better": "lower", "unit": "m/s", "label": "Platoon speed spread", "latex": "Platoon $\\sigma_v$",
-    },
-    "acceleration_rms": {
-        "better": "lower", "unit": "m/s$^2$", "label": "Acceleration RMS", "latex": "$a_{\\mathrm{rms}}$",
-    },
-    "jerk_rms": {
-        "better": "lower", "unit": "m/s$^3$", "label": "Jerk RMS", "latex": "$j_{\\mathrm{rms}}$",
-    },
-    "min_headway": {
-        "better": "higher", "unit": "s", "label": "Minimum time headway", "latex": "$h_{\\min}$",
-    },
-    "energy_per_metre": {
-        "better": "lower", "unit": "J/m", "label": "Tractive energy", "latex": "Energy",
-    },
-}
-
-DEFAULT_TABLE_METRICS = (
-    "return", "platoon_mean_speed", "platoon_speed_std", "acceleration_rms",
-    "jerk_rms", "min_headway", "energy_per_metre",
+# (metric, LaTeX label, decimals) in table order.
+TABLE_ROWS: List[Tuple[str, str, int]] = (
+    [("hero_speed", "Speed (m/s)", 1), ("hero_gap", "Gap to leader (m)", 1),
+     (f"{FIRST}_var", f"{FIRST} $\\sigma_v^2$ (m$^2$/s$^2$)", 1)]
+    + [(f"{p}_link", f"{p} / {POSITIONS[POSITIONS.index(p) - 1]}", 1) for p in LINKS]
+    + [(f"cumulative_{LAST}_{FIRST}", f"Cumulative {LAST} / {FIRST}", 1),
+       ("cutins_ahead", "Cut-ins ahead of hero", 1),
+       ("upstream_flow", "Upstream flow (veh/h/lane)", 0),
+       ("downstream_flow", "Downstream flow (veh/h/lane)", 0)]
 )
-
-CONTROLLER_DISPLAY_NAMES = {
-    "ppo": "PPO",
-    "trpo": "TRPO",
-    "sumo": "SUMO (uncontrolled)",
-    "idm": "IDM",
-    "follower_stopper": "FollowerStopper",
-    "macro_lookahead": "Macro lookahead",
-}
-
-# Training-log series worth a learning curve, keyed by their column in SB3's
-# progress.csv.
-LEARNING_CURVE_SERIES = (
-    ("rollout/ep_rew_mean", "Episode return"),
-    ("rollout/ep_len_mean", "Episode length (steps)"),
-    ("episode/platoon_mean_speed", "Platoon speed (m/s)"),
-    ("episode/platoon_speed_std", "Platoon speed spread (m/s)"),
-    ("episode/jerk_rms", "Jerk RMS (m/s$^3$)"),
-    ("episode/energy_per_metre", "Tractive energy (J/m)"),
-    ("episode/min_headway", "Minimum time headway (s)"),
-    ("episode/fraction_completed", "Episodes reaching the corridor end"),
-)
+TABLE_SECTIONS = {"hero_speed": "Hero", f"{FIRST}_var": "Speed oscillation along the hero's lane",
+                  "cutins_ahead": "Lane and corridor"}
 
 
 # ---------------------------------------------------------------------------
-# Loading
+# Per-episode reconstruction
 # ---------------------------------------------------------------------------
 
 
-def run_label(run_dir: str) -> str:
-    """``<name> (<algorithm>)`` for figure titles.
-
-    Naming the algorithm matters once recurrent and memoryless runs of the same
-    configuration sit side by side: the two are otherwise indistinguishable from
-    their logs, and comparing them is the point of the ``--algorithm ppo``
-    ablation.
-    """
-    name = os.path.basename(os.path.normpath(run_dir))
-    config_path = os.path.join(run_dir, "run_config.json")
-    if (os.path.isfile(config_path)):
-        try:
-            import json
-
-            with open(config_path, "r") as handle:
-                algorithm = json.load(handle).get("train", {}).get("algorithm")
-            if (algorithm):
-                return f"{name} ({algorithm})"
-        except Exception:
-            pass
-    return name
-
-
-def load_progress(run_dir: str) -> pd.DataFrame:
-    """SB3's per-update log. Empty frame when a run has not logged one yet."""
-    path = os.path.join(run_dir, "progress.csv")
-    if (not os.path.isfile(path)):
-        return pd.DataFrame()
-    frame = pd.read_csv(path)
-    if ("time/total_timesteps" in frame.columns):
-        frame = frame.sort_values("time/total_timesteps")
-    return frame
+def positional_wide(vehicles: pd.DataFrame) -> Tuple[Dict[str, pd.DataFrame], float]:
+    """Per-step tables (index step, columns POSITIONS) of speed, s, length and prev_lane, plus dt."""
+    dt = float(np.median(np.diff(np.sort(vehicles["time"].unique()))))
+    v = vehicles.sort_values(["vehicle_id", "step"]).reset_index(drop=True)
+    same_vehicle = v["vehicle_id"].eq(v["vehicle_id"].shift()) & v["step"].eq(v["step"].shift() + 1)
+    v["prev_lane"] = v["lane_id"].shift().where(same_vehicle)
+    hero = v[v["is_hero"]].set_index("step")[["s", "lane_id"]].rename(columns={"s": "hero_s", "lane_id": "hero_lane"})
+    v = v.join(hero, on="step")
+    lane = v[(~v["is_hero"]) & (v["lane_id"] == v["hero_lane"])]
+    ahead = lane[lane["s"] > lane["hero_s"]].copy()
+    behind = lane[lane["s"] < lane["hero_s"]].copy()
+    ahead["rank"] = ahead.groupby("step")["s"].rank(method="first", ascending=True)
+    behind["rank"] = behind.groupby("step")["s"].rank(method="first", ascending=False)
+    ahead = ahead[ahead["rank"] <= len(LEADERS)].assign(position=lambda f: "L" + f["rank"].astype(int).astype(str))
+    behind = behind[behind["rank"] <= len(FOLLOWERS)].assign(position=lambda f: "F" + f["rank"].astype(int).astype(str))
+    hero_rows = v[v["is_hero"]].assign(position="H")
+    long = pd.concat([ahead, hero_rows, behind], ignore_index=True)
+    steps = np.arange(int(vehicles["step"].min()), int(vehicles["step"].max()) + 1)
+    wide = {
+        field: long.pivot_table(index="step", columns="position", values=field, aggfunc="first")
+        .reindex(index=steps, columns=POSITIONS)
+        for field in ("speed", "s", "length", "prev_lane", "hero_lane")
+    }
+    wide["hero_lane"] = hero["hero_lane"].reindex(steps)
+    return wide, dt
 
 
-def load_monitor_episodes(run_dir: str) -> pd.DataFrame:
-    """Every training episode, concatenated across the vectorised workers.
-
-    Monitor writes a json header line before its own header row, hence
-    ``skiprows=1``; ``t`` is seconds since that worker started, so the frames are
-    ordered by it within a worker and pooled across workers afterwards.
-    """
-    frames = []
-    for path in sorted(glob.glob(os.path.join(run_dir, "monitor_*.monitor.csv"))):
-        try:
-            frame = pd.read_csv(path, skiprows=1)
-        except Exception as exc:
-            print(f"WARNING: could not read {path}: {exc}")
-            continue
-        frame["worker"] = os.path.basename(path).split(".")[0]
-        frames.append(frame)
-    if (len(frames) == 0):
-        return pd.DataFrame()
-    episodes = pd.concat(frames, ignore_index=True).sort_values("t").reset_index(drop=True)
-    # A pooled step axis: episodes finish interleaved across workers, so the
-    # cumulative length in completion order is the closest thing to "how much
-    # experience had been collected when this episode ended".
-    episodes["cumulative_steps"] = episodes["l"].cumsum()
-    return episodes
+def _variance(values: pd.Series, min_samples: int) -> float:
+    values = values.dropna()
+    return float(values.var(ddof=0)) if (len(values) >= min_samples) else float("nan")
 
 
-def load_demo_episodes(demo_dir: str) -> pd.DataFrame:
-    path = demo_dir if (os.path.isfile(demo_dir)) else os.path.join(demo_dir, "episodes.csv")
-    if (not os.path.isfile(path)):
-        raise FileNotFoundError(f"no episodes.csv at {path}; run sim_rl_sumo_demo.py first")
-    return pd.read_csv(path)
+def _pair_ratio(numerator: pd.Series, denominator: pd.Series, min_samples: int) -> float:
+    both = numerator.notna() & denominator.notna()
+    if (both.sum() < min_samples):
+        return float("nan")
+    top, bottom = _variance(numerator[both], min_samples), _variance(denominator[both], min_samples)
+    return top / bottom if (np.isfinite(top) and np.isfinite(bottom) and (bottom > MIN_LEADER_VARIANCE)) else float("nan")
 
 
-def load_traces(demo_dir: str) -> Dict[Tuple[str, int], pd.DataFrame]:
-    """Per-step traces keyed by (controller, episode index)."""
-    traces: Dict[Tuple[str, int], pd.DataFrame] = {}
-    for path in sorted(glob.glob(os.path.join(demo_dir, "traces", "*.csv"))):
-        name = os.path.splitext(os.path.basename(path))[0]
-        controller, _, index = name.rpartition("_")
+def episode_metrics(
+    vehicles: pd.DataFrame, trace: Optional[pd.DataFrame], args
+) -> Tuple[Dict[str, float], pd.DataFrame, List[Dict[str, float]]]:
+    """Summary metrics over the window, the per-step oscillation series over the whole episode, and
+    the BINNED_RATIOS per --bin-s bin of the window."""
+    wide, dt = positional_wide(vehicles)
+    speed = wide["speed"]
+    in_window = (speed.index.to_numpy() * dt) >= (args.skip_s - 1e-9)
+    min_samples = max(2, int(round(args.min_samples_s / dt)))
+    w = {field: table[in_window] for field, table in wide.items() if isinstance(table, pd.DataFrame)}
+    hero_lane = wide["hero_lane"][in_window]
+
+    out: Dict[str, float] = {}
+    out["hero_speed"] = float(w["speed"]["H"].mean())
+    gap = w["s"]["L1"] - (w["s"]["H"] + w["length"]["H"])
+    out["hero_gap"] = float(gap.median()) if gap.notna().any() else float("nan")
+    out[f"{FIRST}_var"] = _variance(w["speed"][FIRST], min_samples)
+    for p in LINKS:
+        leader = POSITIONS[POSITIONS.index(p) - 1]
+        out[f"{p}_link"] = _pair_ratio(w["speed"][p], w["speed"][leader], min_samples)
+    out[f"cumulative_{LAST}_{FIRST}"] = _pair_ratio(w["speed"][LAST], w["speed"][FIRST], min_samples)
+    entered = w["prev_lane"]["L1"].notna() & (w["prev_lane"]["L1"] != hero_lane)
+    out["cutins_ahead"] = float(entered.sum())
+    for side in ("upstream", "downstream"):
+        column = f"{side}_flow"
+        if (trace is not None) and (column in trace.columns):
+            late = trace[(trace["step"] * dt) >= (args.skip_s - 1e-9)][column]
+            out[column] = float(late.mean()) if late.notna().any() else float("nan")
+        else:
+            out[column] = float("nan")
+
+    window = max(2, int(round(args.oscillation_window_s / dt)))
+    rolling = speed.rolling(window, center=True, min_periods=max(2, window // 2)).var(ddof=0)
+    series = rolling.copy()
+    series.columns = [f"{p}_var" for p in POSITIONS]
+    for p in LINKS:
+        leader = POSITIONS[POSITIONS.index(p) - 1]
+        denominator = rolling[leader].where(rolling[leader] > MIN_LEADER_VARIANCE)
+        series[f"{p}_link"] = rolling[p] / denominator
+    series.insert(0, "time_s", series.index.to_numpy() * dt)
+
+    # Variance ratios per bin of the summary window, each over the steps of that bin where both
+    # vehicles are present; a bin needs at least half of its samples shared.
+    binned: List[Dict[str, float]] = []
+    elapsed = speed.index.to_numpy() * dt
+    bin_samples = max(2, int(round(0.5 * args.bin_s / dt)))
+    end_s = float(elapsed.max())
+    start = args.skip_s
+    while (start < end_s - 1e-9):
+        stop = start + args.bin_s
+        in_bin = (elapsed >= start - 1e-9) & (elapsed < stop - 1e-9)
+        for top, bottom in BINNED_RATIOS:
+            binned.append({
+                "ratio": f"{top}/{bottom}", "bin_start_s": start, "bin_end_s": stop,
+                "value": _pair_ratio(speed[top][in_bin], speed[bottom][in_bin], bin_samples),
+            })
+        start = stop
+    return out, series, binned
+
+
+# ---------------------------------------------------------------------------
+# Arms
+# ---------------------------------------------------------------------------
+
+
+def parse_arm(text: str) -> Tuple[str, str, str]:
+    label, _, target = text.partition("=")
+    demo, _, controller = target.rpartition(":")
+    if (not label) or (not demo) or (not controller):
+        raise ValueError(f"--arm {text!r} is not LABEL=DEMO_DIR:CONTROLLER")
+    return label.strip(), demo if os.path.isabs(demo) else os.path.join(HERE, demo), controller
+
+
+def load_arm(label: str, demo: str, controller: str, args) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    episodes = pd.read_csv(os.path.join(demo, "episodes.csv"))
+    rows, series, binned = [], [], []
+    for path in sorted(glob.glob(os.path.join(demo, "traces", "vehicles", f"{controller}_*.parquet"))):
+        index = os.path.splitext(os.path.basename(path))[0].rpartition("_")[2]
         if (not index.isdigit()):
             continue
-        traces[(controller, int(index))] = pd.read_csv(path)
-    return traces
+        trace_path = os.path.join(demo, "traces", f"{controller}_{index}.csv")
+        trace = pd.read_csv(trace_path) if os.path.isfile(trace_path) else None
+        metrics, per_step, per_bin = episode_metrics(pd.read_parquet(path), trace, args)
+        match = episodes[(episodes["controller"] == controller) & (episodes["episode"] == int(index))]
+        if (not match.empty):
+            metrics["dataset"] = str(match.iloc[0]["dataset"])
+            metrics["start_time"] = float(match.iloc[0]["start_time"])
+        metrics.update({"arm": label, "episode": int(index)})
+        rows.append(metrics)
+        series.append(per_step.assign(arm=label, episode=int(index)))
+        binned.extend({**row, "arm": label, "episode": int(index)} for row in per_bin)
+    if (not rows):
+        raise FileNotFoundError(f"no traces/vehicles/{controller}_*.parquet under {demo}")
+    return (pd.DataFrame(rows), pd.concat(series, ignore_index=False).rename_axis("step").reset_index(),
+            pd.DataFrame(binned))
 
 
 # ---------------------------------------------------------------------------
-# Statistics
+# Tables
 # ---------------------------------------------------------------------------
 
 
-def summarize_controllers(
-    episodes: pd.DataFrame, metrics: Sequence[str] = DEFAULT_TABLE_METRICS
-) -> pd.DataFrame:
-    """Mean, standard deviation and episode count per controller."""
+def summary_statistics(frame: pd.DataFrame, arms: Sequence[str]) -> pd.DataFrame:
     rows = []
-    for controller, group in episodes.groupby("controller", sort=False):
-        row: Dict[str, Any] = {"controller": controller, "episodes": len(group)}
-        for metric in metrics:
-            if (metric not in group.columns):
-                continue
-            values = pd.to_numeric(group[metric], errors="coerce").dropna()
-            row[f"{metric}_mean"] = float(values.mean()) if (len(values) > 0) else float("nan")
-            row[f"{metric}_std"] = float(values.std(ddof=0)) if (len(values) > 0) else float("nan")
+    for metric, _, _ in TABLE_ROWS:
+        row: Dict[str, object] = {"metric": metric}
+        for arm in arms:
+            values = pd.to_numeric(frame.loc[frame["arm"] == arm, metric], errors="coerce").dropna()
+            row[f"{arm} median"] = float(values.median()) if len(values) else float("nan")
+            row[f"{arm} min"] = float(values.min()) if len(values) else float("nan")
+            row[f"{arm} max"] = float(values.max()) if len(values) else float("nan")
+            row[f"{arm} n"] = int(len(values))
         rows.append(row)
     return pd.DataFrame(rows)
 
 
-def paired_differences(
-    episodes: pd.DataFrame,
-    controller: str,
-    reference: str,
-    metric: str,
-) -> Optional[np.ndarray]:
-    """Per-episode ``controller - reference`` differences on the shared specs.
-
-    Controllers are replayed on identical episode specs by the demo, so pairing
-    on the episode index removes the day-to-day variance that otherwise swamps
-    any controller effect -- across the corridor, the difference between a busy
-    minute and a quiet one is far larger than the difference between two
-    controllers on the same minute.
-    """
-    if ((metric not in episodes.columns) or ("episode" not in episodes.columns)):
-        return None
-    left = episodes[episodes["controller"] == controller].set_index("episode")[metric]
-    right = episodes[episodes["controller"] == reference].set_index("episode")[metric]
-    shared = left.index.intersection(right.index)
-    if (len(shared) == 0):
-        return None
-    return (
-        pd.to_numeric(left.loc[shared], errors="coerce")
-        - pd.to_numeric(right.loc[shared], errors="coerce")
-    ).dropna().to_numpy()
+def _fmt(value: float, decimals: int) -> str:
+    return "--" if (not np.isfinite(value)) else f"{value:.{decimals}f}"
 
 
-def paired_test(differences: np.ndarray) -> Dict[str, float]:
-    """Wilcoxon signed-rank on the paired differences, with the mean effect.
+def latex_table(summary: pd.DataFrame, arms: Sequence[str], args) -> str:
+    counts = sorted({int(summary[f"{arm} n"].max()) for arm in arms})
+    lines = [
+        "% Preamble: \\usepackage{booktabs}",
+        # Median on the first line, [min, max] in a smaller font below it, to keep the columns narrow.
+        # "\\providecommand{\\mmm}[3]{#1\\,[#2,\\,#3]}",
+        "\\providecommand{\\mmm}[3]{\\begin{tabular}[t]{@{}c@{}}#1\\\\[-2pt]{\\scriptsize[#2,\\,#3]}\\end{tabular}}",
+        "\\begin{table}[t]",
+        "\\centering",
+        "\\caption{Hero, lane, and corridor metrics on the in-band I-24 episodes "
+        f"({'/'.join(str(c) for c in counts)} episodes, {args.skip_s:g}--end\\,s of each episode). "
+        "Each cell is the median over episodes, with [min, max] below it. Link rows are the speed variance of a "
+        f"vehicle in the hero's lane divided by that of the vehicle directly ahead of it ({FIRST} is "
+        "reported raw); values below 1 attenuate. "
+        f"Cumulative is $\\sigma_v^2(\\mathrm{{{LAST}}})/\\sigma_v^2(\\mathrm{{{FIRST}}})$. "
+        "Flow is $\\rho v$ in the macroscopic cell behind or ahead of the bubble, averaged over the four lanes.}",
+        "\\label{tab:controller_metrics}",
+        "\\footnotesize",
+        "\\setlength{\\tabcolsep}{3pt}",
+        "\\begin{tabular}{l" + "c" * len(arms) + "}",
+        "\\toprule",
+        " & " + " & ".join(arms) + " \\\\",
+    ]
+    indexed = summary.set_index("metric")
+    for metric, label, decimals in TABLE_ROWS:
+        if (metric in TABLE_SECTIONS):
+            lines.append("\\midrule")
+            lines.append(f"\\multicolumn{{{len(arms) + 1}}}{{l}}{{\\textit{{{TABLE_SECTIONS[metric]}}}}} \\\\")
+        row = indexed.loc[metric]
+        cells = [
+            f"\\mmm{{{_fmt(row[f'{arm} median'], decimals)}}}{{{_fmt(row[f'{arm} min'], decimals)}}}"
+            f"{{{_fmt(row[f'{arm} max'], decimals)}}}"
+            for arm in arms
+        ]
+        lines.append(f"{label} & " + " & ".join(cells) + " \\\\")
+    lines += ["\\bottomrule", "\\end{tabular}", "\\end{table}"]
+    return "\n".join(lines) + "\n"
 
-    Signed-rank rather than a t-test because a handful of episodes is not enough
-    to lean on normality, and the metric distributions here are visibly skewed
-    (a single jam dominates the energy and headway columns).
-    """
-    result = {
-        "n": float(len(differences)),
-        "mean": float(np.mean(differences)) if (len(differences) > 0) else float("nan"),
-        "median": float(np.median(differences)) if (len(differences) > 0) else float("nan"),
-        "p_value": float("nan"),
-    }
-    if (len(differences) < 5) or np.allclose(differences, 0.0):
-        # Below about five pairs the signed-rank test cannot reach any useful
-        # p-value, so report the effect and leave the column empty.
-        return result
-    try:
-        from scipy.stats import wilcoxon
 
-        result["p_value"] = float(wilcoxon(differences).pvalue)
-    except Exception as exc:
-        print(f"WARNING: could not run the signed-rank test: {exc}")
-    return result
+def bootstrap_ci(differences: np.ndarray, clusters: np.ndarray, reps: int, rng) -> Tuple[float, float]:
+    labels = np.unique(clusters)
+    if (len(labels) < 2):
+        return float("nan"), float("nan")
+    groups = [differences[clusters == label] for label in labels]
+    means = np.empty(reps)
+    for r in range(reps):
+        pick = rng.integers(0, len(groups), size=len(groups))
+        means[r] = np.concatenate([groups[i] for i in pick]).mean()
+    low, high = np.percentile(means, [2.5, 97.5])
+    return float(low), float(high)
 
 
-def compare_to_reference(
-    episodes: pd.DataFrame,
-    reference: str = "sumo",
-    metrics: Sequence[str] = DEFAULT_TABLE_METRICS,
-) -> pd.DataFrame:
-    """Paired effect of every controller against ``reference``, per metric."""
-    controllers = [c for c in episodes["controller"].unique() if (c != reference)]
+def paired_vs_reference(frame: pd.DataFrame, arms: Sequence[str], reps: int, seed: int) -> pd.DataFrame:
+    from scipy.stats import wilcoxon
+
+    rng = np.random.default_rng(seed)
+    reference = arms[0]
+    ref = frame[frame["arm"] == reference].set_index("episode")
     rows = []
-    for controller in controllers:
-        for metric in metrics:
-            differences = paired_differences(episodes, controller, reference, metric)
-            if (differences is None) or (len(differences) == 0):
+    for arm in arms[1:]:
+        test = frame[frame["arm"] == arm].set_index("episode")
+        shared = test.index.intersection(ref.index)
+        if ("start_time" in ref.columns) and ("start_time" in test.columns):
+            mismatched = (test.loc[shared, "start_time"] != ref.loc[shared, "start_time"]).sum()
+            if (mismatched):
+                print(f"WARNING: {arm} and {reference} disagree on the spec of {mismatched} episode(s); pairing by index anyway")
+        clusters = (ref.loc[shared, "dataset"].astype(str) + "_"
+                    + (ref.loc[shared, "start_time"] // BIN_S).astype(int).astype(str))
+        for metric, _, _ in TABLE_ROWS:
+            a = pd.to_numeric(test.loc[shared, metric], errors="coerce")
+            b = pd.to_numeric(ref.loc[shared, metric], errors="coerce")
+            keep = a.notna() & b.notna()
+            if (keep.sum() == 0):
                 continue
-            statistics = paired_test(differences)
-            reference_values = pd.to_numeric(
-                episodes[episodes["controller"] == reference][metric], errors="coerce"
-            ).dropna()
-            baseline = float(reference_values.mean()) if (len(reference_values) > 0) else float("nan")
+            d = (a[keep] - b[keep]).to_numpy()
+            low, high = bootstrap_ci(d, clusters[keep].to_numpy(), reps, rng)
+            try:
+                p_value = float(wilcoxon(d).pvalue) if ((len(d) >= 5) and (not np.allclose(d, 0.0))) else float("nan")
+            except ValueError:
+                p_value = float("nan")
             rows.append({
-                "controller": controller,
-                "metric": metric,
-                "n": statistics["n"],
-                "mean_difference": statistics["mean"],
-                "median_difference": statistics["median"],
-                "percent_change": (
-                    100.0 * statistics["mean"] / baseline if (abs(baseline) > 1e-12) else float("nan")
-                ),
-                "p_value": statistics["p_value"],
-                "improved": _is_improvement(metric, statistics["mean"]),
+                "arm": arm, "reference": reference, "metric": metric, "n": int(keep.sum()),
+                "clusters": int(clusters[keep].nunique()), "median_difference": float(np.median(d)),
+                "mean_difference": float(d.mean()), "ci_low": low, "ci_high": high,
+                "ci_excludes_zero": bool(np.isfinite(low) and ((low > 0.0) or (high < 0.0))), "p_value": p_value,
             })
     return pd.DataFrame(rows)
 
 
-def _is_improvement(metric: str, difference: float) -> bool:
-    if (not np.isfinite(difference)):
-        return False
-    better = METRICS.get(metric, {}).get("better", "higher")
-    return (difference > 0.0) if (better == "higher") else (difference < 0.0)
+def aggregate_series(series: pd.DataFrame, arms: Sequence[str]) -> pd.DataFrame:
+    """Per arm, step and quantity: median, quartiles and the number of episodes contributing."""
+    quantities = [f"{p}_var" for p in POSITIONS] + [f"{p}_link" for p in LINKS]
+    long = series.melt(id_vars=["arm", "episode", "step", "time_s"], value_vars=quantities, var_name="quantity")
+    grouped = long.dropna(subset=["value"]).groupby(["arm", "quantity", "step"])["value"]
+    table = pd.DataFrame({
+        "time_s": long.groupby(["arm", "quantity", "step"])["time_s"].first(),
+        "median": grouped.median(), "q25": grouped.quantile(0.25), "q75": grouped.quantile(0.75), "n": grouped.size(),
+    }).reset_index()
+    table["n"] = table["n"].fillna(0).astype(int)
+    table["arm"] = pd.Categorical(table["arm"], categories=list(arms), ordered=True)
+    return table.sort_values(["arm", "quantity", "step"]).reset_index(drop=True)
+
+
+def aggregate_binned(binned: pd.DataFrame, arms: Sequence[str]) -> pd.DataFrame:
+    """Per arm, ratio and bin: median, quartiles and the number of episodes with a value."""
+    valid = binned.dropna(subset=["value"])
+    grouped = valid.groupby(["arm", "ratio", "bin_start_s", "bin_end_s"])["value"]
+    table = pd.DataFrame({
+        "median": grouped.median(), "q25": grouped.quantile(0.25), "q75": grouped.quantile(0.75), "n": grouped.size(),
+    }).reset_index()
+    table["arm"] = pd.Categorical(table["arm"], categories=list(arms), ordered=True)
+    order = {f"{top}/{bottom}": i for i, (top, bottom) in enumerate(BINNED_RATIOS)}
+    table["ratio_order"] = table["ratio"].map(order)
+    return table.sort_values(["ratio_order", "arm", "bin_start_s"]).drop(columns="ratio_order").reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
@@ -312,410 +389,128 @@ def _is_improvement(metric: str, difference: float) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _figure_style():
+def _plt():
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    plt.rcParams.update({
-        "figure.dpi": 130,
-        "savefig.dpi": 200,
-        "font.size": 9,
-        "axes.grid": True,
-        "grid.alpha": 0.3,
-        "axes.spines.top": False,
-        "axes.spines.right": False,
-        "legend.frameon": False,
-    })
+    plt.rcParams.update({"figure.dpi": 130, "savefig.dpi": 200, "font.size": 9, "axes.grid": True, "grid.alpha": 0.25,
+                         "grid.color": "#cccccc", "axes.spines.top": False, "axes.spines.right": False,
+                         "axes.edgecolor": "#888888", "legend.frameon": False, "lines.linewidth": 2.0})
     return plt
 
 
-def _save(figure, output_dir: str, name: str) -> str:
-    os.makedirs(output_dir, exist_ok=True)
-    path = os.path.join(output_dir, f"{name}.png")
+def _save(figure, directory: str, name: str) -> None:
+    os.makedirs(directory, exist_ok=True)
     figure.tight_layout()
-    figure.savefig(path)
-    figure.savefig(os.path.join(output_dir, f"{name}.pdf"))
-    print(f"wrote {path}")
-    return path
+    for extension in ("png", "pdf"):
+        figure.savefig(os.path.join(directory, f"{name}.{extension}"))
+    print(f"wrote {os.path.join(directory, name)}.png")
 
 
-def _smooth(values: np.ndarray, window: int) -> np.ndarray:
-    if ((window <= 1) or (len(values) < window)):
-        return values
-    kernel = np.ones(window) / window
-    return np.convolve(values, kernel, mode="valid")
+def _draw(axis, aggregated: pd.DataFrame, quantity: str, arms: Sequence[str], skip_s: float, min_episodes: int) -> None:
+    for colour, arm in zip(ARM_COLOURS, arms):
+        rows = aggregated[(aggregated["arm"] == arm) & (aggregated["quantity"] == quantity) & (aggregated["n"] >= min_episodes)]
+        if (rows.empty):
+            continue
+        axis.fill_between(rows["time_s"], rows["q25"], rows["q75"], color=colour, alpha=0.15, linewidth=0)
+        axis.plot(rows["time_s"], rows["median"], color=colour, label=arm)
+    axis.axvspan(0.0, skip_s, color="#888888", alpha=0.08, linewidth=0)
+    if quantity.endswith("_link"):
+        # Ratios are multiplicative (0.5 and 2 are equally far from 1), and a quiet leader makes
+        # them spike, so a log axis keeps both halving and doubling readable.
+        axis.set_yscale("log")
+        axis.axhline(1.0, color="#888888", linewidth=0.8)
 
 
-def plot_learning_curves(run_dir: str, output_dir: str, name: str = "learning_curves") -> Optional[str]:
-    """Return and traffic quantities against environment steps."""
-    progress = load_progress(run_dir)
-    if (progress.empty) or ("time/total_timesteps" not in progress.columns):
-        print(f"WARNING: no usable progress.csv under {run_dir}")
-        return None
-    plt = _figure_style()
-    series = [(column, label) for column, label in LEARNING_CURVE_SERIES if (column in progress.columns)]
-    if (len(series) == 0):
-        return None
-    columns = 2
-    rows = int(np.ceil(len(series) / columns))
-    figure, axes = plt.subplots(rows, columns, figsize=(9.0, 2.1 * rows), squeeze=False)
-    steps = progress["time/total_timesteps"].to_numpy(dtype=float)
-    for index, (column, label) in enumerate(series):
-        axis = axes[index // columns][index % columns]
-        values = pd.to_numeric(progress[column], errors="coerce").to_numpy(dtype=float)
-        mask = np.isfinite(values)
-        axis.plot(steps[mask], values[mask], linewidth=1.4, color="#1f5fa8")
-        axis.set_ylabel(label)
-        axis.set_xlabel("environment steps")
-    for index in range(len(series), rows * columns):
-        axes[index // columns][index % columns].axis("off")
-    figure.suptitle(f"Training progress: {run_label(run_dir)}", y=1.0)
-    return _save(figure, output_dir, name)
-
-
-def plot_training_episodes(
-    run_dir: str, output_dir: str, window: int = 20, name: str = "training_episodes"
-) -> Optional[str]:
-    """Per-episode training metrics, raw and smoothed.
-
-    The learning curves above are SB3's per-update means; this is the underlying
-    episode scatter, which is where the spread across days and minutes shows up.
-    """
-    episodes = load_monitor_episodes(run_dir)
-    if (episodes.empty):
-        print(f"WARNING: no monitor_*.monitor.csv under {run_dir}")
-        return None
-    plt = _figure_style()
-    panels = [
-        ("r", "Episode return"),
-        ("platoon_mean_speed", "Platoon speed (m/s)"),
-        ("platoon_speed_std", "Platoon speed spread (m/s)"),
-        ("jerk_rms", "Jerk RMS (m/s$^3$)"),
+def plot_timeseries(aggregated: pd.DataFrame, arms: Sequence[str], directory: str, args) -> None:
+    plt = _plt()
+    groups = [
+        ("oscillation_variance", [f"{p}_var" for p in POSITIONS], "speed variance (m$^2$/s$^2$)", lambda q: q[:-4]),
+        ("oscillation_link_ratio", [f"{p}_link" for p in LINKS], "variance / vehicle ahead",
+         lambda q: f"{q[:-5]} / {POSITIONS[POSITIONS.index(q[:-5]) - 1]}"),
     ]
-    panels = [(column, label) for column, label in panels if (column in episodes.columns)]
-    figure, axes = plt.subplots(len(panels), 1, figsize=(8.0, 2.0 * len(panels)), squeeze=False, sharex=True)
-    steps = episodes["cumulative_steps"].to_numpy(dtype=float)
-    for index, (column, label) in enumerate(panels):
-        axis = axes[index][0]
-        values = pd.to_numeric(episodes[column], errors="coerce").to_numpy(dtype=float)
-        axis.plot(steps, values, ".", markersize=2.5, alpha=0.35, color="#888888")
-        smoothed = _smooth(values, window)
-        if (len(smoothed) > 0):
-            axis.plot(steps[len(steps) - len(smoothed):], smoothed, linewidth=1.6, color="#c1440e")
-        axis.set_ylabel(label)
-        axis.set_ylim(bottom=np.percentile(values, 10))
-        axis.set_ylim(top=np.percentile(values, 90))
-    axes[-1][0].set_xlabel("cumulative environment steps")
-    figure.suptitle(f"Training episodes: {run_label(run_dir)}", y=1.0)
-    return _save(figure, output_dir, name)
+    subtitle = f"rolling {args.oscillation_window_s:g} s variance; median and IQR across episodes; shaded: before {args.skip_s:g} s"
+    for name, quantities, ylabel, title in groups:
+        columns = min(4, len(quantities))
+        rows = int(np.ceil(len(quantities) / columns))
+        figure, axes = plt.subplots(rows, columns, figsize=(3.3 * columns, 2.5 * rows), squeeze=False, sharex=True)
+        for index, quantity in enumerate(quantities):
+            axis = axes[index // columns][index % columns]
+            _draw(axis, aggregated, quantity, arms, args.skip_s, args.min_episodes)
+            axis.set_title(title(quantity), fontsize=9)
+            if (index % columns == 0):
+                axis.set_ylabel(ylabel)
+            if (index // columns == rows - 1):
+                axis.set_xlabel("Episode Time (s)")
+        for index in range(len(quantities), rows * columns):
+            axes[index // columns][index % columns].axis("off")
+        axes[0][0].legend(fontsize=8, loc="upper left")
+        figure.suptitle(subtitle, fontsize=8, color="#555555")
+        _save(figure, directory, name)
+        plt.close(figure)
+        for quantity in quantities:
+            single, axis = plt.subplots(figsize=(4.8, 3.0))
+            _draw(axis, aggregated, quantity, arms, args.skip_s, args.min_episodes)
+            axis.set_title(title(quantity), fontsize=10)
+            axis.set_ylabel(ylabel)
+            axis.set_xlabel("Episode Time (s)")
+            axis.legend(fontsize=8)
+            _save(single, directory, f"{name}_{quantity}")
+            plt.close(single)
 
 
-def plot_controller_comparison(
-    episodes: pd.DataFrame,
-    output_dir: str,
-    metrics: Sequence[str] = DEFAULT_TABLE_METRICS,
-    name: str = "controller_comparison",
-) -> Optional[str]:
-    """One panel per metric: the controller means with the per-episode points.
-
-    The points are drawn because with a handful of paired episodes the mean on
-    its own hides whether a controller wins everywhere or wins once by a lot.
-    """
-    if (episodes.empty):
-        return None
-    plt = _figure_style()
-    controllers = list(dict.fromkeys(episodes["controller"]))
-    metrics = [m for m in metrics if (m in episodes.columns)]
-    columns = 2
-    rows = int(np.ceil(len(metrics) / columns))
-    figure, axes = plt.subplots(rows, columns, figsize=(9.0, 2.4 * rows), squeeze=False)
-    positions = np.arange(len(controllers))
-    for index, metric in enumerate(metrics):
-        axis = axes[index // columns][index % columns]
-        means, spreads = [], []
-        for offset, controller in enumerate(controllers):
-            values = pd.to_numeric(
-                episodes[episodes["controller"] == controller][metric], errors="coerce"
-            ).dropna().to_numpy()
-            means.append(float(np.mean(values)) if (len(values) > 0) else np.nan)
-            spreads.append(float(np.std(values)) if (len(values) > 0) else np.nan)
-            jitter = (np.random.default_rng(offset).uniform(-0.12, 0.12, size=len(values)))
-            axis.plot(np.full(len(values), offset) + jitter, values, ".", markersize=4, alpha=0.5, color="#444444")
-        axis.bar(positions, means, yerr=spreads, capsize=3, alpha=0.45, color="#1f5fa8")
-        info = METRICS.get(metric, {})
-        unit = info.get("unit", "")
-        axis.set_ylabel(f"{info.get('label', metric)}" + (f" ({unit})" if (unit) else ""))
-        axis.set_xticks(positions)
-        axis.set_xticklabels(
-            [CONTROLLER_DISPLAY_NAMES.get(c, c) for c in controllers], rotation=20, ha="right"
-        )
-        axis.set_title("higher is better" if (info.get("better") == "higher") else "lower is better", fontsize=7.5)
-    for index in range(len(metrics), rows * columns):
-        axes[index // columns][index % columns].axis("off")
-    return _save(figure, output_dir, name)
+def _draw_binned(axis, aggregated: pd.DataFrame, ratio: str, arms: Sequence[str], args) -> None:
+    """Median per bin (markers joined by lines) with IQR whiskers, arms side by side within each bin."""
+    offsets = np.linspace(-0.2, 0.2, len(arms)) * args.bin_s if (len(arms) > 1) else [0.0]
+    for colour, arm, offset in zip(ARM_COLOURS, arms, offsets):
+        rows = aggregated[(aggregated["arm"] == arm) & (aggregated["ratio"] == ratio) & (aggregated["n"] >= args.min_episodes)]
+        if (rows.empty):
+            continue
+        centre = (rows["bin_start_s"] + rows["bin_end_s"]) / 2.0 + offset
+        axis.errorbar(centre, rows["median"], yerr=[rows["median"] - rows["q25"], rows["q75"] - rows["median"]],
+                      color=colour, marker="o", markersize=5, linewidth=1.5, elinewidth=1.0, capsize=2, label=arm)
+    axis.set_yscale("log")
+    # Panels whose range stays inside one decade would otherwise show a single "10^0" label.
+    from matplotlib.ticker import LogLocator, FormatStrFormatter
+    axis.yaxis.set_major_locator(LogLocator(base=10.0, subs=(1.0, 2.0, 5.0)))
+    axis.yaxis.set_major_formatter(FormatStrFormatter("%g"))
+    axis.yaxis.set_minor_formatter(FormatStrFormatter(""))
+    axis.axhline(1.0, color="#888888", linewidth=0.8)
+    edges = np.arange(args.skip_s, aggregated["bin_end_s"].max() + 1e-9, args.bin_s)
+    axis.set_xticks(edges)
+    axis.set_xlim(edges[0], edges[-1])
 
 
-def plot_episode_traces(
-    traces: Dict[Tuple[str, int], pd.DataFrame],
-    output_dir: str,
-    episode: int = 0,
-    name: Optional[str] = None,
-) -> Optional[str]:
-    """One episode, every controller: speed, acceleration and the macro lookahead.
-
-    The bottom panel is the point of the coupled simulator -- the macroscopic
-    velocity in the cell ahead of the bubble is the signal a controller can act
-    on before its own leader has reacted, so a policy that is using it should
-    show its speed turning over before the leader's does.
-    """
-    selected = {controller: frame for (controller, index), frame in traces.items() if (index == episode)}
-    if (len(selected) == 0):
-        print(f"WARNING: no traces for episode {episode}")
-        return None
-    plt = _figure_style()
-    figure, axes = plt.subplots(3, 1, figsize=(8.5, 6.4), sharex=True)
-    colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
-    for offset, (controller, frame) in enumerate(sorted(selected.items())):
-        color = colors[offset % len(colors)]
-        label = CONTROLLER_DISPLAY_NAMES.get(controller, controller)
-        steps = frame["step"].to_numpy(dtype=float)
-        axes[0].plot(steps, frame["hero_speed"], linewidth=1.4, color=color, label=label)
-        axes[1].plot(steps, frame["realised_acceleration"], linewidth=1.2, color=color, label=label)
-        if ("macro_velocity_ahead" in frame.columns):
-            axes[2].plot(steps, frame["macro_velocity_ahead"], linewidth=1.2, color=color, label=label)
-    axes[0].set_ylabel("hero speed (m/s)")
-    axes[1].set_ylabel("realised $a$ (m/s$^2$)")
-    axes[2].set_ylabel("macro $v$ ahead (m/s)")
-    axes[2].set_xlabel("macroscopic step (1 s)")
-    axes[0].legend(ncol=2, fontsize=8)
-    figure.suptitle(f"Episode {episode}", y=1.0)
-    return _save(figure, output_dir, name or f"episode_{episode}_traces")
-
-
-# ---------------------------------------------------------------------------
-# LaTeX reporting
-# ---------------------------------------------------------------------------
-
-# Preamble requirements for the generated tables: \usepackage{booktabs}.
-
-_latex_escapes = {
-    "\\": r"\textbackslash{}",
-    "&": r"\&",
-    "%": r"\%",
-    "$": r"\$",
-    "#": r"\#",
-    "_": r"\_",
-    "{": r"\{",
-    "}": r"\}",
-    "~": r"\textasciitilde{}",
-    "^": r"\textasciicircum{}",
-}
-
-
-def latex_escape(text) -> str:
-    return "".join(_latex_escapes.get(character, character) for character in str(text))
-
-
-def _format(value: float, precision: int = 2) -> str:
-    if ((value is None) or (not np.isfinite(value))):
-        return "--"
-    return "%.*f" % (precision, value)
-
-
-def _best_controller(summary: pd.DataFrame, metric: str) -> Optional[str]:
-    column = f"{metric}_mean"
-    if (column not in summary.columns):
-        return None
-    values = summary[column]
-    if (values.dropna().empty):
-        return None
-    better = METRICS.get(metric, {}).get("better", "higher")
-    index = values.idxmax() if (better == "higher") else values.idxmin()
-    return str(summary.loc[index, "controller"])
-
-
-def generate_latex_for_controllers(
-    episodes: pd.DataFrame,
-    metrics: Sequence[str] = DEFAULT_TABLE_METRICS,
-    precision: int = 2,
-    caption: str = (
-        "Hero-vehicle controllers evaluated on identical episodes of the coupled "
-        "macroscopic/microscopic simulation. Each cell is the mean over episodes "
-        "with the standard deviation across them in parentheses; the best "
-        "controller in each column is bold."
-    ),
-    label: str = "tab:rl_controllers",
-    font_size: str = r"\footnotesize",
-    column_separation: str = "4pt",
-    full_width: bool = False,
-    output_path: Optional[str] = None,
-) -> str:
-    """Controller comparison table, in the reporting style of sim_analysis.py.
-
-    Rows are controllers, columns are metrics; the arrow in each header says
-    which direction is better, so the table can be read without the caption.
-    """
-    summary = summarize_controllers(episodes, metrics)
-    metrics = [m for m in metrics if (f"{m}_mean" in summary.columns)]
-    best = {metric: _best_controller(summary, metric) for metric in metrics}
-
-    lines = []
-    lines.append(r"\begin{table%s}[%s]" % ("*" if (full_width) else "", "!t" if (full_width) else "htbp"))
-    lines.append(r"\centering")
-    lines.append(r"\caption{%s}" % latex_escape(caption))
-    lines.append(r"\label{%s}" % label)
-    if (font_size):
-        lines.append(font_size)
-    if (column_separation):
-        lines.append(r"\setlength{\tabcolsep}{%s}" % column_separation)
-    lines.append(r"\begin{tabular}{%s}" % ("lr" + ("r" * len(metrics))))
-    lines.append(r"\toprule")
-
-    header = ["Controller", "Episodes"]
-    for metric in metrics:
-        info = METRICS.get(metric, {})
-        arrow = r"$\uparrow$" if (info.get("better") == "higher") else r"$\downarrow$"
-        unit = info.get("unit", "")
-        # The units are already math-mode fragments in METRICS, so they go in raw.
-        header.append(
-            "%s %s%s" % (info.get("latex", latex_escape(metric)), arrow, (" (%s)" % unit) if (unit) else "")
-        )
-    lines.append(" & ".join(header) + r" \\")
-    lines.append(r"\midrule")
-
-    for _, row in summary.iterrows():
-        controller = str(row["controller"])
-        cells = [latex_escape(CONTROLLER_DISPLAY_NAMES.get(controller, controller)), "%d" % int(row["episodes"])]
-        for metric in metrics:
-            cell = "%s (%s)" % (
-                _format(row.get(f"{metric}_mean"), precision),
-                _format(row.get(f"{metric}_std"), precision),
-            )
-            if (best.get(metric) == controller):
-                cell = r"\textbf{%s}" % cell
-            cells.append(cell)
-        lines.append(" & ".join(cells) + r" \\")
-
-    lines.append(r"\bottomrule")
-    lines.append(r"\end{tabular}")
-    lines.append(r"\end{table%s}" % ("*" if (full_width) else ""))
-
-    table = "\n".join(lines) + "\n"
-    if (output_path is not None):
-        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-        with open(output_path, "w") as handle:
-            handle.write(table)
-        print(f"wrote {output_path}")
-    return table
-
-
-def generate_latex_for_paired_comparison(
-    episodes: pd.DataFrame,
-    reference: str = "sumo",
-    metrics: Sequence[str] = DEFAULT_TABLE_METRICS,
-    precision: int = 2,
-    caption: Optional[str] = None,
-    label: str = "tab:rl_paired",
-    font_size: str = r"\footnotesize",
-    output_path: Optional[str] = None,
-) -> str:
-    """Paired differences against the reference controller, with signed-rank p."""
-    comparison = compare_to_reference(episodes, reference, metrics)
-    if (comparison.empty):
-        return ""
-    if (caption is None):
-        caption = (
-            "Per-episode differences against the %s controller on the same episodes "
-            "(controller minus reference), with the Wilcoxon signed-rank p-value. "
-            "Positive or negative is stated as an improvement or a regression "
-            "according to each metric's direction." % CONTROLLER_DISPLAY_NAMES.get(reference, reference)
-        )
-    controllers = list(dict.fromkeys(comparison["controller"]))
-    metrics = [m for m in metrics if (m in set(comparison["metric"]))]
-
-    lines = []
-    lines.append(r"\begin{table}[htbp]")
-    lines.append(r"\centering")
-    lines.append(r"\caption{%s}" % latex_escape(caption))
-    lines.append(r"\label{%s}" % label)
-    if (font_size):
-        lines.append(font_size)
-    lines.append(r"\begin{tabular}{llrrr}")
-    lines.append(r"\toprule")
-    lines.append(r"Controller & Metric & $\Delta$ mean & Change (\%) & $p$ \\")
-    lines.append(r"\midrule")
-    for index, controller in enumerate(controllers):
-        if (index > 0):
-            lines.append(r"\midrule")
-        for metric in metrics:
-            rows = comparison[
-                (comparison["controller"] == controller) & (comparison["metric"] == metric)
-            ]
-            if (rows.empty):
-                continue
-            row = rows.iloc[0]
-            difference = _format(row["mean_difference"], precision)
-            if (bool(row["improved"])):
-                difference = r"\textbf{%s}" % difference
-            p_value = row["p_value"]
-            lines.append(
-                " & ".join([
-                    latex_escape(CONTROLLER_DISPLAY_NAMES.get(controller, controller)) if (metric == metrics[0]) else "",
-                    METRICS.get(metric, {}).get("latex", latex_escape(metric)),
-                    difference,
-                    _format(row["percent_change"], 1),
-                    "--" if (not np.isfinite(p_value)) else ("%.3f" % p_value),
-                ]) + r" \\"
-            )
-    lines.append(r"\bottomrule")
-    lines.append(r"\end{tabular}")
-    lines.append(r"\end{table}")
-
-    table = "\n".join(lines) + "\n"
-    if (output_path is not None):
-        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-        with open(output_path, "w") as handle:
-            handle.write(table)
-        print(f"wrote {output_path}")
-    return table
-
-
-# ---------------------------------------------------------------------------
-# Terminal reporting
-# ---------------------------------------------------------------------------
-
-
-def print_summary(episodes: pd.DataFrame, reference: str, metrics: Sequence[str]) -> None:
-    summary = summarize_controllers(episodes, metrics)
-    metrics = [m for m in metrics if (f"{m}_mean" in summary.columns)]
-    header = f"{'controller':<20}{'n':>4}" + "".join(f"{m[:12]:>14}" for m in metrics)
-    print()
-    print(header)
-    print("-" * len(header))
-    for _, row in summary.iterrows():
-        line = f"{str(row['controller']):<20}{int(row['episodes']):>4}"
-        for metric in metrics:
-            line += f"{row.get(f'{metric}_mean', float('nan')):>14.3f}"
-        print(line)
-
-    comparison = compare_to_reference(episodes, reference, metrics)
-    if (comparison.empty):
+def plot_binned(aggregated: pd.DataFrame, arms: Sequence[str], directory: str, args) -> None:
+    if (aggregated.empty):
         return
-    print()
-    print(f"paired differences against '{reference}' (bold = improvement, p from Wilcoxon signed-rank)")
-    header = f"{'controller':<20}{'metric':<22}{'delta':>10}{'change %':>10}{'p':>8}{'':>4}"
-    print(header)
-    print("-" * len(header))
-    for _, row in comparison.iterrows():
-        p_value = row["p_value"]
-        print(
-            f"{row['controller']:<20}{row['metric']:<22}{row['mean_difference']:>10.3f}"
-            f"{row['percent_change']:>10.1f}"
-            f"{'    --' if (not np.isfinite(p_value)) else f'{p_value:>8.3f}'}"
-            f"{'  +' if (row['improved']) else '  -':>4}"
-        )
+    plt = _plt()
+    ratios = [f"{top}/{bottom}" for top, bottom in BINNED_RATIOS]
+    title = lambda ratio: ratio.replace("/", " / ")
+    figure, axes = plt.subplots(1, len(ratios), figsize=(3.0 * len(ratios), 3.0), squeeze=False, sharex=True)
+    for index, ratio in enumerate(ratios):
+        axis = axes[0][index]
+        _draw_binned(axis, aggregated, ratio, arms, args)
+        axis.set_title(title(ratio), fontsize=9)
+        axis.set_xlabel("Episode Time (s)")
+        if (index == 0):
+            axis.set_ylabel("Speed Variance Ratio")
+    axes[0][0].legend(fontsize=8, loc="best")
+    figure.suptitle(f"{args.bin_s:g} s bins over {args.skip_s:g} s onward; median and IQR across episodes",
+                    fontsize=8, color="#555555")
+    _save(figure, directory, "binned_variance_ratio")
+    plt.close(figure)
+    for ratio in ratios:
+        single, axis = plt.subplots(figsize=(4.8, 3.0))
+        _draw_binned(axis, aggregated, ratio, arms, args)
+        axis.set_title(title(ratio), fontsize=10)
+        axis.set_ylabel("Speed Variance Ratio")
+        axis.set_xlabel("Episode Time (s)")
+        axis.legend(fontsize=8)
+        _save(single, directory, f"binned_variance_ratio_{ratio.replace('/', '_over_')}")
+        plt.close(single)
 
 
 # ---------------------------------------------------------------------------
@@ -723,50 +518,66 @@ def print_summary(episodes: pd.DataFrame, reference: str, metrics: Sequence[str]
 # ---------------------------------------------------------------------------
 
 
+def print_summary(summary: pd.DataFrame, arms: Sequence[str]) -> None:
+    width = 26
+    print("\n" + f"{'metric':<22}" + "".join(f"{arm:>{width}}" for arm in arms))
+    print("-" * (22 + width * len(arms)))
+    for metric, _, decimals in TABLE_ROWS:
+        row = summary.set_index("metric").loc[metric]
+        cells = [f"{_fmt(row[f'{a} median'], decimals)} [{_fmt(row[f'{a} min'], decimals)}, "
+                 f"{_fmt(row[f'{a} max'], decimals)}] n={int(row[f'{a} n'])}" for a in arms]
+        print(f"{metric:<22}" + "".join(f"{c:>{width}}" for c in cells))
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    parser.add_argument("--run", default=None, help="training run directory (for learning curves)")
-    parser.add_argument("--demo", default=None, help="demo output directory (for the controller comparison)")
-    parser.add_argument("--out", default=None, help="where figures/ and tables/ go (default: the demo or run directory)")
-    parser.add_argument("--reference", default="sumo", help="controller the paired differences are taken against")
-    parser.add_argument("--metrics", nargs="+", default=list(DEFAULT_TABLE_METRICS))
-    parser.add_argument("--episode", type=int, default=0, help="which episode's traces to plot")
-    parser.add_argument("--smooth-window", type=int, default=20)
-    parser.add_argument("--latex", action="store_true", help="also write the LaTeX tables")
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--arm", action="append", default=None, metavar="LABEL=DEMO_DIR:CONTROLLER",
+                        help="an arm to compare; repeat for each, reference first (default: SUMO IDM, AVC original, AVC corridor)")
+    parser.add_argument("--out", default=os.path.join(HERE, "run_data", "rl", "analysis", "stability"))
+    parser.add_argument("--skip-s", type=float, default=30.0, help="summary metrics use steps with step * dt >= this")
+    parser.add_argument("--min-samples-s", type=float, default=5.0, help="shared samples a variance or ratio needs")
+    parser.add_argument("--oscillation-window-s", type=float, default=10.0, help="centred window of the rolling variance")
+    parser.add_argument("--bin-s", type=float, default=5.0, help="bin width of the binned variance ratios over the summary window")
+    parser.add_argument("--min-episodes", type=int, default=5, help="time-series steps drawn only where this many episodes contribute")
+    parser.add_argument("--bootstrap", type=int, default=2000)
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--no-figures", action="store_true")
     return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     args = build_arg_parser().parse_args(argv)
-    if ((args.run is None) and (args.demo is None)):
-        raise SystemExit("pass --run (a training run), --demo (demo results), or both")
+    specs = [parse_arm(text) for text in (args.arm or DEFAULT_ARMS)]
+    arms = [label for label, _, _ in specs]
+    frames, series, binned = [], [], []
+    for label, demo, controller in specs:
+        print(f"reading {label}: {controller} in {demo}")
+        metrics, per_step, per_bin = load_arm(label, demo, controller, args)
+        frames.append(metrics)
+        series.append(per_step)
+        binned.append(per_bin)
+    frame = pd.concat(frames, ignore_index=True)
+    table_dir = os.path.join(args.out, "tables")
+    os.makedirs(table_dir, exist_ok=True)
 
-    output_root = args.out or args.demo or args.run
-    figure_dir = os.path.join(output_root, "figures")
-    table_dir = os.path.join(output_root, "tables")
-
-    if (args.run is not None) and (not args.no_figures):
-        plot_learning_curves(args.run, figure_dir)
-        plot_training_episodes(args.run, figure_dir, window=args.smooth_window)
-
-    if (args.demo is not None):
-        episodes = load_demo_episodes(args.demo)
-        metrics = [m for m in args.metrics if (m in episodes.columns)]
-        print_summary(episodes, args.reference, metrics)
-        if (not args.no_figures):
-            plot_controller_comparison(episodes, figure_dir, metrics)
-            plot_episode_traces(load_traces(args.demo), figure_dir, episode=args.episode)
-        if (args.latex):
-            generate_latex_for_controllers(
-                episodes, metrics, output_path=os.path.join(table_dir, "rl_controllers.tex")
-            )
-            generate_latex_for_paired_comparison(
-                episodes, args.reference, metrics,
-                output_path=os.path.join(table_dir, "rl_paired.tex"),
-            )
+    frame.to_csv(os.path.join(table_dir, "episode_metrics.csv"), index=False)
+    summary = summary_statistics(frame, arms)
+    summary.to_csv(os.path.join(table_dir, "summary_statistics.csv"), index=False)
+    with open(os.path.join(table_dir, "summary_statistics.tex"), "w") as handle:
+        handle.write(latex_table(summary, arms, args))
+    paired_vs_reference(frame, arms, args.bootstrap, args.seed).to_csv(
+        os.path.join(table_dir, "paired_vs_reference.csv"), index=False
+    )
+    aggregated = aggregate_series(pd.concat(series, ignore_index=True), arms)
+    aggregated.to_csv(os.path.join(table_dir, "oscillation_timeseries.csv"), index=False)
+    binned_table = aggregate_binned(pd.concat(binned, ignore_index=True), arms)
+    binned_table.to_csv(os.path.join(table_dir, "binned_variance_ratio.csv"), index=False)
+    print(f"wrote episode_metrics, summary_statistics (.csv/.tex), paired_vs_reference, oscillation_timeseries "
+          f"and binned_variance_ratio to {table_dir}")
+    print_summary(summary, arms)
+    if (not args.no_figures):
+        plot_timeseries(aggregated, arms, os.path.join(args.out, "figures", "timeseries"), args)
+        plot_binned(binned_table, arms, os.path.join(args.out, "figures", "timeseries"), args)
 
 
 if __name__ == "__main__":
