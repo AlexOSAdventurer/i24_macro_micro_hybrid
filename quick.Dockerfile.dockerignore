@@ -1,0 +1,4 @@
+# BuildKit picks this up for quick.Dockerfile only. The repo root holds tens of GB
+# of datasets and the CARLA/Unreal trees; send nothing but the requirements file.
+*
+!i24motion_macro_micro/requirements.txt

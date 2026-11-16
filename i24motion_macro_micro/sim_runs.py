@@ -24,7 +24,6 @@ import sim_calibration_metanet
 from simulation import Simulation, RolloutRenderer, GroundTruthStore, I24WestAndEastNetworkCollapsed, METANETModel, METANETParams, TriangularFD
 from rollout_store import RolloutStore
 from i24_trajectory_replayer import I24TrajectoryReplayer
-from i24_carla_coupler import I24CarlaCoupler
 from i24_sumo_coupler import I24SumoCoupler
 from i24_micro_bridge import I24MicroSimBridge
 from dash import Dash, dcc, html, Input, Output, State, callback
@@ -161,6 +160,10 @@ def run_sumo():
 
 
 def run_carla():
+    # Imported here, not at module level: CARLA is absent from the quick (SUMO-only)
+    # image, and loading it under amd64 emulation can segfault.
+    from i24_carla_coupler import I24CarlaCoupler
+
     config_folder = "config/"
     datasets = os.listdir("config")
     for dataset in datasets:
