@@ -23,6 +23,7 @@ from __future__ import annotations
 import sim_calibration_metanet
 from simulation import Simulation, RolloutRenderer, GroundTruthStore, I24WestAndEastNetworkCollapsed, METANETModel, METANETParams, TriangularFD
 from rollout_store import RolloutStore
+from fd_params import canonical_params
 from i24_trajectory_replayer import I24TrajectoryReplayer
 from i24_sumo_coupler import I24SumoCoupler
 from i24_micro_bridge import I24MicroSimBridge
@@ -82,7 +83,8 @@ def run_sumo():
 
                     gt = GroundTruthStore.from_parquet(os.path.join(config["storage_locations"]["simulation_dataset"], "micro.parquet"), os.path.join(config["storage_locations"]["simulation_dataset"], "macro.parquet"))
                     sim.initialize_from_ground_truth(gt, time_value=current_start_time)
-                    params = {'v_f': 25.02031797294094, 'rho_j': 0.07719493079089293, 'lambda_lc': 0.13384902076274044, 'w': 5.728460762748048}
+                    params = canonical_params()  # fd_params.py: the same FD the network.json cells carry
+                    #params = {'v_f': 25.02031797294094, 'rho_j': 0.07719493079089293, 'lambda_lc': 0.13384902076274044, 'w': 5.728460762748048}
                     triangular_fd = TriangularFD(v_f=params['v_f'], w=params['w'], rho_j=params['rho_j'])
 
                     coupler = I24SumoCoupler(
@@ -186,7 +188,8 @@ def run_carla():
 
                     gt = GroundTruthStore.from_parquet(os.path.join(config["storage_locations"]["simulation_dataset"], "micro.parquet"), os.path.join(config["storage_locations"]["simulation_dataset"], "macro.parquet"))
                     sim.initialize_from_ground_truth(gt, time_value=current_start_time)
-                    params = {'v_f': 25.02031797294094, 'rho_j': 0.07719493079089293, 'lambda_lc': 0.13384902076274044, 'w': 5.728460762748048}
+                    params = canonical_params()  # fd_params.py: the same FD the network.json cells carry
+                    #params = {'v_f': 25.02031797294094, 'rho_j': 0.07719493079089293, 'lambda_lc': 0.13384902076274044, 'w': 5.728460762748048}
                     triangular_fd = TriangularFD(v_f=params['v_f'], w=params['w'], rho_j=params['rho_j'])
 
                     coupler = I24CarlaCoupler(

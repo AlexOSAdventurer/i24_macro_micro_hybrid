@@ -39,6 +39,7 @@ from simulation import (
 import numpy as np
 import optuna
 import pandas as pd
+import random
 import json
 import os
 
@@ -48,12 +49,21 @@ ROAD_ID = "2"
 # first-order calibrations, so the objective stays comparable.
 #JAM_THRESHOLD = 15.0
 
-with open("i24_motion_to_dataset.json", "r") as f:
-    config = json.load(f)
-
-# Macro only: nothing here is microscopic, so the ~550 MB micro parquet is not read.
-MACRO_PATH = os.path.join(config["storage_locations"]["simulation_dataset"], "macro.parquet")
-MACRO_METANET_PATH = os.path.join(config["storage_locations"]["simulation_dataset"], "macro_metanet.parquet")
+# Same scheme as sim_calibration_lwr_triangular.py: every trial draws one day's
+# dataset at random. The macro data is loaded on first use and cached (see
+# load_collapsed_gt) rather than at import, because sim_demo.py and sim_runs.py
+# import this module.
+DATASETS = sorted(os.listdir("config/"))
+CONFIGS = {}
+for _dataset in DATASETS:
+    with open(os.path.join("config/", _dataset), "r") as f:
+        CONFIGS[_dataset] = json.load(f)
+# with open("i24_motion_to_dataset.json", "r") as f:
+#     config = json.load(f)
+#
+# # Macro only: nothing here is microscopic, so the ~550 MB micro parquet is not read.
+# MACRO_PATH = os.path.join(config["storage_locations"]["simulation_dataset"], "macro.parquet")
+# MACRO_METANET_PATH = os.path.join(config["storage_locations"]["simulation_dataset"], "macro_metanet.parquet")
 
 
 def collapse_macro_ground_truth(gt: GroundTruthStore) -> GroundTruthStore:
@@ -119,15 +129,35 @@ class MacroSeries:
         return chosen
 
 
-if os.path.exists(MACRO_METANET_PATH):
-    gt_collapsed = GroundTruthStore.from_parquet(macro_parquet_path=MACRO_METANET_PATH)
-else:
-    print(f"{MACRO_METANET_PATH} not found; collapsing {MACRO_PATH} in memory. "
-          f"Run I24SimulationData().generate_macro_data_metanet() to cache it.")
-    gt_collapsed = collapse_macro_ground_truth(
-        GroundTruthStore.from_parquet(macro_parquet_path=MACRO_PATH)
-    )
-gt_series = MacroSeries(gt_collapsed)
+_GT_CACHE: dict[str, tuple[GroundTruthStore, MacroSeries]] = {}
+
+
+def load_collapsed_gt(dataset: str) -> tuple[GroundTruthStore, MacroSeries]:
+    """(collapsed ground truth, its per-time lookup) for one config/<dataset>, cached.
+
+    Macro only: nothing here is microscopic, so the micro parquet is not read.
+    """
+    if dataset not in _GT_CACHE:
+        dataset_dir = CONFIGS[dataset]["storage_locations"]["simulation_dataset"]
+        macro_path = os.path.join(dataset_dir, "macro.parquet")
+        macro_metanet_path = os.path.join(dataset_dir, "macro_metanet.parquet")
+        if os.path.exists(macro_metanet_path):
+            gt = GroundTruthStore.from_parquet(macro_parquet_path=macro_metanet_path)
+        else:
+            print(f"{macro_metanet_path} not found; collapsing {macro_path} in memory. "
+                  f"Run I24SimulationData().generate_macro_data_metanet() to cache it.")
+            gt = collapse_macro_ground_truth(GroundTruthStore.from_parquet(macro_parquet_path=macro_path))
+        _GT_CACHE[dataset] = (gt, MacroSeries(gt))
+    return _GT_CACHE[dataset]
+# if os.path.exists(MACRO_METANET_PATH):
+#     gt_collapsed = GroundTruthStore.from_parquet(macro_parquet_path=MACRO_METANET_PATH)
+# else:
+#     print(f"{MACRO_METANET_PATH} not found; collapsing {MACRO_PATH} in memory. "
+#           f"Run I24SimulationData().generate_macro_data_metanet() to cache it.")
+#     gt_collapsed = collapse_macro_ground_truth(
+#         GroundTruthStore.from_parquet(macro_parquet_path=MACRO_PATH)
+#     )
+# gt_series = MacroSeries(gt_collapsed)
 
 
 def suggest_params(trial, lanes: int) -> METANETParams:
@@ -197,9 +227,9 @@ def install_boundary_conditions(
     is current when `_step_active_network` computes the fluxes, poststep so the density
     neighbours read is the measurement rather than whatever the free discharge left.
 
-    `gt_collapsed` is the store the boundaries are read from; the per-time lookup is
-    built here so callers do not have to reach for the module-level `gt_series`, and so
-    a caller with its own store gets boundaries consistent with it.
+    `gt_collapsed` is the store the boundaries are read from (one day's, from
+    `load_collapsed_gt`); the per-time lookup is built here so a caller with its own
+    store gets boundaries consistent with it.
     """
     series = MacroSeries(gt_collapsed)
     inlets, outlets = [], []
@@ -237,12 +267,15 @@ def install_boundary_conditions(
     sim.register_poststep_callback(update, "metanet_boundary_conditions_repin")
 
 
-def build_simulation(params_for_lanes) -> tuple[Simulation, METANETModel]:
-    """Collapsed network + METANET model, initialised from the ground truth at t0.
+def build_simulation(params_for_lanes, dataset: str) -> tuple[Simulation, METANETModel]:
+    """Collapsed network + METANET model for config/<dataset>, initialised from its
+    ground truth at t0.
 
     `params_for_lanes` is called with the lane count once the network is built, so the
     caller can sample parameters that depend on it.
     """
+    config = CONFIGS[dataset]
+    gt_collapsed, gt_series = load_collapsed_gt(dataset)
     road_config = config["road_data"][ROAD_ID]
     # The FD is decorative under METANET (the model supplies demand and supply
     # itself); it is kept only so the cells carry one for plotting. The collapsed
@@ -297,7 +330,13 @@ def build_simulation(params_for_lanes) -> tuple[Simulation, METANETModel]:
 
 
 def run_calibration(trial):
-    sim, model, JAM_THRESHOLD = build_simulation(lambda lanes: suggest_params(trial, lanes))
+    selected_dataset = random.choice(DATASETS)
+    config = CONFIGS[selected_dataset]
+    _, gt_series = load_collapsed_gt(selected_dataset)
+    trial.set_user_attr("dataset", selected_dataset)
+    print(f"Creating sim data from {selected_dataset}!")
+    sim, model, JAM_THRESHOLD = build_simulation(lambda lanes: suggest_params(trial, lanes), selected_dataset)
+    #sim, model, JAM_THRESHOLD = build_simulation(lambda lanes: suggest_params(trial, lanes))
 
     warnings = model.stability_report(sim)
     if warnings:
@@ -381,6 +420,7 @@ def run_calibration(trial):
 
 
 if __name__ == "__main__":
+    random.seed(42)
     study = optuna.create_study()
     study.optimize(run_calibration, n_trials=5000, n_jobs=1)
     print(study.best_params)

@@ -7,6 +7,7 @@ from i24_micro_bridge import I24MicroSimBridge
 from simulation_dataset import I24SimulationData
 import json
 import os
+import tempfile
 import numpy as np
 
 datasets = os.listdir("config/")
@@ -39,15 +40,19 @@ def run_calibration(trial):
     w = trial.suggest_float("w", 3.0, 6.0)
     network_generator = I24WestAndEastNetwork(TriangularFD(v_f, w, rho_j), lambda_lc)
     network_generator.create_network(config["road_data"]["2"]["road_length"], config["road_data"]["2"]["cell_length"], config["road_data"]["2"]["lanes"], lane_width=config["road_data"]["2"]["lane_width"])
-    network_generator.save_network(os.path.join(config["storage_locations"]["simulation_dataset"], "network.json"))
+    #network_generator.save_network(os.path.join(config["storage_locations"]["simulation_dataset"], "network.json"))
+    trial_network_path = os.path.join(tempfile.gettempdir(), f"calibration_lwr_trial_{os.getpid()}_{trial.number}.json")
+    network_generator.save_network(trial_network_path)
 
     print("Creating sim itself!")
     sim = Simulation.from_json(
-        json_path=os.path.join(config["storage_locations"]["simulation_dataset"], "network.json"),
+        json_path=trial_network_path,
+        #json_path=os.path.join(config["storage_locations"]["simulation_dataset"], "network.json"),
         time_resolution=config["time_step"],
         origin_time=config["time_origin"],
         min_cell_length=100.0
     )
+    os.remove(trial_network_path)
 
     sim.initialize_from_ground_truth(gt, time_value=config["time_origin"])
     print("Running sim!")
@@ -65,7 +70,8 @@ def run_calibration(trial):
         renderer._ensure_ts_lane("1", lane)
         renderer._ensure_ts_lane("2", lane)
         sim_velocity_data = renderer.ts_data[("2", lane, "sim")]["velocity"]
-        empirical_velocity_data = renderer.ts_data[("2", lane, "empirical")]["velocity"][1:]
+        empirical_velocity_data = renderer.ts_data[("2", lane, "empirical")]["velocity"]  # already on the sim's frame axis
+        #empirical_velocity_data = renderer.ts_data[("2", lane, "empirical")]["velocity"][1:]
         
         sim_in_jam = (sim_velocity_data < jam_threshold).astype(int).reshape(-1)
         empirical_in_jam = (empirical_velocity_data < jam_threshold).astype(int).reshape(-1)
@@ -79,7 +85,8 @@ def run_calibration(trial):
         print("Road 2 ", combined_flow_in_jam, combined_flow_in_free, l1_current)
 
         sim_velocity_data = renderer.ts_data[("1", lane, "sim")]["velocity"]
-        empirical_velocity_data = renderer.ts_data[("1", lane, "empirical")]["velocity"][1:]
+        empirical_velocity_data = renderer.ts_data[("1", lane, "empirical")]["velocity"]  # already on the sim's frame axis
+        #empirical_velocity_data = renderer.ts_data[("1", lane, "empirical")]["velocity"][1:]
         sim_in_jam = (sim_velocity_data < jam_threshold).astype(int).reshape(-1)
         empirical_in_jam = (empirical_velocity_data < jam_threshold).astype(int).reshape(-1)
         sim_in_free = (sim_velocity_data >= jam_threshold).astype(int).reshape(-1)

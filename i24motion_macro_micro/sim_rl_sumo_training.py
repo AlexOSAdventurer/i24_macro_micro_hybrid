@@ -95,6 +95,7 @@ import numpy as np
 from gymnasium import spaces
 
 from simulation import FundamentalDiagram, I24MicroMask, Simulation, GroundTruthStore, TriangularFD
+from fd_params import CANONICAL_FD_PARAMS
 from i24_micro_bridge import I24MicroSimBridge
 from i24_sumo_coupler import I24SumoCoupler
 from i24_motion_sumo_coupled import HeroPolicy
@@ -107,11 +108,12 @@ DEFAULT_OUTPUT_ROOT = os.path.join(HERE, "run_data", "rl")
 # Same triangular fit the SUMO runs in sim_runs.py / sim_demo.py use, so a
 # trained controller sees the fundamental diagram those rollouts were produced
 # with.  lambda_lc is a lane-change parameter and is not part of the FD.
-DEFAULT_FD_PARAMS = {
-    "v_f": 25.02031797294094,
-    "w": 5.728460762748048,
-    "rho_j": 0.07719493079089293,
-}
+DEFAULT_FD_PARAMS = dict(CANONICAL_FD_PARAMS)  # fd_params.py; also what network.json's cells carry
+# DEFAULT_FD_PARAMS = {
+#     "v_f": 25.02031797294094,
+#     "w": 5.728460762748048,
+#     "rho_j": 0.07719493079089293,
+# }
 
 # The AVC ring's observation constants, from automatic_vehicular_control/ring.py: speeds
 # are divided by max_speed=10, the leader's front-to-front offset by
@@ -140,7 +142,8 @@ DEFAULT_FD_PARAMS = {
 # different transformation than it learned.  Defaults below are the CORRIDOR-SCALE values;
 # pass --obs-max-speed 10 to evaluate a published-AVC checkpoint.
 AVC_PUBLISHED_MAX_SPEED = 10.0               # ring.py's default; original_run
-AVC_CORRIDOR_MAX_SPEED = 25.02031797294094   # = DEFAULT_FD_PARAMS['v_f']; corridor_matched_*
+AVC_CORRIDOR_MAX_SPEED = CANONICAL_FD_PARAMS["v_f"]   # = DEFAULT_FD_PARAMS['v_f']; corridor_matched_*
+# AVC_CORRIDOR_MAX_SPEED = 25.02031797294094
 AVC_MAX_DIST = 300.0                         # = circumference_max, same in both arms
 AVC_OBS_LOW = -1.0                           # = ring.py's `low`, same in both arms
 

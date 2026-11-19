@@ -1,6 +1,7 @@
 import i24_motion_data
 import i24_motion_macro
 import simulation
+import fd_params
 import numpy as np
 import pandas as pd
 import pyarrow as pa
@@ -12,6 +13,19 @@ import os
 {'v_f': 38.82661919086127, 'rho_j': 0.13273852897987434, 'lambda_lc': 0.12801469008205105, 'w': 5.52936062831337}
 
 """
+
+
+def build_network_generator(config: dict) -> "simulation.I24WestAndEastNetwork":
+    """The 1-mile two-road network with the canonical FD (fd_params.py), built
+    from a dataset config's road_data. Needs no trajectory data."""
+    # For now both roads have the same length, so just grab one of them for config.
+    road = config["road_data"]["2"]
+    params = fd_params.canonical_params()
+    triangular_fd = simulation.TriangularFD(v_f=params['v_f'], w=params['w'], rho_j=params['rho_j'])
+    generator = simulation.I24WestAndEastNetwork(fd=triangular_fd, lambda_lc=params['lambda_lc'])
+    generator.create_network(road["road_length"], road["cell_length"], road["lanes"], lane_width=road["lane_width"])
+    return generator
+
 
 class I24SimulationData:
     def __init__(self, config_path="i24_motion_to_dataset.json", network_path="network.json", network_metanet_path="network_metanet.json", macro_path="macro.parquet", macro_metanet_path="macro_metanet.parquet", micro_path="micro.parquet"):
@@ -31,21 +45,24 @@ class I24SimulationData:
         self.load_source_data()
 
     def create_network_file(self):
-        # For now both roads have the same length, so just grab one of them for config.
-        config = self.config["road_data"]["2"]
-        params = {'v_f': 25.02031797294094, 'rho_j': 0.07719493079089293, 'lambda_lc': 0.13384902076274044, 'w': 5.728460762748048}
+        # Canonical FD from fd_params.py; see build_network_generator.
+        self.network_generator = build_network_generator(self.config)
+        self.network_generator.save_network(self.network_path)
+        # Previous inline version, kept for reference (the FD now lives in fd_params.py):
+        # config = self.config["road_data"]["2"]
+        # params = {'v_f': 25.02031797294094, 'rho_j': 0.07719493079089293, 'lambda_lc': 0.13384902076274044, 'w': 5.728460762748048}
         #params = {'v_f': 30.019341712559083, 'rho_j': 0.09411385875052518, 'lambda_lc': 0.16914326352090997, 'w': 4.573064692495487} #. Best is trial 71 with value: -1.6869119514065773.
         #params = {'v_f': 44.628171971976364, 'rho_j': 0.10161810757336569, 'lambda_lc': 0.12233207260740411, 'w': 4.939175703300891}
         #params = {'v_f': 43.906521944351404, 'rho_j': 0.13154571531898504, 'lambda_lc': 0.0789091812007707, 'w': 6.054218545965104}
         #params_original = {'v_f': 49.73562026160161, "rho_j": 0.1304577157114563, "lambda_lc": 0.13951724538021434, 'w': 5.697835695812354}
-        triangular_fd = simulation.TriangularFD(v_f=params['v_f'], w=params['w'], rho_j=params['rho_j'])
-        self.network_generator = simulation.I24WestAndEastNetwork(fd=triangular_fd, lambda_lc=params['lambda_lc'])
+        # triangular_fd = simulation.TriangularFD(v_f=params['v_f'], w=params['w'], rho_j=params['rho_j'])
+        # self.network_generator = simulation.I24WestAndEastNetwork(fd=triangular_fd, lambda_lc=params['lambda_lc'])
         #triangular_fd = simulation.TriangularFD(v_f=49.816011505539535, w=6.053452290089522, rho_j=0.12998583138493472)
         #self.network_generator = simulation.I24WestAndEastNetwork(fd=triangular_fd, lambda_lc=0.10076621081371681)
         #greenshields_fd = simulation.GreenshieldsFD(v_f=42.634906282620406, rho_j=0.06711901063946596)
         #self.network_generator = simulation.I24WestAndEastNetwork(fd=greenshields_fd, lambda_lc=0.28911022854691354)
-        self.network_generator.create_network(config["road_length"], config["cell_length"], config["lanes"], lane_width=config["lane_width"])
-        self.network_generator.save_network(self.network_path)
+        # self.network_generator.create_network(config["road_length"], config["cell_length"], config["lanes"], lane_width=config["lane_width"])
+        # self.network_generator.save_network(self.network_path)
 
     def create_network_file_metanet(self):
         # Same corridor as create_network_file, but with each carriageway's lanes
@@ -235,12 +252,6 @@ class I24SimulationData:
         pq.write_table(table, self.macro_metanet_path, compression="zstd", row_group_size=1000, sorting_columns=sorting_columns)
 
 if __name__ == "__main__":
-    #sim_data = I24SimulationData()
-    #sim_data.create_network_file()
-    #sim_data.create_network_file_metanet()
-    #sim_data.generate_micro_data()
-    #sim_data.generate_macro_data_metanet()
-    #sim_data.generate_macro_data()
     config_folder = "config/"
     datasets = os.listdir(config_folder)
     for dataset in datasets:

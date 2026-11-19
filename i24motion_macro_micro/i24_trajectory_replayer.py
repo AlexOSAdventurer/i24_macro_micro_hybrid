@@ -125,7 +125,15 @@ class I24TrajectoryReplayer:
                         anchor_speed = ds / dt_obs
 
         self.bridge.update_vehicles(vehicles)
-        self.bridge.anchor_speed = anchor_speed
+        # No vehicle ahead of the centre this step (light traffic): the mask still
+        # needs a frame speed, so use the speed the window actually moves at below
+        # -- the previous anchor's, or 0 when there is none. None crashed
+        # I24MicroMask.rear_boundary_flux.
+        if anchor_speed is not None:
+            self.bridge.anchor_speed = anchor_speed
+        else:
+            self.bridge.anchor_speed = self.current_anchor_speed if self.current_anchor_speed is not None else 0.0
+        #self.bridge.anchor_speed = anchor_speed
         result = self._compute_next_middle_s(middle_s, self.current_anchor_speed if self.current_anchor_speed is not None else anchor_speed)
         self.current_anchor_speed = anchor_speed
         if self.initialized:

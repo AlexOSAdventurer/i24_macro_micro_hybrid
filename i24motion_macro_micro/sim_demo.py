@@ -21,6 +21,7 @@ Standalone (requires a pickled Simulation at demo_sim.pickle)::
 """
 from __future__ import annotations
 from simulation import Simulation, RolloutRenderer, GroundTruthStore, I24WestAndEastNetworkCollapsed, METANETModel, METANETParams, TriangularFD
+from fd_params import canonical_params
 from i24_trajectory_replayer import I24TrajectoryReplayer
 from i24_sumo_coupler import I24SumoCoupler
 from i24_micro_bridge import I24MicroSimBridge
@@ -242,7 +243,7 @@ def run_demo_lwr_triangular():
     run_app(sim, rotation_deg=82.8192)
 
 def run_demo_open_loop():
-    with open("i24_motion_to_dataset.json", "r") as f:
+    with open("config/2022-11-30.json", "r") as f:
         config = json.load(f)
 
     sim = Simulation.from_json(
@@ -308,7 +309,8 @@ def run_demo_carla():
 
     gt = GroundTruthStore.from_parquet(os.path.join(config["storage_locations"]["simulation_dataset"], "micro.parquet"), os.path.join(config["storage_locations"]["simulation_dataset"], "macro.parquet"))
     sim.initialize_from_ground_truth(gt, time_value=config["time_origin"]+2750.0)
-    params = {'v_f': 25.02031797294094, 'rho_j': 0.07719493079089293, 'lambda_lc': 0.13384902076274044, 'w': 5.728460762748048}
+    params = canonical_params()  # fd_params.py: the same FD the network.json cells carry
+    #params = {'v_f': 25.02031797294094, 'rho_j': 0.07719493079089293, 'lambda_lc': 0.13384902076274044, 'w': 5.728460762748048}
     #params = {'v_f': 30.019341712559083, 'rho_j': 0.09411385875052518, 'lambda_lc': 0.16914326352090997, 'w': 4.573064692495487} #. Best is trial 71 with value: -1.6869119514065773.
     triangular_fd = TriangularFD(v_f=params['v_f'], w=params['w'], rho_j=params['rho_j'])
 
@@ -367,7 +369,8 @@ def run_demo_sumo():
 
     gt = GroundTruthStore.from_parquet(os.path.join(config["storage_locations"]["simulation_dataset"], "micro.parquet"), os.path.join(config["storage_locations"]["simulation_dataset"], "macro.parquet"))
     sim.initialize_from_ground_truth(gt, time_value=config["time_origin"]+3600.0)
-    params = {'v_f': 25.02031797294094, 'rho_j': 0.07719493079089293, 'lambda_lc': 0.13384902076274044, 'w': 5.728460762748048}
+    params = canonical_params()  # fd_params.py: the same FD the network.json cells carry
+    #params = {'v_f': 25.02031797294094, 'rho_j': 0.07719493079089293, 'lambda_lc': 0.13384902076274044, 'w': 5.728460762748048}
     #params = {'v_f': 30.019341712559083, 'rho_j': 0.09411385875052518, 'lambda_lc': 0.16914326352090997, 'w': 4.573064692495487} #. Best is trial 71 with value: -1.6869119514065773.
     triangular_fd = TriangularFD(v_f=params['v_f'], w=params['w'], rho_j=params['rho_j'])
 
@@ -460,7 +463,7 @@ def run_demo_metanet():
     [I 2026-08-19 09:21:27,102] Trial 922 finished with value: -1.583904588696137 and parameters: {'tau_s': 47.86898722920049, 'eta_km2_per_h': 54.498074688599296, 'kappa_veh_per_km_lane': 45.95143563683463, 'v_free_kmh': 134.4172710870525, 'rho_crit_veh_per_km_lane': 24.27930712745335, 'alpha': 4.7917591228885, 'jam_threshold': 5.003871736480674}. Best is trial 922 with value: -1.583904588696137.
     """
 
-    with open("i24_motion_to_dataset.json", "r") as f:
+    with open("config/2022-11-30.json", "r") as f:
         config = json.load(f)
     road_config = config["road_data"]["2"]
     # The FD is decorative under METANET (the model supplies demand and supply
@@ -520,14 +523,17 @@ def run_demo_metanet():
     sim.record_rollout = True
 
     t0 = float(config["time_origin"])
-    sim.initialize_from_ground_truth(sim_calibration_metanet.gt_collapsed, time_value=t0, drives_boundaries=False)
+    gt_collapsed, _ = sim_calibration_metanet.load_collapsed_gt("2022-11-30.json")  # same day as config above
+    sim.initialize_from_ground_truth(gt_collapsed, time_value=t0, drives_boundaries=False)
+    #sim.initialize_from_ground_truth(sim_calibration_metanet.gt_collapsed, time_value=t0, drives_boundaries=False)
     # Shared with the calibration rather than copied: this used to be an inline
     # duplicate, and it drifted into prescribing the discharge through
     # outflow_boundary_map. That map is applied as min(demand, q_gt), a one-sided cap
     # that buried 1038 undischarged vehicles in road 1's 100 m terminal cell over an
     # hour and drove it to 2.1x the measured density.
     sim_calibration_metanet.install_boundary_conditions(
-        sim, model, sim_calibration_metanet.gt_collapsed
+        sim, model, gt_collapsed
+        #sim, model, sim_calibration_metanet.gt_collapsed
     )
     for i in range(3599):
         sim.step()

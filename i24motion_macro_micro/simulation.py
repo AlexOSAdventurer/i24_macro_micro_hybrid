@@ -336,6 +336,43 @@ class Network:
             json.dump(self.to_dict(), f, indent=2)
 
     @staticmethod
+    def _polygon_on_polylines(
+        left_poly: np.ndarray, right_poly: np.ndarray, seg_lengths: np.ndarray, cumulative: np.ndarray,
+        start_s: float, end_s: float, lat: float, width: float,
+    ) -> Tuple[List[float], List[float]]:
+        """(x, y) of a lane polygon over [start_s, end_s] that follows the road.
+
+        Besides the two end cross-sections it includes a cross-section at every
+        road polyline vertex strictly inside the span, so the fill follows a
+        curved road instead of cutting a straight chord across it. On a road
+        whose polylines are straight two-point lines (all generated 1-mile
+        networks) there are no such vertices and the result is the original
+        four-corner polygon.
+        """
+        nseg = len(seg_lengths)
+
+        def interp(s: float) -> Tuple[np.ndarray, np.ndarray]:
+            idx = int(np.clip(np.searchsorted(cumulative, s) - 1, 0, nseg - 1))
+            t = (s - cumulative[idx]) / max(seg_lengths[idx], 1e-8)
+            l = left_poly[idx] + t * (left_poly[idx + 1] - left_poly[idx])
+            r = right_poly[idx] + t * (right_poly[idx + 1] - right_poly[idx])
+            d = (r - l) / max(float(np.linalg.norm(r - l)), 1e-8)
+            return l + (-lat) * d, l + (-(lat - width)) * d
+
+        lo, hi = (start_s, end_s) if start_s <= end_s else (end_s, start_s)
+        # Interior polyline vertices only: a span reaching past the polyline's
+        # end (cells may overrun a slightly short polyline) is extrapolated
+        # along the last segment, as before, without adding its end vertex.
+        interior = cumulative[1:-1]
+        inner = interior[(interior > lo + 1e-6) & (interior < hi - 1e-6)]
+        stations = [start_s] + [float(s) for s in (inner if start_s <= end_s else inner[::-1])] + [end_s]
+        lefts, rights = zip(*(interp(s) for s in stations))
+        # Same vertex order as the original four-corner polygon:
+        # left@start -> right side forward -> left side backward -> left@start.
+        ring = [lefts[0]] + list(rights) + list(reversed(lefts))
+        return [float(p[0]) for p in ring], [float(p[1]) for p in ring]
+
+    @staticmethod
     def _cell_polygon(road: "Road", start_s: float, end_s: float, lane: int) -> Tuple[List[float], List[float]]:
         """Return (x, y) coordinate lists for a cell polygon in road-world coordinates."""
         left_poly = np.array(road.left_polyline, dtype=float)
@@ -343,20 +380,15 @@ class Network:
         seg_lengths = np.linalg.norm(np.diff(left_poly, axis=0), axis=1)
         cumulative = np.concatenate([[0.0], np.cumsum(seg_lengths)])
         lane_info = road.lane_data[lane]
-        lat = float(lane_info["lateral_position"])
-        width = float(lane_info["width"])
-
-        def interp(s: float) -> Tuple[np.ndarray, np.ndarray]:
-            idx = int(np.clip(np.searchsorted(cumulative, s) - 1, 0, len(seg_lengths) - 1))
-            t = (s - cumulative[idx]) / max(seg_lengths[idx], 1e-8)
-            l = left_poly[idx] + t * (left_poly[idx + 1] - left_poly[idx])
-            r = right_poly[idx] + t * (right_poly[idx + 1] - right_poly[idx])
-            d = (r - l) / max(float(np.linalg.norm(r - l)), 1e-8)
-            return l + (-lat) * d, l + (-(lat - width)) * d
-
-        p1, p2 = interp(start_s)
-        p3, p4 = interp(end_s)
-        return [p1[0], p2[0], p4[0], p3[0], p1[0]], [p1[1], p2[1], p4[1], p3[1], p1[1]]
+        return Network._polygon_on_polylines(
+            left_poly, right_poly, seg_lengths, cumulative, start_s, end_s,
+            float(lane_info["lateral_position"]), float(lane_info["width"]),
+        )
+        # Previous four-corner version, kept for reference: it drew a straight
+        # chord between the cell's end cross-sections, which cuts across curves.
+        # p1, p2 = interp(start_s)
+        # p3, p4 = interp(end_s)
+        # return [p1[0], p2[0], p4[0], p3[0], p1[0]], [p1[1], p2[1], p4[1], p3[1], p1[1]]
 
     def plot_network(self) -> None:
         fig = go.Figure()
@@ -3028,24 +3060,18 @@ class RolloutRenderer:
         def _polygon(road_id: str, s0: float, s1: float, lane: int) -> Tuple[List[float], List[float]]:
             lp, rp, seg, cum, lane_data = self._road_geom[road_id]
             info = lane_data[lane]
-            lat = float(info["lateral_position"])
-            width = float(info["width"])
-            nseg = len(seg)
-
-            def _pt(s: float):
-                idx = int(np.clip(np.searchsorted(cum, s) - 1, 0, nseg - 1))
-                t = (s - cum[idx]) / max(seg[idx], 1e-8)
-                l = lp[idx] + t * (lp[idx + 1] - lp[idx])
-                r = rp[idx] + t * (rp[idx + 1] - rp[idx])
-                d = (r - l) / max(float(np.linalg.norm(r - l)), 1e-8)
-                return l + (-lat) * d, l + (-(lat - width)) * d
-
-            p1, p2 = _pt(s0)
-            p3, p4 = _pt(s1)
-            return _rotate(
-                [p1[0], p2[0], p4[0], p3[0], p1[0]],
-                [p1[1], p2[1], p4[1], p3[1], p1[1]],
-            )
+            # Follows curved roads (cross-section at every interior polyline
+            # vertex); identical to the old four-corner box on straight roads.
+            return _rotate(*Network._polygon_on_polylines(
+                lp, rp, seg, cum, s0, s1, float(info["lateral_position"]), float(info["width"]),
+            ))
+            # Previous four-corner version, kept for reference:
+            # p1, p2 = _pt(s0)
+            # p3, p4 = _pt(s1)
+            # return _rotate(
+            #     [p1[0], p2[0], p4[0], p3[0], p1[0]],
+            #     [p1[1], p2[1], p4[1], p3[1], p1[1]],
+            # )
         self._polygon = _polygon
 
         # --- Vectorised quantity transform (matches scalar _q_value exactly) ---

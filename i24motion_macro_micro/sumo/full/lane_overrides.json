@@ -1,0 +1,41 @@
+{
+  "description": "Mainline lane-count overrides applied by build_i24_full_network.py on top of the OSM `lanes` tags. MM is the MOTION / survey mile-post frame. A span end within 100 m of a ramp attachment node snaps to it, so lane adds and drops line up with the ramp junctions; set from_snap/to_snap false to keep an end at its MM. Evidence: evaluate_i24_full_network.py on eval/traj_sample.npz (20,000 trajectories, 10 days). r5 = lane -5 points / mean main-lane points; the floor on plain 4-lane road is ~0.01. Sheet = auxiliary_information/ramp_and_landmark_layer.csv.",
+  "overrides": [
+    {
+      "direction": "wb",
+      "from_mm": 62.20,
+      "to_mm": 61.51,
+      "lanes": 5,
+      "note": "Old Hickory on-ramp lane-add. OSM drops the lane at ~MM 61.715, but the data keeps a distinct lane -5 peak (r5 0.11-0.25) to ~61.45-61.50, and the sheet has wb_OH_on_end at 61.51."
+    },
+    {
+      "direction": "wb",
+      "from_mm": 60.49,
+      "to_mm": 60.22,
+      "lanes": 5,
+      "note": "Hickory Hollow off-ramp deceleration lane. OSM has only ~80 m of 5th lane before the diverge. Distinct-vehicle profile: lane -5 starts at MM 60.49 (r5 0.01 at 60.51 -> 0.16 at 60.48 -> 0.2-0.37 down to the gore at 60.20); sheet wb_HH_off_start is 60.52."
+    },
+    {
+      "direction": "eb",
+      "from_mm": 61.905,
+      "to_mm": 62.21,
+      "lanes": 5,
+      "note": "Old Hickory off-ramp deceleration lane. OSM starts the 5th lane at ~61.96 (sheet eb_OH_off_start 61.95); the distinct-vehicle profile starts at 61.905 (r5 0.02 at 61.89 -> 0.16 at 61.91 -> 0.28 at 61.94). The end snaps to the OSM diverge."
+    },
+    {
+      "direction": "eb",
+      "from_mm": 60.43,
+      "to_mm": 60.53,
+      "to_snap": false,
+      "lanes": 5,
+      "note": "Hickory Hollow on-ramp acceleration lane. OSM has a direct merge. The data has a distinct lane -5 peak at 64-66 ft over MM 60.43-60.52 (r5 0.28) and none over 60.52-60.70 (r5 0.03), so the lane ends at ~60.53, not at the sheet's eb_HH_on_end 60.70 (likely the end of the taper)."
+    },
+    {
+      "direction": "eb",
+      "from_mm": 59.85,
+      "to_mm": 60.19,
+      "lanes": 4,
+      "note": "Between the two Hickory Hollow exits. OSM tags 5 lanes, but the data has no separate lane -5 peak (r5 0.085 comes from a wider lane -4 spread), and the sheet marks no lane here. Check against imagery."
+    }
+  ]
+}
